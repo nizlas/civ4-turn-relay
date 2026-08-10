@@ -1,0 +1,81 @@
+# Local environment (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# Pytest, mypy, Ruff
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# PyInstaller
+*.spec
+
+# IDE-local files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Windows / macOS metadata
+Thumbs.db
+Desktop.ini
+ehthumbs.db
+.DS_Store
+._*
+
+# Logs
+*.log
+logs/
+
+# Local application data
+data/
+var/
+*.local
+*.local.*
+
+# Civilization IV save files (local downloads/uploads)
+*.CivBeyondSwordSave
+*.Civ4SavedGame
+saves/
+incoming/
+outgoing/
+
+# Private SSH keys and common key filenames
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+id_ecdsa
+id_ecdsa.pub
+id_dsa
+id_dsa.pub
+*.pem
+*.ppk
+*.key
