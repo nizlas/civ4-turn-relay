@@ -75,6 +75,14 @@ The Linux host is only a shared SFTP file store. It does not run Civilization or
 7. Two-computer end-to-end testing
 8. Signed / reproducible Windows packaging
 
+## Design documents
+
+Normative design (not yet implemented):
+
+- [`AGENTS.md`](AGENTS.md) — document routing and hard safety rules for contributors and coding agents
+- [`docs/DESIGN_SPEC.md`](docs/DESIGN_SPEC.md) — product behavior, configuration, UI, and acceptance criteria
+- [`docs/SYNC_PROTOCOL.md`](docs/SYNC_PROTOCOL.md) — protocol v1: manifest, sync algorithms, concurrency, recovery
+
 ## Security
 
 Credentials and real server details must never be committed. Copy [`.env.example`](.env.example) to a local `.env` (gitignored). Prefer SSH keys over passwords where practical. The application must never log credentials. See also [`.gitignore`](.gitignore) for ignored secrets, keys, and save files.
