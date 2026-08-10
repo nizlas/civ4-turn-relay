@@ -27,8 +27,8 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 
 | Phase | Name | Status |
 |-------|------|--------|
-| P0 | Python project skeleton and quality gates | **ACTIVE** |
-| P1 | Domain types, configuration models, validation, deterministic serialization | NOT STARTED |
+| P0 | Python project skeleton and quality gates | **COMPLETE** |
+| P1 | Domain types, configuration models, validation, deterministic serialization | **ACTIVE** |
 | P2 | Storage abstraction and failure-injectable fake storage | NOT STARTED |
 | P3 | Core sync protocol engine | NOT STARTED |
 | P4 | Local persistence, reconciliation, baseline, save detection, watching | NOT STARTED |
@@ -40,7 +40,7 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 
 ## 4. Active implementation phase
 
-**P0 — Python project skeleton and quality gates** is the only ACTIVE phase.
+**P1 — Domain types, configuration models, validation, deterministic serialization** is the only ACTIVE phase.
 
 ## 5. Phase-gate process
 
@@ -130,7 +130,7 @@ A phase moves from ACTIVE → COMPLETE only when:
 
 ## P0 — Python project skeleton and quality gates
 
-**Status:** ACTIVE
+**Status:** COMPLETE
 
 ### Goal
 
@@ -190,13 +190,13 @@ None (tooling only).
 
 ### Risks / decisions
 
-- Exact packaging layout (`src/` vs flat) — choose conventional `src` layout unless tooling friction appears
+- Exact packaging layout (`src/` vs flat) — **resolved:** conventional `src/` layout (`src/civ4_turn_relay/`) with hatchling editable installs
 
 ---
 
 ## P1 — Domain types, configuration models, validation, deterministic serialization
 
-**Status:** NOT STARTED
+**Status:** ACTIVE
 
 ### Goal
 
