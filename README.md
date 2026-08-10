@@ -82,6 +82,7 @@ Normative design (not yet implemented):
 - [`AGENTS.md`](AGENTS.md) — document routing and hard safety rules for contributors and coding agents
 - [`docs/DESIGN_SPEC.md`](docs/DESIGN_SPEC.md) — product behavior, configuration, UI, and acceptance criteria
 - [`docs/SYNC_PROTOCOL.md`](docs/SYNC_PROTOCOL.md) — protocol v1: manifest, sync algorithms, concurrency, recovery
+- [`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md) — incremental implementation phases and exit gates
 
 ## Security
 

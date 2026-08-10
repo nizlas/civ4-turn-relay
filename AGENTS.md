@@ -19,7 +19,7 @@ In project design documents:
 |----------|-----------|
 | [`docs/DESIGN_SPEC.md`](docs/DESIGN_SPEC.md) | Product behavior, configuration, UI, local states, acceptance criteria |
 | [`docs/SYNC_PROTOCOL.md`](docs/SYNC_PROTOCOL.md) | Protocol v1: remote layout, manifest, algorithms, concurrency, recovery |
-| [`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md) | Implementation phases and gates (**when it exists**) |
+| [`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md) | Implementation phases and gates |
 | [`README.md`](README.md) | Orientation only; not the design source of truth |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution and licensing expectations |
 | [`docs/licensing.md`](docs/licensing.md) | Licensing policy |
@@ -37,7 +37,7 @@ Do **not** load every document for every small task.
 | Repository orientation | `README.md` |
 | User behavior, configuration, product scope, UI | `docs/DESIGN_SPEC.md` |
 | State, saves, sync, remote storage, concurrency, recovery | `docs/SYNC_PROTOCOL.md` |
-| Implementation sequencing (once present) | Only the **current** section of `docs/PHASE_PLAN.md` plus its listed prerequisites |
+| Implementation sequencing | Only the **ACTIVE** section of `docs/PHASE_PLAN.md` plus its listed prerequisites |
 | Contributions / license | `CONTRIBUTING.md`, `docs/licensing.md` as needed |
 
 ## Hard rules
@@ -51,7 +51,7 @@ Do **not** load every document for every small task.
 7. Remote writes that commit match state **MUST** be atomic (see protocol commit point).
 8. Keep **UI, domain logic, process launching, filesystem watching, and remote storage** behind explicit boundaries.
 9. When changing protocol invariants, **add or update tests**.
-10. Once a phase plan exists, **remain within the active implementation phase**.
+10. **Remain within the ACTIVE implementation phase** in `docs/PHASE_PLAN.md`.
 
 ## Architecture expectation
 
