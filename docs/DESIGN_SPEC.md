@@ -77,7 +77,7 @@ Legend: **Relay** = user action in the app · **Civ** = action inside Civilizati
 | Step | Actor | Action |
 |------|-------|--------|
 | 1 | Relay | Create match: stable game ID, display name, ordered human players, local player ID, mod, PBEM save location, launch profile |
-| 2 | Auto | Persist per-match config locally; create or initialize remote game directory per protocol |
+| 2 | Auto | Persist per-match config locally; initialize remote match atomically per [`SYNC_PROTOCOL.md` §2.5](SYNC_PROTOCOL.md#25-initial-match-creation) (valid seq-0 `manifest.json` is the init commit point) |
 | 3 | Auto | Enter `WAITING_FOR_MY_FIRST_SAVE` if this client owns the opening handoff |
 
 ### 3.3 Joining or importing a match
@@ -92,24 +92,25 @@ Legend: **Relay** = user action in the app · **Civ** = action inside Civilizati
 
 | Step | Actor | Action |
 |------|-------|--------|
-| 1 | Civ | Match creator creates the PBEM game and produces the first outgoing human save |
-| 2 | Auto | Detect stable outgoing save → verify → upload/commit per protocol |
-| 3 | Auto | Transition to waiting for the next human in order |
+| 1 | Relay / Auto | Before launch from `WAITING_FOR_MY_FIRST_SAVE`, record durable play-session baseline |
+| 2 | Civ | Match creator creates the PBEM game and produces the first outgoing human save |
+| 3 | Auto | Detect post-baseline outgoing candidate → verify → upload/commit per protocol |
+| 4 | Auto | Transition to waiting for the next human in order |
 
 ### 3.5 Receiving and playing a normal turn
 
 | Step | Actor | Action |
 |------|-------|--------|
 | 1 | Auto | Poll/fetch manifest; if local player is current owner and save is new, download and verify |
-| 2 | Relay / Auto | Present `YOUR TURN` / `DIN TUR`; primary action launches Civ with mod + save (optional auto-launch MAY run only after verified download) |
+| 2 | Relay / Auto | Present `YOUR TURN` / `DIN TUR`; before launch, record durable play-session baseline; primary action launches Civ with mod + save (optional per-match auto-launch MAY run only after verified download) |
 | 3 | Civ | Player completes turn and clicks **Next Turn** |
 
 ### 3.6 Detecting and sending the outgoing save
 
 | Step | Actor | Action |
 |------|-------|--------|
-| 1 | Auto | Detect stable, matching outgoing save that is not the incoming hash |
-| 2 | Auto | Upload and commit handoff per protocol |
+| 1 | Auto | Detect stable outgoing candidate whose hash is absent from baseline, incoming save, `accepted_save_hashes`, and locally processed outgoing hashes ([protocol §6](SYNC_PROTOCOL.md#6-outgoing-save-detection)) |
+| 2 | Auto | Upload and commit handoff per protocol (auto-send only when baseline is trustworthy) |
 | 3 | Auto | Show next expected human player |
 
 ### 3.7 Restart after application or Civilization crash
@@ -142,18 +143,20 @@ Switching matches MUST NOT alter any match’s remote ownership.
 
 ## 4. Configuration model
 
-Server settings MUST NOT be duplicated into every match. Secrets MUST NOT be committed; [`.env.example`](../.env.example) holds placeholders only.
+Server and installation settings MUST NOT be duplicated into every match. Secrets MUST NOT be committed; [`.env.example`](../.env.example) holds **global** placeholders only.
 
 ### 4.1 Global configuration
 
-| Concept | Editable | Notes |
-|---------|----------|-------|
-| SFTP host, port, username | Yes | Validated by UI (format / reachability checks) |
-| Authentication method / private key path / password | Yes | Stored locally as secrets; never logged |
-| Server root | Yes | Remote base path for all games |
-| Polling interval | Yes | Default 10 seconds (see `.env.example`) |
-| Civ installation and launch profiles | Yes | Executable path, working directory, profile name |
-| Log level | Yes | Local only |
+| Concept | Editable | In `.env` example | Notes |
+|---------|----------|-------------------|-------|
+| SFTP host, port, username | Yes | Yes | Validated by UI (format / reachability checks) |
+| Authentication method / private key path / password | Yes | Yes | Stored locally as secrets; never logged |
+| Server root | Yes | Yes | Remote base path for all games |
+| Polling interval | Yes | Yes | Default 10 seconds |
+| Log level | Yes | Yes | Local only |
+| Civ installation / default executable / launch-profile seed | Yes | Optional executable seed | Working directory and named profiles MAY live in local global config files |
+
+`.env` MUST NOT carry per-match identity, mod, PBEM save directory, or automatic-launch settings.
 
 ### 4.2 Per-match configuration
 
@@ -162,17 +165,17 @@ Server settings MUST NOT be duplicated into every match. Secrets MUST NOT be com
 | Stable match / game ID | Create-time | Format enforced by protocol; immutable after remote init |
 | Display name | Yes | Local and/or mirrored in manifest display field |
 | Ordered human player IDs and display names | Create / admin repair | Defines relay order; excludes AI |
-| Local player ownership (`player_id` for this client) | Yes | MUST be one of the human IDs |
+| Local player ownership (`player_id` for this client) | Yes | MUST be one of the human IDs; **not** a global `.env` value |
 | Launch profile | Yes | References a global profile |
-| Mod name or path | Yes | Default concept: `AdvCiv` |
-| PBEM save location and matching rules | Yes | Directory + filename/pattern constraints |
-| Optional automatic launch | Yes | Default off; MUST NOT create turn transitions |
+| Mod name or path | Yes | Default concept: `AdvCiv`; per-match only |
+| PBEM save location and matching rules | Yes | Directory + filename/pattern constraints; per-match only |
+| Optional automatic launch | Yes | Default off; per-match only; MUST NOT create turn transitions |
 
 ### 4.3 Storage and validation
 
 - User-editable values are those listed above.
 - The UI SHOULD validate formats before save (game ID, paths, port range, player list non-empty and unique IDs).
-- Local persistence MAY use config files under the user data directory plus `.env` for secrets.
+- Local persistence MAY use `.env` for global secrets/settings plus per-match config files under the user data directory.
 - Global SFTP settings apply to all matches under the configured server root.
 
 ---
@@ -220,6 +223,7 @@ stateDiagram-v2
     MY_TURN_DOWNLOADED --> OUTGOING_SAVE_DETECTED: stable outgoing save
     CIV_RUNNING --> OUTGOING_SAVE_DETECTED: stable outgoing save
     CIV_RUNNING --> MY_TURN_DOWNLOADED: Civ exit, no new outgoing
+    CIV_RUNNING --> WAITING_FOR_MY_FIRST_SAVE: Civ exit, seq 0, no outgoing
 
     OUTGOING_SAVE_DETECTED --> UPLOADING: begin handoff
     UPLOADING --> WAITING_FOR_OTHER_PLAYER: commit success
@@ -240,8 +244,8 @@ stateDiagram-v2
 | `WAITING_FOR_OTHER_PLAYER` | Another human owns the handoff | Manifest current player ≠ local | Waiting for {player} | None needed | → `DOWNLOADING`, `ERROR` | Upload commit | Same if still not owner |
 | `DOWNLOADING` | Fetching accepted save for this player | Manifest says local is owner; download in progress | Downloading save… | None | → `MY_TURN_DOWNLOADED`, `WAITING_FOR_OTHER_PLAYER`, `ERROR` | Launch before verify | Resume or restart download |
 | `MY_TURN_DOWNLOADED` | Verified incoming save ready | Local verified hash = manifest accepted hash; local is owner | YOUR TURN / DIN TUR | Start Civ and play | → `CIV_RUNNING`, `OUTGOING_SAVE_DETECTED`, `ERROR` | Upload incoming hash as new handoff | Restore this if evidence still holds |
-| `CIV_RUNNING` | Civ process associated with this match is running | Process handle / PID observation | Civilization is running | Focus / open folder (secondary) | → `OUTGOING_SAVE_DETECTED`, `MY_TURN_DOWNLOADED`, `ERROR` | Manifest rewrite because Civ started | If Civ still running → `CIV_RUNNING`; else re-derive |
-| `OUTGOING_SAVE_DETECTED` | Stable new outgoing candidate ready | Stable file, matching rules, hash ≠ incoming, not yet accepted | Outgoing save ready to send | Send now (or Auto sending…) | → `UPLOADING`, `ERROR` | Skip verify | Re-hash; if already accepted remotely → wait state |
+| `CIV_RUNNING` | Civ process associated with this match is running | Process handle / PID observation; durable play-session baseline recorded at launch | Civilization is running | Focus / open folder (secondary) | → `OUTGOING_SAVE_DETECTED`, `MY_TURN_DOWNLOADED`, `WAITING_FOR_MY_FIRST_SAVE`, `ERROR` | Manifest rewrite because Civ started | If Civ still running → `CIV_RUNNING` with preserved baseline; else re-derive |
+| `OUTGOING_SAVE_DETECTED` | Stable new outgoing candidate ready | Stable file; matching rules; hash absent from baseline, incoming, `accepted_save_hashes`, and locally processed outgoings | Outgoing save ready to send | Send now (or Auto sending…) | → `UPLOADING`, `ERROR` | Skip verify; auto-send without trustworthy baseline | Re-hash and reclassify per protocol §6.3; never treat older-hash replay as a new success |
 | `UPLOADING` | Handoff commit in progress | Operation journal active | Uploading save… | None | → `WAITING_FOR_OTHER_PLAYER`, `OUTGOING_SAVE_DETECTED`, `ERROR` | Second concurrent commit for same match | Resume idempotent commit ([protocol](SYNC_PROTOCOL.md#7-upload-and-commit-algorithm)) |
 | `ERROR` | Operator attention needed | Recorded failure context | Error: {specific} | Retry / Open diagnostics | → `RECONCILING` | Silent ignore | Show last error + reconcile |
 
@@ -289,7 +293,7 @@ Swedish `DIN TUR` and English `YOUR TURN` MAY both be supported; the status mean
 | `DOWNLOADING` | Disabled: Downloading… | No protocol effect |
 | `MY_TURN_DOWNLOADED` | Start Civ and play | Launch Civ with mod + verified incoming save |
 | `CIV_RUNNING` | Disabled: Civilization is running | Optional secondary: reveal save folder |
-| `OUTGOING_SAVE_DETECTED` | Send save (if not auto) | Start upload/commit; auto-send SHOULD be default when candidate is valid |
+| `OUTGOING_SAVE_DETECTED` | Send save (if not auto) | Start upload/commit; auto-send SHOULD be default when candidate is valid **and** a trustworthy play-session baseline exists |
 | `UPLOADING` | Disabled: Uploading… | No protocol effect |
 | `ERROR` | Retry | Re-enter `RECONCILING` / resume failed idempotent op |
 | `RECONCILING` | Disabled: Checking… | No protocol effect |
@@ -315,7 +319,8 @@ Avoid generic messages such as “No connection” without host, operation, and 
 
 - Launch MUST use the selected launch profile, configured mod, and—when playing a received turn—the verified incoming save path.
 - Exact CLI flags are an integration detail; the design requires “mod + save” correctness, not save rewriting ([Open decisions](#13-open-decisions)).
-- If Civilization is already running for this match, the client MUST NOT start a second instance by default; it SHOULD inform the user and keep `CIV_RUNNING`.
+- Immediately before launching from `WAITING_FOR_MY_FIRST_SAVE` or `MY_TURN_DOWNLOADED`, the client MUST record a durable play-session baseline of stable matching PBEM files and hashes ([`SYNC_PROTOCOL.md` §6.1](SYNC_PROTOCOL.md#61-play-session-baseline)).
+- If Civilization is already running for this match, the client MUST NOT start a second instance by default; it SHOULD inform the user and keep `CIV_RUNNING` (baseline from the original launch MUST remain).
 - If an unrelated Civ process is running, the client SHOULD warn before launch.
 
 ### 8.2 Outgoing save completion
@@ -326,10 +331,14 @@ A candidate MUST be accepted for `OUTGOING_SAVE_DETECTED` only when all hold:
 - Filename/matching rules for the selected game pass
 - File size is stable across at least two samples separated by a short interval (or equivalent lock/readability check)
 - File is readable end-to-end for hashing
+- Content SHA-256 is absent from the play-session baseline
 - Content SHA-256 ≠ current verified incoming hash
-- Content SHA-256 is not already the manifest’s accepted hash
+- Content SHA-256 is absent from manifest `accepted_save_hashes`
+- Content SHA-256 is absent from locally processed outgoing candidates
+- A trustworthy baseline exists when auto-selecting; otherwise auto-send stops and an explained recovery/manual-selection path is required
+- If multiple plausible post-baseline candidates exist, require user selection; do not guess
 
-Filesystem events SHOULD trigger checks; polling at the global interval MUST remain a fallback.
+Filesystem events SHOULD trigger checks; polling at the global interval MUST remain a fallback. Timestamps and events MUST NOT establish identity or handoff validity. An overwritten path is acceptable only if its new content hash satisfies the rules above. Normative detail: [`SYNC_PROTOCOL.md` §6](SYNC_PROTOCOL.md#6-outgoing-save-detection).
 
 ### 8.3 Stale, partial, duplicate, unrelated
 
@@ -338,16 +347,21 @@ Filesystem events SHOULD trigger checks; polling at the global interval MUST rem
 | Partial write | Wait until stable; do not hash/upload |
 | Duplicate event / same hash | Idempotent no-op |
 | Unrelated save / other game | Ignore |
-| Stale local save from older sequence | Ignore for upload; may surface in diagnostics |
-| Incoming file copied into PBEM folder | Reject as outgoing (same hash as incoming) |
+| File present before launch (in baseline) | Not an automatic outgoing candidate |
+| Stale/replay hash in `accepted_save_hashes` | No remote advance; classify per protocol §6.3 (reject incoming; idempotent ack only for sender reconcile; older hash → stale/replay) |
+| Incoming file copied into PBEM folder | Reject as outgoing (same hash as incoming / latest accepted for recipient) |
+| Missing/corrupt baseline | Disable auto-send; explained manual recovery |
 
 ### 8.4 Civilization closes without outgoing save
 
-Return to `MY_TURN_DOWNLOADED` (or `WAITING_FOR_MY_FIRST_SAVE` if still seq 0 with no accepted save). Explain that no new outgoing save was detected. Do not change remote ownership.
+- If protocol sequence remains `0`, no accepted save exists, and no valid outgoing candidate was produced → transition `CIV_RUNNING` → `WAITING_FOR_MY_FIRST_SAVE`.
+- Otherwise, when a verified incoming turn was in play → transition `CIV_RUNNING` → `MY_TURN_DOWNLOADED`.
+
+Explain that no new outgoing save was detected. Do not change remote ownership.
 
 ### 8.5 Auto-launch boundaries
 
-Optional auto-launch MAY start Civ only after a save is fully verified and the state is `MY_TURN_DOWNLOADED`. Auto-launch MUST NOT upload, alter manifests, or advance protocol sequence.
+Optional **per-match** auto-launch MAY start Civ only after a save is fully verified and the state is `MY_TURN_DOWNLOADED`, and only after the play-session baseline is recorded. Auto-launch MUST NOT upload, alter manifests, or advance protocol sequence.
 
 ---
 
@@ -355,19 +369,21 @@ Optional auto-launch MAY start Civ only after a save is fully verified and the s
 
 ### 9.1 Startup reconciliation inputs
 
-1. Authoritative remote manifest
-2. Verified remote save object (size + SHA-256)
+1. Authoritative remote manifest (including `accepted_save_hashes`)
+2. Verified remote save object (full read-back SHA-256)
 3. Local cache (last sequence/hash, paths)
 4. Local incoming and outgoing files
-5. Recorded hashes and operation journal
+5. Recorded hashes, operation journal, and play-session baseline
 6. Whether Civilization is running
+7. Remote upload-lock presence/metadata (never auto-delete foreign locks)
 
-The program MUST explain the recovered state rather than guess silently from filenames alone.
+The program MUST explain the recovered state rather than guess silently from filenames alone. If the play-session baseline is missing or corrupt while outgoing detection would otherwise run, auto-send MUST stop pending explicit recovery.
 
 ### 9.2 Repair rules
 
 - Repair actions MUST be explicit, previewed, and confirmed.
 - Repair MUST NOT silently delete history or overwrite the authoritative accepted save.
+- Abandoned foreign upload-lock removal and incomplete match-directory repair require confirmation that the original process is stopped / that overwrite is intended; both MUST be logged clearly.
 - Protocol-level repair semantics: [`SYNC_PROTOCOL.md`](SYNC_PROTOCOL.md#11-history-and-repair).
 
 ---
@@ -397,8 +413,8 @@ Diagnostics SHOULD help a non-technical player classify problems as:
 | Local | Missing Civ path, save folder unreadable |
 | Network | Timeout, DNS failure |
 | Authentication | Key rejected, auth failure (no secret echoed) |
-| Remote state | Manifest invalid, lock held, wrong owner |
-| Invalid save | Hash mismatch, size mismatch, unstable file |
+| Remote state | Manifest invalid, foreign lock held (possibly abandoned after informational threshold), wrong owner, incomplete match init |
+| Invalid save | Hash mismatch, size mismatch, unstable file, stale/replay candidate |
 
 Export MAY attach redacted logs and last manifest metadata (no secrets).
 
@@ -411,15 +427,17 @@ Export MAY attach redacted logs and last manifest metadata (no secrets).
 | FR-001 | Initial handoff | Creator’s first stable save commits seq 0→1; next human becomes current; joiner can download |
 | FR-002 | Normal alternating handoffs | Only current human can commit; sequence increments once per accepted save; next player derived from order |
 | FR-003 | Duplicate file events | Re-seeing the same outgoing hash does not double-advance ([protocol tests](SYNC_PROTOCOL.md#13-protocol-test-matrix)) |
-| FR-004 | Application restart | After kill mid-wait/download/upload, reconcile restores a correct non-guessed state |
+| FR-004 | Application restart | After kill mid-wait/download/upload, reconcile restores a correct non-guessed state; baseline survives when Civ still running |
 | FR-005 | Network interruption | Interrupted ops leave ownership unchanged or eventually consistent via idempotent retry |
 | FR-006 | Wrong-player upload | Non-owner commit attempt fails; manifest unchanged |
 | FR-007 | Partial upload | Temp objects never become accepted; retry safe |
-| FR-008 | Stale local save | Older local file cannot overwrite newer accepted remote handoff |
+| FR-008 | Stale local save / historical replay | Hash in `accepted_save_hashes` cannot advance again; older hashes are not new successes |
 | FR-009 | Concurrent polling | Two clients polling: at most one successful new handoff for a given new hash |
-| FR-010 | Civ produces no save | Civ exit without candidate → local wait/play state; remote unchanged |
+| FR-010 | Civ produces no save | Civ exit without candidate → `MY_TURN_DOWNLOADED` or `WAITING_FOR_MY_FIRST_SAVE` (seq 0); remote unchanged |
 | FR-011 | Multiple matches | Switching selected match changes presentation only; other matches’ remote state untouched |
 | FR-012 | Secret redaction | Logs, UI errors, and diagnostics export contain no passwords, keys, or secret env values |
+| FR-013 | Play-session baseline | Pre-launch files are not auto-sent; missing baseline disables auto-send |
+| FR-014 | Foreign locks | Never auto-broken; abandoned removal only via confirmed repair |
 
 ---
 
@@ -440,9 +458,9 @@ Product-level principles only. Detailed protocol cases: [`SYNC_PROTOCOL.md`](SYN
 | Topic | Recommendation |
 |-------|----------------|
 | Exact Civ IV CLI for mod + save | Confirm empirically on BTS/AdvCiv during launch-integration phase; keep launcher behind an adapter interface now |
-| Default auto-send vs manual Send | Auto-send after valid `OUTGOING_SAVE_DETECTED` |
-| Default auto-launch | Off (matches `.env.example`) |
+| Default auto-send vs manual Send | Auto-send after valid `OUTGOING_SAVE_DETECTED` when a trustworthy baseline exists |
+| Default per-match auto-launch | Off |
 | Stable-file sampling interval | 1.0s between size samples, twice; make configurable later if needed |
 | Host-key policy | Verify against pinned host key / known_hosts; refuse on mismatch (no silent insecure accept) |
 
-Protocol lock timeout and save path addressing are decided in [`SYNC_PROTOCOL.md`](SYNC_PROTOCOL.md#14-open-decisions).
+Lock fencing, atomic rename, full remote read-back, save path naming, and informational abandoned-lock display are decided in [`SYNC_PROTOCOL.md`](SYNC_PROTOCOL.md#14-open-decisions) and MUST NOT be weakened here.
