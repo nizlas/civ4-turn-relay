@@ -78,7 +78,7 @@ A phase moves from ACTIVE → COMPLETE only when:
 
 ### Protocol tests → owning phases
 
-Primary owner is the phase that must first make the test green. Later phases may re-run subsets.
+**Primary** is exactly one phase: the phase that must first make the complete test green. **Also** lists foundations or later re-runs. P1/P2 may prepare validators or adapter signals, but they do not own complete protocol PT outcomes.
 
 | PT | Primary | Also |
 |----|---------|------|
@@ -111,7 +111,7 @@ Primary owner is the phase that must first make the test green. Later phases may
 | PT-27 | P3 | P6 |
 | PT-28 | P3 | P6 |
 | PT-29 | P3 | P6 |
-| PT-30 | P2, P3 | P6 |
+| PT-30 | P3 | P2, P6 |
 | PT-31 | P3 | P5 |
 | PT-32 | P3 | |
 | PT-33 | P3 | |
@@ -119,8 +119,8 @@ Primary owner is the phase that must first make the test green. Later phases may
 | PT-35 | P3 | |
 | PT-36 | P3 | P5 |
 | PT-37 | P3 | P5 |
-| PT-38 | P1, P3 | |
-| PT-39 | P1, P3 | |
+| PT-38 | P3 | P1 |
+| PT-39 | P3 | P1 |
 | PT-40 | P3 | |
 | PT-41 | P3 | P5 |
 | PT-42 | P3 | P5 |
@@ -153,7 +153,8 @@ Approved design baseline (`DESIGN_SPEC`, `SYNC_PROTOCOL`, this plan).
 
 ### In scope
 
-- `pyproject.toml` (or equivalent) for Python 3.12, pytest, Ruff, mypy as agreed locally
+- `pyproject.toml` (or equivalent) for Python 3.12
+- Local quality gates: **pytest**, **Ruff**, and **mypy** (exact tool configuration is chosen during P0 implementation)
 - Package root (e.g. `src/civ4_turn_relay/`) with minimal `__init__` / version placeholder
 - Test layout (`tests/`), one smoke test
 - Dev docs for running lint/typecheck/tests
@@ -243,7 +244,7 @@ P0 complete.
 
 ### Applicable PT IDs
 
-- **PT-38**, **PT-39** (validation foundations; full protocol wiring in P3)
+- Foundations only for **PT-38** and **PT-39** (validators and rejection cases). The complete protocol outcomes remain owned by **P3**.
 - Partial support for schema cases used by PT-13/PT-18
 
 ### Manual verification
@@ -307,7 +308,7 @@ P1 complete.
 
 ### Applicable PT IDs
 
-- **PT-30** (missing atomic-replace capability surfaced by adapter)
+- Foundation for **PT-30**: adapter capability signaling when atomic replace is unavailable. The complete protocol refusal outcome is owned by **P3**.
 - Infrastructure for PT-07, PT-25–PT-29 (executed fully in P3)
 
 ### Manual verification
@@ -550,7 +551,7 @@ P5 complete.
 - Paramiko adapter implementing the storage port
 - Explicit verification of: atomic mkdir lock behavior, host-key verification (refuse mismatch), full remote read-back SHA-256, immutable save publication, `posix_rename` / `posix-rename@openssh.com`
 - Disposable-server test harness (containers or ephemeral local sshd) with **fixture credentials only**
-- Integration re-run of PT-07, PT-26–PT-30, PT-29, plus a small commit/download subset
+- Integration re-run of PT-07, PT-26–PT-30, plus a small commit/download subset
 
 ### Out of scope
 
@@ -599,11 +600,11 @@ Empirically determine and implement launch/process integration for Steam/BTS/Adv
 
 ### Why now
 
-Launch flags cannot be assumed; need real Windows evidence after core sync works.
+Launch flags cannot be assumed; this phase follows a working Paramiko adapter so launch integration builds on proven remote transfer.
 
 ### Prerequisites
 
-P5 complete; P6 SHOULD be complete so real transfers can be used in manual tests, but launch adapter remains behind a port testable with fakes.
+P6 complete.
 
 ### Read
 
@@ -663,11 +664,11 @@ Minimal main window consuming domain states/commands only; settings, match CRUD/
 
 ### Why now
 
-UI must not invent protocol; it presents P3–P7 capabilities.
+UI must not invent protocol; it presents the completed domain, sync, SFTP, and Civ-launch capabilities from prior phases.
 
 ### Prerequisites
 
-P4–P5 complete; P6–P7 SHOULD be complete for full primary actions (SFTP + Start Civ).
+P7 complete.
 
 ### Read
 
@@ -728,11 +729,11 @@ Real two-human hardening on disposable/real-user SFTP (credentials never committ
 
 ### Why now
 
-Packaging must not begin until the two-client workflow works reliably (P5+; preferably P6–P8).
+Packaging and release hardening follow a complete UI-backed client that already includes sync, SFTP, and Civ launch.
 
 ### Prerequisites
 
-P5 complete; P6–P8 complete for a release candidate that includes SFTP, Civ launch, and UI.
+P8 complete.
 
 ### Read
 

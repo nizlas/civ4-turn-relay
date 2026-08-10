@@ -64,16 +64,9 @@ The Linux host is only a shared SFTP file store. It does not run Civilization or
 - SFTP
 - Packaged Windows executable
 
-## Provisional roadmap
+## Implementation sequence
 
-1. Repository foundation
-2. Pure domain state machine and manifest
-3. Local save discovery and idempotence
-4. SFTP protocol and crash recovery
-5. Civilization launch integration
-6. Minimal GUI
-7. Two-computer end-to-end testing
-8. Signed / reproducible Windows packaging
+The authoritative implementation sequence is [`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md). That document defines phases, exit gates, and the current **ACTIVE** phase. Do not treat any other roadmap as authoritative.
 
 ## Design documents
 
