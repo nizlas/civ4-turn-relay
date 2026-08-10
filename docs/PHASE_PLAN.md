@@ -725,7 +725,7 @@ None exclusively; exercises PT-11 / PT-23 paths via UI commands.
 
 ### Goal
 
-Real two-human hardening on disposable/real-user SFTP (credentials never committed), signed/reproducible Windows packaging, operational docs, third-party notices.
+Real two-human hardening on disposable/real-user SFTP (credentials never committed), Windows distribution that ships **both** a portable build and a real installer, operational docs, and third-party notices.
 
 ### Why now
 
@@ -737,17 +737,27 @@ P8 complete.
 
 ### Read
 
-- [`DESIGN_SPEC.md` §11–12](DESIGN_SPEC.md#11-functional-requirements-and-acceptance-criteria)
+- [`DESIGN_SPEC.md` §1](DESIGN_SPEC.md#1-goals-and-non-goals) (planned stack / Windows distribution), [§11–12](DESIGN_SPEC.md#11-functional-requirements-and-acceptance-criteria)
 - [`docs/licensing.md`](licensing.md)
 - [`README.md`](../README.md) (update early-scaffolding warning when actually ready—only in this phase’s docs work)
 
 ### In scope
 
 - Two-computer / two-player test plan (manual) using player-owned disposable paths
-- PyInstaller (or chosen) packaging; reproducible build notes
-- Ops: install, `.env`, host keys, backup/repair expectations
+- **Portable Windows build:** PyInstaller (or selected equivalent) producing a portable folder/zip in addition to the installer
+- **Real Windows installer:** Inno Setup (or justified equivalent) producing a normal installer `.exe` (not merely a renamed PyInstaller executable), with:
+  - Default per-user install without admin where practical
+  - Install under an appropriate per-user Windows application location
+  - Start Menu shortcut
+  - Desktop shortcut MAY be an installer option
+  - Register a normal Windows uninstaller
+  - Support upgrading an existing installation
+  - Preserve user config, match metadata, logs, and save-related local data during upgrades
+  - Uninstall MUST NOT delete user saves or match data by default
+- **MSVC x64 runtime:** handle via official `vc_redist.x64.exe`; prefer embedded/offline redistributable when Microsoft redistribution terms permit; if embedding is not legally or technically appropriate, implement an explicit verified prerequisite flow (not silent fail)
+- Applicable third-party notices for PySide6/Paramiko/etc. (and other bundled components)
+- Reproducible build notes; ops docs for install, `.env`, host keys, backup/repair expectations
 - Release checklist: FR-001–FR-014 signed off; PT matrix still green on fake; SFTP subset green
-- Third-party notices for PySide6/Paramiko/etc.
 
 ### Out of scope
 
@@ -756,11 +766,14 @@ P8 complete.
 
 ### Expected files/components
 
-- Packaging scripts, `docs/ops.md` (or similar), NOTICE/third-party files
+- Portable packaging config/scripts (PyInstaller or equivalent)
+- Real installer project/scripts (Inno Setup or justified equivalent)—not a renamed frozen exe
+- `docs/ops.md` (or similar), NOTICE/third-party files
+- VC++ redistributable handling as above (embedded when permitted, otherwise explicit prerequisite flow)
 
 ### Required automated tests
 
-- Packaged binary smoke (launch → shows UI/version) where feasible
+- Packaged binary smoke (launch → shows UI/version) where feasible for portable and/or installed layout
 - Full fake-storage PT regression before tag
 
 ### Applicable PT IDs
@@ -771,16 +784,22 @@ Regression: **PT-01–PT-43** on fake storage; SFTP subset from P6.
 
 - Two-player AdvCiv PBEM handoff real run (saves remain local/uncommitted)
 - Crash/restart drills on both PCs
+- Fresh install, upgrade preserving user data, and uninstall that leaves saves/match data by default
+- Portable zip/folder run without installer
+- VC++ runtime path: embedded install or verified prerequisite flow succeeds on a clean machine profile
 
 ### Exit criteria
 
-- Reliable two-player workflow; package builds; licensing notices present; README scaffolding warning revised only when safe
+- Reliable two-player workflow
+- Both portable distribution and real Windows installer build and meet the installer requirements above
+- Licensing notices present; README scaffolding warning revised only when safe
 - No phase left ACTIVE except maintenance
 
 ### Risks / decisions
 
-- Code signing availability
+- Code signing remains a P9 release decision/risk (availability and whether to sign)
 - History pruning still deferred unless ops pain appears ([protocol §14](SYNC_PROTOCOL.md#14-open-decisions))
+- Exact installer tool (Inno Setup vs justified equivalent) and VC++ embed-vs-prerequisite choice resolved in this phase with recorded reason
 
 ---
 
