@@ -41,7 +41,7 @@ The application manages saves, verification, transfer, and launching only. It MU
 
 ### Planned client stack (later implementation)
 
-Python 3.12, PySide6, Paramiko (SFTP), Watchdog (filesystem events), PyInstaller (Windows packaging). The remote side is ordinary SFTP storage with no custom server-side process. Correctness comes from the client protocol and the authoritative server manifest ([`SYNC_PROTOCOL.md`](SYNC_PROTOCOL.md)).
+Python 3.12, PySide6, Paramiko (SFTP), Watchdog (filesystem events). Windows distribution (P9) MUST provide both a portable/distributable build (PyInstaller or selected equivalent) and a real Windows installer (Inno Setup or justified equivalent)—not only a standalone executable. The remote side is ordinary SFTP storage with no custom server-side process. Correctness comes from the client protocol and the authoritative server manifest ([`SYNC_PROTOCOL.md`](SYNC_PROTOCOL.md)). Packaging and installer requirements are owned by [`PHASE_PLAN.md` P9](PHASE_PLAN.md#p9--real-two-player-hardening-windows-packaging-ops-docs-release-readiness).
 
 ---
 

@@ -62,7 +62,7 @@ The Linux host is only a shared SFTP file store. It does not run Civilization or
 - Python 3.12
 - PySide6
 - SFTP
-- Packaged Windows executable
+- Windows distribution: portable/distributable build (PyInstaller or equivalent) **and** a real Windows installer (Inno Setup or justified equivalent); see [`docs/PHASE_PLAN.md` P9](docs/PHASE_PLAN.md#p9--real-two-player-hardening-windows-packaging-ops-docs-release-readiness)
 
 ## Implementation sequence
 
