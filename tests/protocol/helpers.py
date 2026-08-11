@@ -55,7 +55,6 @@ def sample_match_config(
         mod_name=None,
         pbem_save_directory=r"C:\Games\Civ4\Saves\pbem",
         save_matching=SaveMatchingRules(filename_glob="*.CivBeyondSwordSave"),
-        auto_launch=False,
     )
 
 

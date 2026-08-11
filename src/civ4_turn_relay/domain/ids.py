@@ -46,13 +46,20 @@ def validate_player_id(value: str, *, field_path: str = "player_id") -> str:
 
 
 def validate_client_id(value: str, *, field_path: str = "client_id") -> str:
-    """Validate a stable local installation / client ID for lock ownership."""
-    if not isinstance(value, str) or not CLIENT_ID_PATTERN.fullmatch(value):
-        raise DomainValidationError(
-            "expected a client ID matching ^[a-z][a-z0-9_-]{0,63}$",
-            field_path=field_path,
-        )
-    return value
+    """Validate a stable local installation / client ID for lock ownership.
+
+    Accepts a canonical lowercase UUID (preferred installation identity) or the
+    legacy ``^[a-z][a-z0-9_-]{0,63}$`` form used by earlier fixtures.
+    """
+    if isinstance(value, str) and OPERATION_ID_PATTERN.fullmatch(value):
+        return value
+    if isinstance(value, str) and CLIENT_ID_PATTERN.fullmatch(value):
+        return value
+    raise DomainValidationError(
+        "expected a canonical lowercase UUID or a client ID matching "
+        "^[a-z][a-z0-9_-]{0,63}$",
+        field_path=field_path,
+    )
 
 
 def validate_sha256_hex(value: str, *, field_path: str = "sha256") -> str:

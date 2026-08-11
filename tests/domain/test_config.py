@@ -17,6 +17,7 @@ from civ4_turn_relay.domain import (
     MatchConfig,
     Player,
     SaveMatchingRules,
+    TurnHandlingMode,
     global_config_from_env_mapping,
     redact_known_secrets,
 )
@@ -47,7 +48,7 @@ def env_mapping_with_key() -> dict[str, str]:
 
 def match_mapping() -> dict[str, Any]:
     return {
-        "auto_launch": True,
+        "allow_force_close_after_commit": True,
         "display_name": "Example Match",
         "game_id": "example-match",
         "launch_profile": "default",
@@ -59,6 +60,7 @@ def match_mapping() -> dict[str, Any]:
             {"display_name": "Player B", "id": "player_b"},
         ],
         "save_matching": {"filename_glob": "*.CivBeyondSwordSave"},
+        "turn_handling_mode": "fully_managed",
     }
 
 
@@ -205,17 +207,21 @@ class TestMatchConfig:
         config = MatchConfig.from_mapping(match_mapping())
         assert config.game_id == "example-match"
         assert config.local_player_id == "player_a"
-        assert config.auto_launch is True
+        assert config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
+        assert config.allow_force_close_after_commit is True
         assert config.save_matching.filename_glob == "*.CivBeyondSwordSave"
         assert [player.id for player in config.players] == [
             "player_a",
             "player_b",
         ]
 
-    def test_auto_launch_defaults_to_false(self) -> None:
+    def test_turn_handling_defaults(self) -> None:
         mapping = match_mapping()
-        del mapping["auto_launch"]
-        assert MatchConfig.from_mapping(mapping).auto_launch is False
+        del mapping["turn_handling_mode"]
+        del mapping["allow_force_close_after_commit"]
+        parsed = MatchConfig.from_mapping(mapping)
+        assert parsed.turn_handling_mode is TurnHandlingMode.STANDARD
+        assert parsed.allow_force_close_after_commit is False
         config = MatchConfig(
             game_id="example-match",
             display_name="Example Match",
@@ -226,7 +232,41 @@ class TestMatchConfig:
             pbem_save_directory="C:\\Placeholder\\Saves\\pbem",
             save_matching=SaveMatchingRules(filename_glob="*.sav"),
         )
-        assert config.auto_launch is False
+        assert config.turn_handling_mode is TurnHandlingMode.STANDARD
+        assert config.allow_force_close_after_commit is False
+
+    def test_standard_canonicalizes_force_close_to_false(self) -> None:
+        mapping = match_mapping()
+        mapping["turn_handling_mode"] = "standard"
+        mapping["allow_force_close_after_commit"] = True
+        parsed = MatchConfig.from_mapping(mapping)
+        assert parsed.turn_handling_mode is TurnHandlingMode.STANDARD
+        assert parsed.allow_force_close_after_commit is False
+        assert parsed.to_mapping()["allow_force_close_after_commit"] is False
+        constructed = MatchConfig(
+            game_id="example-match",
+            display_name="Example Match",
+            players=(Player(id="player_a", display_name="Player A"),),
+            local_player_id="player_a",
+            launch_profile=None,
+            mod_name=None,
+            pbem_save_directory="C:\\Placeholder\\Saves\\pbem",
+            save_matching=SaveMatchingRules(filename_glob="*.sav"),
+            turn_handling_mode=TurnHandlingMode.STANDARD,
+            allow_force_close_after_commit=True,
+        )
+        assert constructed.allow_force_close_after_commit is False
+
+    def test_fully_managed_preserves_force_close_true(self) -> None:
+        config = MatchConfig.from_mapping(match_mapping())
+        assert config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
+        assert config.allow_force_close_after_commit is True
+
+    def test_obsolete_auto_launch_rejected(self) -> None:
+        mapping = match_mapping() | {"auto_launch": True}
+        with pytest.raises(DomainValidationError) as exc_info:
+            MatchConfig.from_mapping(mapping)
+        assert exc_info.value.field_path == "auto_launch"
 
     def test_json_round_trip_is_deterministic(self) -> None:
         config = MatchConfig.from_mapping(match_mapping())
@@ -251,8 +291,16 @@ class TestMatchConfig:
                 },
             ),
             ("local_player_id", {"local_player_id": "player_c"}),
-            ("auto_launch", {"auto_launch": 1}),
-            ("auto_launch", {"auto_launch": "true"}),
+            ("turn_handling_mode", {"turn_handling_mode": "auto_launch"}),
+            ("turn_handling_mode", {"turn_handling_mode": 1}),
+            (
+                "allow_force_close_after_commit",
+                {"allow_force_close_after_commit": 1},
+            ),
+            (
+                "allow_force_close_after_commit",
+                {"allow_force_close_after_commit": "true"},
+            ),
             ("pbem_save_directory", {"pbem_save_directory": "relative\\dir"}),
             ("save_matching", {"save_matching": "*.sav"}),
             (
@@ -323,5 +371,6 @@ class TestConfigSeparation:
             "mod_name",
             "pbem_save_directory",
             "save_matching",
-            "auto_launch",
+            "turn_handling_mode",
+            "allow_force_close_after_commit",
         }

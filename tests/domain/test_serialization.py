@@ -116,7 +116,7 @@ def _valid_seq0_manifest_json() -> str:
 
 def _valid_match_config_json() -> str:
     return """{
-  "auto_launch": false,
+  "allow_force_close_after_commit": false,
   "display_name": "Example Match",
   "game_id": "example-match",
   "launch_profile": "default",
@@ -127,7 +127,8 @@ def _valid_match_config_json() -> str:
     {"display_name": "Player A", "id": "player_a"},
     {"display_name": "Player B", "id": "player_b"}
   ],
-  "save_matching": {"filename_glob": "*.CivBeyondSwordSave"}
+  "save_matching": {"filename_glob": "*.CivBeyondSwordSave"},
+  "turn_handling_mode": "standard"
 }
 """
 
@@ -254,7 +255,8 @@ def test_manifest_and_match_config_reject_nonfinite_constants(token: str) -> Non
     assert "non-finite" in exc_info.value.message
 
     match_doc = _valid_match_config_json().replace(
-        '"auto_launch": false', f'"auto_launch": {token}'
+        '"allow_force_close_after_commit": false',
+        f'"allow_force_close_after_commit": {token}',
     )
     with pytest.raises(DomainValidationError) as exc_info:
         MatchConfig.from_json_bytes(match_doc.encode("utf-8"))

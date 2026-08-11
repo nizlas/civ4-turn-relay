@@ -12,6 +12,7 @@ from civ4_turn_relay.domain.config import (
     GlobalConfig,
     MatchConfig,
     SaveMatchingRules,
+    TurnHandlingMode,
     global_config_from_env_mapping,
 )
 from civ4_turn_relay.domain.errors import DomainValidationError
@@ -68,6 +69,7 @@ __all__ = [
     "Player",
     "ProtocolMetadata",
     "SaveMatchingRules",
+    "TurnHandlingMode",
     "global_config_from_env_mapping",
     "is_sensitive_field_name",
     "parse_json_object_bytes",

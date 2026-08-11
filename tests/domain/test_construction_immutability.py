@@ -84,7 +84,6 @@ def _match_config(**overrides: Any) -> MatchConfig:
         "mod_name": "AdvCiv",
         "pbem_save_directory": "C:\\Placeholder\\Saves\\pbem",
         "save_matching": SaveMatchingRules(filename_glob="*.CivBeyondSwordSave"),
-        "auto_launch": False,
     }
     values.update(overrides)
     return MatchConfig(**values)

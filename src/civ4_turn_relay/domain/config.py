@@ -3,7 +3,7 @@
 Global configuration mirrors the ``.env.example`` shape: installation and
 server settings only. Per-match configuration carries match-local values
 only. SFTP settings and credentials never appear per match; player identity,
-mod, PBEM directory, and automatic launch never appear globally.
+mod, PBEM directory, and turn-handling settings never appear globally.
 
 Parsing is pure: environment values are read from a supplied mapping (never
 ``os.environ``) and per-match configuration round-trips through strict
@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum, unique
 
 from civ4_turn_relay.domain.construction import (
     canonicalize_tuple,
@@ -68,6 +69,20 @@ _MATCH_CONFIG_REQUIRED_KEYS = (
     "players",
     "save_matching",
 )
+
+_MATCH_CONFIG_OPTIONAL_KEYS = (
+    "allow_force_close_after_commit",
+    "turn_handling_mode",
+)
+
+
+@unique
+class TurnHandlingMode(Enum):
+    """Per-match turn-handling mode (design spec §4.2 / §8.5)."""
+
+    STANDARD = "standard"
+    FULLY_MANAGED = "fully_managed"
+
 
 _DECIMAL_INTEGER = re.compile(r"^[0-9]+$")
 
@@ -281,6 +296,25 @@ class SaveMatchingRules:
             raise error.with_prefix(path) from None
 
 
+def _parse_turn_handling_mode(
+    value: object, *, field_path: str = "turn_handling_mode"
+) -> TurnHandlingMode:
+    if isinstance(value, TurnHandlingMode):
+        return value
+    if not isinstance(value, str):
+        raise DomainValidationError(
+            "expected a turn-handling mode string",
+            field_path=field_path,
+        )
+    try:
+        return TurnHandlingMode(value)
+    except ValueError:
+        raise DomainValidationError(
+            "expected one of standard, fully_managed",
+            field_path=field_path,
+        ) from None
+
+
 @dataclass(frozen=True, slots=True)
 class MatchConfig:
     """Match-local configuration only (design spec §4.2).
@@ -296,7 +330,8 @@ class MatchConfig:
     mod_name: str | None
     pbem_save_directory: str
     save_matching: SaveMatchingRules
-    auto_launch: bool = False
+    turn_handling_mode: TurnHandlingMode = TurnHandlingMode.STANDARD
+    allow_force_close_after_commit: bool = False
 
     def __post_init__(self) -> None:
         players = canonicalize_tuple(
@@ -313,6 +348,10 @@ class MatchConfig:
         object.__setattr__(self, "launch_profile", launch_profile)
         mod_name = require_optional_string(self.mod_name, field_path="mod_name")
         object.__setattr__(self, "mod_name", mod_name)
+        turn_handling_mode = _parse_turn_handling_mode(
+            self.turn_handling_mode, field_path="turn_handling_mode"
+        )
+        object.__setattr__(self, "turn_handling_mode", turn_handling_mode)
 
         validate_game_id(self.game_id, field_path="game_id")
         _require_non_empty(self.display_name, "display_name")
@@ -340,13 +379,19 @@ class MatchConfig:
         validate_windows_local_path(
             self.pbem_save_directory, field_path="pbem_save_directory"
         )
-        if not isinstance(self.auto_launch, bool):
-            raise DomainValidationError("expected a boolean", field_path="auto_launch")
+        if not isinstance(self.allow_force_close_after_commit, bool):
+            raise DomainValidationError(
+                "expected a boolean",
+                field_path="allow_force_close_after_commit",
+            )
+        # Meaningful only in Fully managed; STANDARD always stores false.
+        if turn_handling_mode is TurnHandlingMode.STANDARD:
+            object.__setattr__(self, "allow_force_close_after_commit", False)
 
     def to_mapping(self) -> dict[str, object]:
         """Return a primitive mapping of this per-match configuration."""
         return {
-            "auto_launch": self.auto_launch,
+            "allow_force_close_after_commit": self.allow_force_close_after_commit,
             "display_name": self.display_name,
             "game_id": self.game_id,
             "launch_profile": self.launch_profile,
@@ -355,13 +400,16 @@ class MatchConfig:
             "pbem_save_directory": self.pbem_save_directory,
             "players": [player.to_mapping() for player in self.players],
             "save_matching": self.save_matching.to_mapping(),
+            "turn_handling_mode": self.turn_handling_mode.value,
         }
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> MatchConfig:
         """Parse and validate per-match configuration from a mapping."""
         check_exact_keys(
-            mapping, _MATCH_CONFIG_REQUIRED_KEYS, optional=("auto_launch",)
+            mapping,
+            _MATCH_CONFIG_REQUIRED_KEYS,
+            optional=_MATCH_CONFIG_OPTIONAL_KEYS,
         )
         players_raw = get_array(mapping, "players")
         players: list[Player] = []
@@ -373,6 +421,13 @@ class MatchConfig:
         save_matching = SaveMatchingRules.from_mapping(
             get_object(mapping, "save_matching"), path="save_matching"
         )
+        if "turn_handling_mode" in mapping:
+            turn_handling_mode = _parse_turn_handling_mode(
+                get_string(mapping, "turn_handling_mode"),
+                field_path="turn_handling_mode",
+            )
+        else:
+            turn_handling_mode = TurnHandlingMode.STANDARD
         return cls(
             game_id=get_string(mapping, "game_id"),
             display_name=get_string(mapping, "display_name"),
@@ -382,7 +437,10 @@ class MatchConfig:
             mod_name=get_optional_string(mapping, "mod_name"),
             pbem_save_directory=get_string(mapping, "pbem_save_directory"),
             save_matching=save_matching,
-            auto_launch=get_boolean(mapping, "auto_launch", default=False),
+            turn_handling_mode=turn_handling_mode,
+            allow_force_close_after_commit=get_boolean(
+                mapping, "allow_force_close_after_commit", default=False
+            ),
         )
 
     def to_json_bytes(self) -> bytes:

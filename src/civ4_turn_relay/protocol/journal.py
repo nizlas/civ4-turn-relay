@@ -1,24 +1,39 @@
-"""In-memory operation-journal port for prior-attempt and lock-resume evidence.
+"""Operation-journal port for prior-attempt and lock-resume evidence.
 
-Durable disk persistence is deferred to P4. This module provides a small
-protocol surface and a test/in-process implementation that handoff uses for
-:class:`~civ4_turn_relay.protocol.hash_classify.PriorAttemptEvidence` and
-own-lock resume (§7.1).
+:class:`InMemoryOperationJournal` is suitable for tests and in-process engines.
+Durable disk persistence lives in :mod:`civ4_turn_relay.local.journal` (P4).
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from civ4_turn_relay.domain import (
+    DomainValidationError,
     validate_client_id,
     validate_game_id,
     validate_operation_id,
     validate_player_id,
     validate_sha256_hex,
 )
+from civ4_turn_relay.domain.construction import require_optional_string
+from civ4_turn_relay.domain.serialization import (
+    check_exact_keys,
+    get_integer,
+    get_optional_string,
+    get_string,
+)
 from civ4_turn_relay.protocol.hash_classify import PriorAttemptEvidence
+
+_IN_PROGRESS_KEYS = (
+    "client_id",
+    "game_id",
+    "operation_id",
+    "player_id",
+    "sha256",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +45,8 @@ class InProgressHandoff:
     client_id: str
     player_id: str
     sha256: str
+    step_reached: str | None = None
+    protocol_sequence: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -53,6 +70,77 @@ class InProgressHandoff:
         object.__setattr__(
             self, "sha256", validate_sha256_hex(self.sha256, field_path="sha256")
         )
+        step = require_optional_string(self.step_reached, field_path="step_reached")
+        object.__setattr__(self, "step_reached", step)
+        if step is not None and not step:
+            raise DomainValidationError(
+                "must be omitted instead of empty", field_path="step_reached"
+            )
+        if self.protocol_sequence is not None:
+            if isinstance(self.protocol_sequence, bool) or not isinstance(
+                self.protocol_sequence, int
+            ):
+                raise DomainValidationError(
+                    "expected an integer (booleans are not integers)",
+                    field_path="protocol_sequence",
+                )
+            if self.protocol_sequence < 0:
+                raise DomainValidationError(
+                    "expected a non-negative integer",
+                    field_path="protocol_sequence",
+                )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "client_id": self.client_id,
+            "game_id": self.game_id,
+            "operation_id": self.operation_id,
+            "player_id": self.player_id,
+            "protocol_sequence": self.protocol_sequence,
+            "sha256": self.sha256,
+            "step_reached": self.step_reached,
+        }
+
+    @classmethod
+    def from_mapping(
+        cls, mapping: Mapping[str, object], *, path: str = ""
+    ) -> InProgressHandoff:
+        check_exact_keys(
+            mapping,
+            _IN_PROGRESS_KEYS,
+            optional=("protocol_sequence", "step_reached"),
+            path=path,
+        )
+        game_id = get_string(mapping, "game_id", path=path)
+        operation_id = get_string(mapping, "operation_id", path=path)
+        client_id = get_string(mapping, "client_id", path=path)
+        player_id = get_string(mapping, "player_id", path=path)
+        sha256 = get_string(mapping, "sha256", path=path)
+        step_reached = (
+            get_optional_string(mapping, "step_reached", path=path)
+            if "step_reached" in mapping
+            else None
+        )
+        if "protocol_sequence" not in mapping:
+            protocol_sequence: int | None = None
+        else:
+            raw_sequence = mapping["protocol_sequence"]
+            if raw_sequence is None:
+                protocol_sequence = None
+            else:
+                protocol_sequence = get_integer(mapping, "protocol_sequence", path=path)
+        try:
+            return cls(
+                game_id=game_id,
+                operation_id=operation_id,
+                client_id=client_id,
+                player_id=player_id,
+                sha256=sha256,
+                step_reached=step_reached,
+                protocol_sequence=protocol_sequence,
+            )
+        except DomainValidationError as error:
+            raise error.with_prefix(path) from None
 
 
 @runtime_checkable
