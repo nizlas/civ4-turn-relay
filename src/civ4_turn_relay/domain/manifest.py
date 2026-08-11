@@ -12,6 +12,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from civ4_turn_relay.domain.construction import (
+    canonicalize_tuple,
+    require_instance,
+    require_optional_instance,
+    require_optional_string,
+)
 from civ4_turn_relay.domain.errors import DomainValidationError
 from civ4_turn_relay.domain.ids import (
     validate_game_id,
@@ -170,10 +176,11 @@ class ProtocolMetadata:
                 f"must be {MIN_CLIENT_PROTOCOL} for protocol v1",
                 field_path="min_client_protocol",
             )
-        if self.last_operation_id is not None:
-            validate_operation_id(
-                self.last_operation_id, field_path="last_operation_id"
-            )
+        last_operation_id = require_optional_string(
+            self.last_operation_id, field_path="last_operation_id"
+        )
+        if last_operation_id is not None:
+            validate_operation_id(last_operation_id, field_path="last_operation_id")
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -216,6 +223,34 @@ class Manifest:
     protocol: ProtocolMetadata
 
     def __post_init__(self) -> None:
+        players = canonicalize_tuple(
+            self.players, Player, field_path="players", item_label="Player instance"
+        )
+        object.__setattr__(self, "players", players)
+        hashes = canonicalize_tuple(
+            self.accepted_save_hashes,
+            str,
+            field_path="accepted_save_hashes",
+            item_label="string",
+        )
+        object.__setattr__(self, "accepted_save_hashes", hashes)
+        accepted_save = require_optional_instance(
+            self.accepted_save, AcceptedSave, field_path="accepted_save"
+        )
+        object.__setattr__(self, "accepted_save", accepted_save)
+        protocol = require_instance(
+            self.protocol, ProtocolMetadata, field_path="protocol"
+        )
+        object.__setattr__(self, "protocol", protocol)
+        last_sender_id = require_optional_string(
+            self.last_sender_id, field_path="last_sender_id"
+        )
+        object.__setattr__(self, "last_sender_id", last_sender_id)
+        previous_manifest_ref = require_optional_string(
+            self.previous_manifest_ref, field_path="previous_manifest_ref"
+        )
+        object.__setattr__(self, "previous_manifest_ref", previous_manifest_ref)
+
         _require_true_int(self.schema_version, "schema_version")
         if self.schema_version != MANIFEST_SCHEMA_VERSION:
             raise DomainValidationError(
@@ -245,6 +280,10 @@ class Manifest:
                     "duplicate player ID", field_path=f"players[{index}].id"
                 )
             seen.add(player.id)
+        if not isinstance(self.current_player_id, str):
+            raise DomainValidationError(
+                "expected a string", field_path="current_player_id"
+            )
         if self.current_player_id not in seen:
             raise DomainValidationError(
                 "must be the ID of a listed player",

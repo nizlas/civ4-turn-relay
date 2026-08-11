@@ -7,17 +7,21 @@ one trailing newline.
 The strict readers implement schema-v1 parsing: missing, unexpected, or
 mistyped fields raise :class:`DomainValidationError`. JSON booleans are
 rejected wherever an integer is required (``bool`` subclasses ``int`` in
-Python and must not slip through).
+Python and must not slip through). Duplicate object keys and non-finite
+numeric constants (``NaN`` / ``Infinity`` / ``-Infinity``) are also rejected;
+there is no last-key-wins behavior.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
+from typing import cast
 
 from civ4_turn_relay.domain.errors import DomainValidationError
 
 _UTF8_BOM = b"\xef\xbb\xbf"
+_OBJECT_PAIRS_TAG = "__civ4_turn_relay_object_pairs__"
 
 
 def to_canonical_json_bytes(value: object) -> bytes:
@@ -33,8 +37,48 @@ def to_canonical_json_bytes(value: object) -> bytes:
     return text.encode("utf-8") + b"\n"
 
 
+def _reject_nonfinite_constant(name: str) -> object:
+    raise DomainValidationError(
+        "non-finite JSON numbers (NaN/Infinity) are not allowed"
+    )
+
+
+def _object_pairs_marker(
+    pairs: list[tuple[str, object]],
+) -> tuple[str, tuple[tuple[str, object], ...]]:
+    return (_OBJECT_PAIRS_TAG, tuple(pairs))
+
+
+def _convert_strict_json(value: object, *, path: str = "") -> object:
+    if isinstance(value, tuple) and len(value) == 2 and value[0] == _OBJECT_PAIRS_TAG:
+        pairs = cast(Sequence[tuple[str, object]], value[1])
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if not isinstance(key, str):
+                raise DomainValidationError(
+                    "object keys must be strings",
+                    field_path=path or None,
+                )
+            field = join_path(path, key)
+            if key in result:
+                raise DomainValidationError("duplicate object key", field_path=field)
+            result[key] = _convert_strict_json(item, path=field)
+        return result
+    if isinstance(value, list):
+        return [
+            _convert_strict_json(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    return value
+
+
 def parse_json_object_bytes(data: bytes) -> Mapping[str, object]:
-    """Parse UTF-8 JSON bytes whose top-level value must be an object."""
+    """Parse UTF-8 JSON bytes whose top-level value must be an object.
+
+    Rejects UTF-8 BOMs, invalid UTF-8, malformed JSON, non-object top-level
+    values, duplicate keys at every object depth, and non-finite numeric
+    constants. Duplicate keys never silently overwrite earlier values.
+    """
     if data.startswith(_UTF8_BOM):
         raise DomainValidationError("JSON document must not contain a UTF-8 BOM")
     try:
@@ -42,12 +86,19 @@ def parse_json_object_bytes(data: bytes) -> Mapping[str, object]:
     except UnicodeDecodeError:
         raise DomainValidationError("document is not valid UTF-8") from None
     try:
-        parsed: object = json.loads(text)
+        parsed: object = json.loads(
+            text,
+            object_pairs_hook=_object_pairs_marker,
+            parse_constant=_reject_nonfinite_constant,
+        )
+    except DomainValidationError:
+        raise
     except json.JSONDecodeError:
         raise DomainValidationError("document is not valid JSON") from None
-    if not isinstance(parsed, dict):
+    converted = _convert_strict_json(parsed)
+    if not isinstance(converted, dict):
         raise DomainValidationError("top-level JSON value must be an object")
-    return parsed
+    return cast(dict[str, object], converted)
 
 
 def join_path(parent: str, key: str) -> str:
