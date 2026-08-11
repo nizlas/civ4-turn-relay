@@ -18,9 +18,11 @@ from civ4_turn_relay.domain import (
     Player,
     SaveMatchingRules,
     global_config_from_env_mapping,
+    redact_known_secrets,
 )
 
 FAKE_PASSWORD = "placeholder-not-a-real-password"
+FAKE_PRIVATE_KEY_PATH = "C:\\Placeholder\\Keys\\id_ed25519_placeholder"
 
 
 def env_mapping() -> dict[str, str]:
@@ -34,6 +36,12 @@ def env_mapping() -> dict[str, str]:
         "CIV4_RELAY_SFTP_REMOTE_ROOT": "/placeholder/civ4-relay",
         "CIV4_RELAY_SFTP_PRIVATE_KEY_PATH": "",
         "CIV4_RELAY_SFTP_PASSWORD": FAKE_PASSWORD,
+    }
+
+
+def env_mapping_with_key() -> dict[str, str]:
+    return env_mapping() | {
+        "CIV4_RELAY_SFTP_PRIVATE_KEY_PATH": FAKE_PRIVATE_KEY_PATH,
     }
 
 
@@ -128,22 +136,31 @@ class TestGlobalConfig:
             global_config_from_env_mapping(env)
         assert exc_info.value.field_path == "log_level"
 
-    def test_password_absent_from_repr(self) -> None:
-        config = global_config_from_env_mapping(env_mapping())
-        assert FAKE_PASSWORD not in repr(config)
-        assert FAKE_PASSWORD not in str(config)
+    def test_secrets_absent_from_repr_and_str(self) -> None:
+        config = global_config_from_env_mapping(env_mapping_with_key())
+        rendered = repr(config)
+        as_text = str(config)
+        assert FAKE_PASSWORD not in rendered
+        assert FAKE_PASSWORD not in as_text
+        assert FAKE_PRIVATE_KEY_PATH not in rendered
+        assert FAKE_PRIVATE_KEY_PATH not in as_text
 
-    def test_password_absent_from_validation_errors(self) -> None:
-        env = env_mapping() | {"CIV4_RELAY_SFTP_PORT": "not-a-port"}
+    def test_secrets_absent_from_validation_errors(self) -> None:
+        env = env_mapping_with_key() | {"CIV4_RELAY_SFTP_PORT": "not-a-port"}
         with pytest.raises(DomainValidationError) as exc_info:
             global_config_from_env_mapping(env)
-        assert FAKE_PASSWORD not in str(exc_info.value)
+        message = str(exc_info.value)
+        assert FAKE_PASSWORD not in message
+        assert FAKE_PRIVATE_KEY_PATH not in message
 
     def test_redacted_diagnostics(self) -> None:
-        config = global_config_from_env_mapping(env_mapping())
+        config = global_config_from_env_mapping(env_mapping_with_key())
         redacted = config.to_redacted_mapping()
         assert redacted["sftp_password"] == REDACTED
-        assert FAKE_PASSWORD not in str(redacted)
+        assert redacted["sftp_private_key_path"] == REDACTED
+        redacted_text = str(redacted)
+        assert FAKE_PASSWORD not in redacted_text
+        assert FAKE_PRIVATE_KEY_PATH not in redacted_text
         assert redacted["sftp_host"] == "sftp.example.invalid"
 
     def test_redacted_diagnostics_show_absent_secrets_as_none(self) -> None:
@@ -151,10 +168,36 @@ class TestGlobalConfig:
         del env["CIV4_RELAY_SFTP_PASSWORD"]
         redacted = global_config_from_env_mapping(env).to_redacted_mapping()
         assert redacted["sftp_password"] is None
+        assert redacted["sftp_private_key_path"] is None
 
-    def test_secret_values_for_text_redaction(self) -> None:
-        config = global_config_from_env_mapping(env_mapping())
-        assert config.secret_values() == (FAKE_PASSWORD,)
+    def test_secret_values_include_password_and_private_key_path(self) -> None:
+        config = global_config_from_env_mapping(env_mapping_with_key())
+        assert config.secret_values() == (FAKE_PASSWORD, FAKE_PRIVATE_KEY_PATH)
+
+    def test_known_secret_text_redaction_covers_password_and_key_path(self) -> None:
+        config = global_config_from_env_mapping(env_mapping_with_key())
+        diagnostic = (
+            f"auth failed password={FAKE_PASSWORD} "
+            f"key={FAKE_PRIVATE_KEY_PATH} host={config.sftp_host}"
+        )
+        redacted = redact_known_secrets(diagnostic, config.secret_values())
+        assert FAKE_PASSWORD not in redacted
+        assert FAKE_PRIVATE_KEY_PATH not in redacted
+        assert REDACTED in redacted
+        assert config.sftp_host in redacted
+
+    def test_direct_construction_accepts_valid_optional_secrets(self) -> None:
+        config = GlobalConfig(
+            sftp_host="sftp.example.invalid",
+            sftp_port=22,
+            sftp_username="placeholder-user",
+            sftp_remote_root="/placeholder",
+            sftp_private_key_path=FAKE_PRIVATE_KEY_PATH,
+            sftp_password=FAKE_PASSWORD,
+        )
+        assert config.sftp_private_key_path == FAKE_PRIVATE_KEY_PATH
+        assert config.sftp_password == FAKE_PASSWORD
+        assert FAKE_PRIVATE_KEY_PATH not in repr(config)
 
 
 class TestMatchConfig:

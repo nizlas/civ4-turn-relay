@@ -16,6 +16,11 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from civ4_turn_relay.domain.construction import (
+    canonicalize_tuple,
+    require_instance,
+    require_optional_string,
+)
 from civ4_turn_relay.domain.errors import DomainValidationError
 from civ4_turn_relay.domain.ids import validate_game_id, validate_player_id
 from civ4_turn_relay.domain.manifest import Player
@@ -86,8 +91,9 @@ def _require_true_int(value: int, field_path: str) -> None:
 class GlobalConfig:
     """Installation-wide settings (the ``.env.example`` shape).
 
-    ``sftp_password`` is a secret: it is excluded from ``repr`` and never
-    appears in validation errors or redacted diagnostics.
+    ``sftp_password`` and ``sftp_private_key_path`` are secrets: they are
+    excluded from ``repr``, never appear in validation errors, and are
+    redacted in diagnostic representations.
     """
 
     sftp_host: str
@@ -97,7 +103,7 @@ class GlobalConfig:
     log_level: str = DEFAULT_LOG_LEVEL
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     civ4_executable: str | None = None
-    sftp_private_key_path: str | None = None
+    sftp_private_key_path: str | None = field(default=None, repr=False)
     sftp_password: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -118,7 +124,7 @@ class GlobalConfig:
                 "backslashes are not allowed in remote paths",
                 field_path="sftp_remote_root",
             )
-        if self.log_level not in _LOG_LEVELS:
+        if not isinstance(self.log_level, str) or self.log_level not in _LOG_LEVELS:
             raise DomainValidationError(
                 "expected one of DEBUG, INFO, WARNING, ERROR, CRITICAL",
                 field_path="log_level",
@@ -129,22 +135,37 @@ class GlobalConfig:
                 "expected a positive number of seconds",
                 field_path="poll_interval_seconds",
             )
-        if self.civ4_executable is not None:
+        civ4_executable = require_optional_string(
+            self.civ4_executable, field_path="civ4_executable"
+        )
+        object.__setattr__(self, "civ4_executable", civ4_executable)
+        if civ4_executable is not None:
+            validate_windows_local_path(civ4_executable, field_path="civ4_executable")
+        private_key_path = require_optional_string(
+            self.sftp_private_key_path, field_path="sftp_private_key_path"
+        )
+        object.__setattr__(self, "sftp_private_key_path", private_key_path)
+        if private_key_path is not None:
             validate_windows_local_path(
-                self.civ4_executable, field_path="civ4_executable"
+                private_key_path, field_path="sftp_private_key_path"
             )
-        if self.sftp_private_key_path is not None:
-            validate_windows_local_path(
-                self.sftp_private_key_path, field_path="sftp_private_key_path"
-            )
-        if self.sftp_password is not None and not self.sftp_password:
+        password = require_optional_string(
+            self.sftp_password, field_path="sftp_password"
+        )
+        object.__setattr__(self, "sftp_password", password)
+        if password is not None and not password:
             raise DomainValidationError(
                 "must be omitted instead of empty", field_path="sftp_password"
             )
 
     def secret_values(self) -> tuple[str, ...]:
         """Known secret values for text redaction (see FR-012)."""
-        return () if self.sftp_password is None else (self.sftp_password,)
+        secrets: list[str] = []
+        if self.sftp_password is not None:
+            secrets.append(self.sftp_password)
+        if self.sftp_private_key_path is not None:
+            secrets.append(self.sftp_private_key_path)
+        return tuple(secrets)
 
     def to_redacted_mapping(self) -> dict[str, object]:
         """Diagnostic representation with all secret fields redacted."""
@@ -278,14 +299,29 @@ class MatchConfig:
     auto_launch: bool = False
 
     def __post_init__(self) -> None:
+        players = canonicalize_tuple(
+            self.players, Player, field_path="players", item_label="Player instance"
+        )
+        object.__setattr__(self, "players", players)
+        save_matching = require_instance(
+            self.save_matching, SaveMatchingRules, field_path="save_matching"
+        )
+        object.__setattr__(self, "save_matching", save_matching)
+        launch_profile = require_optional_string(
+            self.launch_profile, field_path="launch_profile"
+        )
+        object.__setattr__(self, "launch_profile", launch_profile)
+        mod_name = require_optional_string(self.mod_name, field_path="mod_name")
+        object.__setattr__(self, "mod_name", mod_name)
+
         validate_game_id(self.game_id, field_path="game_id")
         _require_non_empty(self.display_name, "display_name")
-        if not self.players:
+        if not players:
             raise DomainValidationError(
                 "must list at least one human player", field_path="players"
             )
         seen: set[str] = set()
-        for index, player in enumerate(self.players):
+        for index, player in enumerate(players):
             if player.id in seen:
                 raise DomainValidationError(
                     "duplicate player ID", field_path=f"players[{index}].id"
@@ -297,10 +333,10 @@ class MatchConfig:
                 "must be the ID of a listed player",
                 field_path="local_player_id",
             )
-        if self.launch_profile is not None:
-            _require_non_empty(self.launch_profile, "launch_profile")
-        if self.mod_name is not None:
-            _require_non_empty(self.mod_name, "mod_name")
+        if launch_profile is not None:
+            _require_non_empty(launch_profile, "launch_profile")
+        if mod_name is not None:
+            _require_non_empty(mod_name, "mod_name")
         validate_windows_local_path(
             self.pbem_save_directory, field_path="pbem_save_directory"
         )
