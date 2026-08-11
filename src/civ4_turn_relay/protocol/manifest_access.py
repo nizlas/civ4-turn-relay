@@ -42,6 +42,8 @@ class ManifestReadResult:
 
     Field invariants:
 
+    - ``outcome`` must be a real ``ManifestReadOutcome`` (no string coercion).
+    - ``manifest``, when non-``None``, must be a real ``Manifest`` instance.
     - ``OK`` requires both ``manifest`` and exact ``raw_bytes``.
     - Non-``OK`` outcomes never carry a parsed ``manifest``.
     - ``MISSING`` and ``TRANSPORT_FAILURE`` require ``raw_bytes is None``.
@@ -56,6 +58,16 @@ class ManifestReadResult:
     raw_bytes: bytes | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.outcome, ManifestReadOutcome):
+            raise DomainValidationError(
+                "expected a ManifestReadOutcome",
+                field_path="outcome",
+            )
+        if self.manifest is not None and not isinstance(self.manifest, Manifest):
+            raise DomainValidationError(
+                "expected a Manifest instance",
+                field_path="manifest",
+            )
         if self.raw_bytes is not None and type(self.raw_bytes) is not bytes:
             raise DomainValidationError(
                 "raw_bytes must be exact bytes",

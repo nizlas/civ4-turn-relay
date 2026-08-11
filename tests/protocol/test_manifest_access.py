@@ -214,3 +214,38 @@ def test_manifest_read_result_invariants_for_non_ok_outcomes() -> None:
             ManifestReadOutcome.INVALID,
             raw_bytes=bytearray(b"{}"),  # type: ignore[arg-type]
         )
+
+
+def test_manifest_read_result_rejects_incorrect_outcome_and_manifest_types() -> None:
+    from civ4_turn_relay.protocol import ManifestReadResult
+
+    storage = FakeStorage()
+    created = initialize_match(storage, sample_match_config(), operation_id=OP_ID)
+    assert created.manifest is not None
+    raw = created.manifest.to_json_bytes()
+
+    with pytest.raises(DomainValidationError) as outcome_exc:
+        ManifestReadResult("ok", manifest=created.manifest, raw_bytes=raw)  # type: ignore[arg-type]
+    assert outcome_exc.value.field_path == "outcome"
+
+    with pytest.raises(DomainValidationError) as manifest_exc:
+        ManifestReadResult(
+            ManifestReadOutcome.OK,
+            manifest=object(),  # type: ignore[arg-type]
+            raw_bytes=raw,
+        )
+    assert manifest_exc.value.field_path == "manifest"
+
+    with pytest.raises(DomainValidationError):
+        ManifestReadResult(
+            ManifestReadOutcome.OK,
+            manifest=object(),  # type: ignore[arg-type]
+            raw_bytes=None,
+        )
+
+    # Valid reader results remain constructible and unchanged.
+    ok = read_authoritative_manifest(storage, "example-match")
+    assert ok.outcome is ManifestReadOutcome.OK
+    assert ok.manifest == created.manifest
+    assert ok.raw_bytes == raw
+    assert type(ok.raw_bytes) is bytes
