@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from civ4_turn_relay.domain import DomainValidationError
 from civ4_turn_relay.protocol import (
     HashClassification,
     PriorAttemptEvidence,
@@ -63,7 +64,46 @@ def test_absent_hash_is_new_handoff_candidate() -> None:
     assert result is HashClassification.NEW_HANDOFF_CANDIDATE
 
 
-def test_journal_only_historical_acknowledgement() -> None:
+def test_absent_hash_with_historical_journal_is_journal_only_ack() -> None:
+    result = classify_candidate_hash(
+        candidate_sha256=HASH_3,
+        accepted_save_hashes=(HASH_1, HASH_2),
+        local_player_id="player_a",
+        current_player_id="player_c",
+        last_sender_id="player_b",
+        evidence=PriorAttemptEvidence(historically_accepted_for_hash=True),
+    )
+    assert result is HashClassification.JOURNAL_ONLY_ACK
+
+
+def test_recipient_rejection_precedes_historical_journal_evidence() -> None:
+    result = classify_candidate_hash(
+        candidate_sha256=HASH_1,
+        accepted_save_hashes=(HASH_1,),
+        local_player_id="player_b",
+        current_player_id="player_b",
+        last_sender_id="player_a",
+        evidence=PriorAttemptEvidence(historically_accepted_for_hash=True),
+    )
+    assert result is HashClassification.REJECT_INCOMING
+
+
+def test_idempotent_ack_precedes_historical_journal_evidence() -> None:
+    result = classify_candidate_hash(
+        candidate_sha256=HASH_1,
+        accepted_save_hashes=(HASH_1,),
+        local_player_id="player_a",
+        current_player_id="player_b",
+        last_sender_id="player_a",
+        evidence=PriorAttemptEvidence(
+            handoff_attempted_for_hash=True,
+            historically_accepted_for_hash=True,
+        ),
+    )
+    assert result is HashClassification.IDEMPOTENT_ACK
+
+
+def test_older_accepted_hash_with_historical_evidence_is_journal_only() -> None:
     result = classify_candidate_hash(
         candidate_sha256=HASH_1,
         accepted_save_hashes=(HASH_1, HASH_2),
@@ -75,7 +115,19 @@ def test_journal_only_historical_acknowledgement() -> None:
     assert result is HashClassification.JOURNAL_ONLY_ACK
 
 
-def test_previous_sender_without_journal_is_not_idempotent_ack() -> None:
+def test_older_accepted_hash_without_historical_evidence_is_stale() -> None:
+    result = classify_candidate_hash(
+        candidate_sha256=HASH_1,
+        accepted_save_hashes=(HASH_1, HASH_2),
+        local_player_id="player_a",
+        current_player_id="player_c",
+        last_sender_id="player_b",
+        evidence=PriorAttemptEvidence(historically_accepted_for_hash=False),
+    )
+    assert result is HashClassification.STALE_REPLAY
+
+
+def test_previous_sender_without_journal_attempt_is_not_idempotent_ack() -> None:
     result = classify_candidate_hash(
         candidate_sha256=HASH_1,
         accepted_save_hashes=(HASH_1,),
@@ -85,3 +137,26 @@ def test_previous_sender_without_journal_is_not_idempotent_ack() -> None:
         evidence=PriorAttemptEvidence(handoff_attempted_for_hash=False),
     )
     assert result is HashClassification.STALE_REPLAY
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("handoff_attempted_for_hash", 1),
+        ("handoff_attempted_for_hash", "true"),
+        ("handoff_attempted_for_hash", None),
+        ("historically_accepted_for_hash", 0),
+        ("historically_accepted_for_hash", "false"),
+        ("historically_accepted_for_hash", None),
+    ],
+)
+def test_prior_attempt_evidence_requires_exact_booleans(
+    field: str, bad_value: object
+) -> None:
+    kwargs: dict[str, object] = {
+        "handoff_attempted_for_hash": False,
+        "historically_accepted_for_hash": False,
+        field: bad_value,
+    }
+    with pytest.raises(DomainValidationError):
+        PriorAttemptEvidence(**kwargs)  # type: ignore[arg-type]
