@@ -2,25 +2,7 @@
 
 A small, reliable Windows manager for Civilization IV: Beyond the Sword PBEM games, initially targeting Advanced Civ.
 
-> **Early design / scaffolding only.** This repository is not yet safe for real games. No turn relay, save handling, or GUI is implemented. Do not use it to manage active PBEM matches.
-
-## Motivation
-
-Existing third-party PBEM tooling inspired the desired workflow but proved unreliable in practice: duplicate save detection could incorrectly advance turn state, the UI did not clearly expose actual state, and crash recovery was weak.
-
-This project is written from scratch. It does not copy source, text, assets, or implementation details from that tooling.
-
-## Intended workflow
-
-1. The relay runs in the background while Civilization IV is closed.
-2. When a remote turn becomes available, the relay downloads and verifies it.
-3. Optionally, it launches Civilization IV directly into the correct save.
-4. The player finishes the turn and clicks **Next Turn** inside Civilization IV.
-5. Civilization IV creates the outgoing PBEM save.
-6. The relay detects, verifies, and uploads that save automatically.
-7. The relay transitions explicitly to waiting for the next player.
-
-The Linux host is only a shared SFTP file store. It does not run Civilization or game-server software.
+Relay keeps an authoritative SFTP-backed turn sequence, downloads and verifies saves, and automates as much of the local Civilization lifecycle as the player chooses — without copying any third-party PBEM manager.
 
 ## Design goals
 
@@ -33,6 +15,54 @@ The Linux host is only a shared SFTP file store. It does not run Civilization or
 - **Understandable diagnostics** — failures explain what happened and what to do next.
 - **Minimal user interaction** — automation for the common path; settings stay out of the way.
 - **Global server configuration** — connection details are not duplicated for every match.
+
+## Fully Managed mode
+
+**Fully Managed mode** is a primary product feature and explicit design goal: fully automated turn handling so the player mostly just plays.
+
+In the normal successful case:
+
+1. The Relay application remains running quietly in the background.
+2. When the authoritative server says it is the player’s turn, Relay downloads and verifies the save.
+3. Relay launches Civilization IV / Beyond the Sword / Advanced Civ directly with the correct save.
+4. The player simply plays the turn and presses **Next Turn** inside Civilization.
+5. Relay waits until the outgoing save is complete and stable.
+6. It verifies, uploads, and atomically commits the save for the next player.
+7. Only after the handoff is authoritatively committed does Relay gracefully close the exact Civilization process that it launched.
+8. Relay then waits for the next turn and repeats the cycle.
+
+The player does not browse save folders, upload files, navigate multiplayer menus, or interact with Relay between turns.
+
+### Closest practical Civ IV “Play by Cloud”
+
+Civilization IV has no native Play by Cloud integration. Turns are still exchanged as save files. Relay hides that file exchange and the local process lifecycle from the player.
+
+Civilization must restart and load the save for each turn — it does **not** stay running between turns. The intended rhythm is still similar to Civilization VI Play by Cloud, where receiving a turn also meant visibly loading the saved game. This project does not claim literal parity with Civ VI.
+
+### Safety properties
+
+- No automatic send without a durable play-session baseline and a stable, verified outgoing save.
+- No process close before an authoritative commit (or proven idempotent acknowledgement).
+- Only the exact Relay-launched Civilization process may be closed.
+- Failures become visible and require explicit recovery rather than silently guessing.
+
+Detailed lifecycle and safety semantics: [`docs/DESIGN_SPEC.md`](docs/DESIGN_SPEC.md) (§8.5 turn-handling modes).
+
+### Implementation status
+
+Protocol, local persistence, reconciliation, save detection, and orchestration foundations are implemented. The **complete** end-to-end Fully Managed experience — real Windows launch/close integration and the UI — is an explicit design goal still being completed in **P7/P8** ([`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md)). Until that work lands, do not rely on Fully Managed mode for real matches.
+
+## Standard mode
+
+**Standard mode** is the conservative alternative (and the default). The user explicitly launches Civilization when ready; Relay does **not** close it after a commit. Relay still downloads, verifies, detects, and uploads according to the authoritative manifest — without owning the process lifecycle.
+
+## Motivation
+
+Existing third-party PBEM tooling inspired the desired workflow but proved unreliable in practice: duplicate save detection could incorrectly advance turn state, the UI did not clearly expose actual state, and crash recovery was weak.
+
+This project is written from scratch. It does not copy source, text, assets, or implementation details from that tooling.
+
+The Linux host is only a shared SFTP file store. It does not run Civilization or game-server software.
 
 ## Planned server model
 
@@ -70,7 +100,7 @@ The authoritative implementation sequence is [`docs/PHASE_PLAN.md`](docs/PHASE_P
 
 ## Design documents
 
-Normative design (not yet implemented):
+Normative design:
 
 - [`AGENTS.md`](AGENTS.md) — document routing and hard safety rules for contributors and coding agents
 - [`docs/DESIGN_SPEC.md`](docs/DESIGN_SPEC.md) — product behavior, configuration, UI, and acceptance criteria
@@ -80,6 +110,8 @@ Normative design (not yet implemented):
 ## Security
 
 Credentials and real server details must never be committed. Copy [`.env.example`](.env.example) to a local `.env` (gitignored). Prefer SSH keys over passwords where practical. The application must never log credentials. See also [`.gitignore`](.gitignore) for ignored secrets, keys, and save files.
+
+SFTP host-key verification is mandatory (known_hosts **or** SHA-256 fingerprint). Adapter details and the disposable OpenSSH test command are in [`docs/SFTP_ADAPTER.md`](docs/SFTP_ADAPTER.md).
 
 ## License
 

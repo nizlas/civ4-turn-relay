@@ -71,6 +71,9 @@ class FakeStorage:
     def capabilities(self) -> StorageCapabilities:
         return self._capabilities
 
+    def close(self) -> None:
+        """No-op for API parity with network adapters. Idempotent."""
+
     def snapshot(self) -> StorageSnapshot:
         """Return an immutable copy of the current tree (no shared mutables)."""
         files = {path: bytes(content) for path, content in self._files.items()}

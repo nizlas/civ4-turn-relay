@@ -22,6 +22,7 @@ from civ4_turn_relay.storage.faults import (
     FaultScheduleError,
     StorageOp,
 )
+from civ4_turn_relay.storage.paramiko_sftp import ParamikoStorage
 from civ4_turn_relay.storage.port import (
     Storage,
     StorageCapabilities,
@@ -43,6 +44,7 @@ __all__ = [
     "FaultScheduleError",
     "ObjectComparisonResult",
     "ObjectFingerprint",
+    "ParamikoStorage",
     "Storage",
     "StorageAlreadyExistsError",
     "StorageCapabilities",

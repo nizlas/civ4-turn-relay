@@ -7,6 +7,7 @@ from civ4_turn_relay.local.detect import (
     DetectionOutcome,
     DetectionResult,
     observe_outgoing_candidates,
+    revalidate_candidate_file,
 )
 from civ4_turn_relay.local.diagnostics import DiagnosticEvent, emit_diagnostic
 from civ4_turn_relay.local.errors import (
@@ -16,13 +17,18 @@ from civ4_turn_relay.local.errors import (
     LocalStoreMissingError,
     LocalStoreUnsupportedSchemaError,
 )
+from civ4_turn_relay.local.handoff_evidence import (
+    HandoffEvidence,
+    attribute_handoff_result,
+    attribute_journal_against_manifest,
+)
 from civ4_turn_relay.local.intents import OrchestrationIntent, OrchestrationIntentKind
 from civ4_turn_relay.local.journal import DurableHandoffJournal
 from civ4_turn_relay.local.json_store import AtomicJsonStore, atomic_write_bytes
 from civ4_turn_relay.local.orchestrate import (
-    HandoffEvidence,
     ProcessObservation,
     decide_intents,
+    observation_matches_association,
 )
 from civ4_turn_relay.local.promote import (
     PromoteOutcome,
@@ -42,6 +48,7 @@ from civ4_turn_relay.local.records import (
     MatchLocalRecords,
     OutgoingCandidateRecord,
     PlaySessionBaseline,
+    PostCommitCloseRecord,
     ProcessAssociationRecord,
     StabilityObservation,
     VerifiedRemoteRecord,
@@ -79,6 +86,7 @@ __all__ = [
     "OrchestrationIntentKind",
     "OutgoingCandidateRecord",
     "PlaySessionBaseline",
+    "PostCommitCloseRecord",
     "ProcessAssociationRecord",
     "ProcessObservation",
     "PromoteOutcome",
@@ -89,10 +97,14 @@ __all__ = [
     "SystemClock",
     "VerifiedRemoteRecord",
     "atomic_write_bytes",
+    "attribute_handoff_result",
+    "attribute_journal_against_manifest",
     "capture_play_session_baseline",
     "decide_intents",
     "emit_diagnostic",
+    "observation_matches_association",
     "observe_outgoing_candidates",
     "promote_verified_download",
     "reconcile_match",
+    "revalidate_candidate_file",
 ]

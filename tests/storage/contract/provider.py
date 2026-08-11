@@ -79,6 +79,11 @@ class DelegatingStorage:
     def atomic_replace(self, source: str, destination: str) -> None:
         self._inner.atomic_replace(source, destination)
 
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            close()
+
 
 class DelegatingStorageProvider:
     """Provider that returns DelegatingStorage around FakeStorage."""

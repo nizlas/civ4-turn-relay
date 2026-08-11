@@ -32,15 +32,15 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 | P2 | Storage abstraction and failure-injectable fake storage | **COMPLETE** |
 | P3 | Core sync protocol engine | **COMPLETE** |
 | P4 | Local persistence, reconciliation, baseline, save detection, watching | **COMPLETE** |
-| P5 | Headless two-client end-to-end (fake storage) | **ACTIVE** |
-| P6 | Paramiko SFTP adapter and disposable-server integration tests | NOT STARTED |
-| P7 | Windows Civ IV / BTS / AdvCiv launch and process integration | NOT STARTED |
+| P5 | Headless two-client end-to-end (fake storage) | **COMPLETE** |
+| P6 | Paramiko SFTP adapter and disposable-server integration tests | **COMPLETE** |
+| P7 | Windows Civ IV / BTS / AdvCiv launch and process integration | **ACTIVE** |
 | P8 | Minimal PySide6 UI, matches, settings, status, diagnostics | NOT STARTED |
 | P9 | Two-player hardening, packaging, ops docs, release readiness | NOT STARTED |
 
 ## 4. Active implementation phase
 
-**P5 — Headless two-client end-to-end workflow (fake storage)** is the only ACTIVE phase.
+**P7 — Windows Civilization IV / BTS / Advanced Civ launch and process integration** is the only ACTIVE phase.
 
 ## 5. Phase-gate process
 
@@ -479,7 +479,7 @@ P4 closed with LocalStore (`installation.json`, per-match `config.json`/`state.j
 
 ## P5 — Headless two-client end-to-end workflow (fake storage)
 
-**Status:** ACTIVE
+**Status:** COMPLETE
 
 ### Goal
 
@@ -535,11 +535,15 @@ None required if e2e suite is deterministic.
 
 - Timing sensitivity — prefer deterministic fake clock/events over wall-clock sleeps where possible
 
+### Completion note
+
+P5 closed with production `RelayClient` (`app/`) composing LocalStore, Storage, P3 init/download/handoff, and P4 reconcile/detect/monitor/intents. Deterministic two-client FakeStorage e2e in `tests/e2e_fake/` covers initialize→alternating handoffs, Fully Managed auto-launch/auto-send/close intents, Standard explicit Start, multi-candidate selection, non-owner rejection, duplicate-tick idempotency, restart with baseline/process association, Civ-exit-without-save (no relaunch loop), second-match isolation, and fault/retry/idempotent resume scenarios. UI, Paramiko live OpenSSH (P6), and real Civ process control remain later phases.
+
 ---
 
 ## P6 — Paramiko SFTP adapter and disposable-server integration tests
 
-**Status:** NOT STARTED
+**Status:** COMPLETE
 
 ### Goal
 
@@ -601,11 +605,15 @@ P5 complete.
 - Confirm host-key UX details for first-time pin ([DESIGN_SPEC §13](DESIGN_SPEC.md#13-open-decisions))
 - CI availability of disposable sshd — may be manual/nightly if needed
 
+### Completion note
+
+P6 closed with `ParamikoStorage` implementing the full Storage contract (path containment, exclusive mkdir, OpenSSH `rename` publish-no-replace, `posix_rename` atomic replace, complete read-back), connection-time capability probing, and strict host-key verification (`known_hosts` and/or SHA-256 fingerprint; no AutoAddPolicy). GlobalConfig extended for passphrase, connect timeout, and host-key settings; `load_global_config` loads an explicit dotenv path with environ override via `python-dotenv`. Disposable Alpine OpenSSH harness lives under `tests/storage/integration/` (`pytest -m openssh_sftp`); ordinary runs skip cleanly when Docker is unavailable. Reusable contract remains on FakeStorage + delegating wrapper. Docs: [`docs/SFTP_ADAPTER.md`](SFTP_ADAPTER.md), [`.env.example`](../.env.example). Live OpenSSH contract execution was not run in the closing environment because Docker was unavailable; the harness is ready for `pytest -m openssh_sftp`.
+
 ---
 
 ## P7 — Windows Civilization IV / BTS / Advanced Civ launch and process integration
 
-**Status:** NOT STARTED
+**Status:** ACTIVE
 
 ### Goal
 

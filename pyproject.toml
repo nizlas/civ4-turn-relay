@@ -11,19 +11,25 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 authors = [{ name = "Niclas Danielsson" }]
-dependencies = ["watchdog>=4.0.0,<7"]
+dependencies = [
+    "watchdog>=4.0.0,<7",
+    "paramiko>=3.4.0,<4",
+    "python-dotenv>=1.0.0,<2",
+]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "ruff",
     "mypy",
+    "types-paramiko",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "pt(id): protocol test-matrix identifier from SYNC_PROTOCOL.md §13",
+    "openssh_sftp: disposable OpenSSH/Docker SFTP integration (skipped when unavailable)",
 ]
 
 [tool.ruff]

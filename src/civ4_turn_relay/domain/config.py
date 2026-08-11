@@ -42,6 +42,7 @@ ENV_PREFIX = "CIV4_RELAY_"
 
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_POLL_INTERVAL_SECONDS = 10
+DEFAULT_SFTP_CONNECT_TIMEOUT_SECONDS = 30
 
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
@@ -55,9 +56,15 @@ _ENV_KEYS = frozenset(
         "SFTP_USERNAME",
         "SFTP_REMOTE_ROOT",
         "SFTP_PRIVATE_KEY_PATH",
+        "SFTP_PRIVATE_KEY_PASSPHRASE",
         "SFTP_PASSWORD",
+        "SFTP_KNOWN_HOSTS_PATH",
+        "SFTP_HOST_KEY_SHA256",
+        "SFTP_CONNECT_TIMEOUT_SECONDS",
     }
 )
+
+_HOST_KEY_SHA256 = re.compile(r"^(?:SHA256:)?[A-Za-z0-9+/]+=*$")
 
 _MATCH_CONFIG_REQUIRED_KEYS = (
     "display_name",
@@ -106,9 +113,9 @@ def _require_true_int(value: int, field_path: str) -> None:
 class GlobalConfig:
     """Installation-wide settings (the ``.env.example`` shape).
 
-    ``sftp_password`` and ``sftp_private_key_path`` are secrets: they are
-    excluded from ``repr``, never appear in validation errors, and are
-    redacted in diagnostic representations.
+    Secret fields are excluded from ``repr``, never appear in validation
+    errors, and are redacted in diagnostic representations. Match configs
+    must not duplicate these server credentials.
     """
 
     sftp_host: str
@@ -119,7 +126,11 @@ class GlobalConfig:
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     civ4_executable: str | None = None
     sftp_private_key_path: str | None = field(default=None, repr=False)
+    sftp_private_key_passphrase: str | None = field(default=None, repr=False)
     sftp_password: str | None = field(default=None, repr=False)
+    sftp_known_hosts_path: str | None = None
+    sftp_host_key_sha256: str | None = None
+    sftp_connect_timeout_seconds: int = DEFAULT_SFTP_CONNECT_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         _require_non_empty(self.sftp_host, "sftp_host")
@@ -150,6 +161,14 @@ class GlobalConfig:
                 "expected a positive number of seconds",
                 field_path="poll_interval_seconds",
             )
+        _require_true_int(
+            self.sftp_connect_timeout_seconds, "sftp_connect_timeout_seconds"
+        )
+        if self.sftp_connect_timeout_seconds < 1:
+            raise DomainValidationError(
+                "expected a positive number of seconds",
+                field_path="sftp_connect_timeout_seconds",
+            )
         civ4_executable = require_optional_string(
             self.civ4_executable, field_path="civ4_executable"
         )
@@ -164,6 +183,15 @@ class GlobalConfig:
             validate_windows_local_path(
                 private_key_path, field_path="sftp_private_key_path"
             )
+        passphrase = require_optional_string(
+            self.sftp_private_key_passphrase, field_path="sftp_private_key_passphrase"
+        )
+        object.__setattr__(self, "sftp_private_key_passphrase", passphrase)
+        if passphrase is not None and private_key_path is None:
+            raise DomainValidationError(
+                "private-key passphrase requires a private-key path",
+                field_path="sftp_private_key_passphrase",
+            )
         password = require_optional_string(
             self.sftp_password, field_path="sftp_password"
         )
@@ -172,12 +200,47 @@ class GlobalConfig:
             raise DomainValidationError(
                 "must be omitted instead of empty", field_path="sftp_password"
             )
+        if private_key_path is None and password is None:
+            raise DomainValidationError(
+                "either sftp_password or sftp_private_key_path is required",
+                field_path="sftp_password",
+            )
+        known_hosts = require_optional_string(
+            self.sftp_known_hosts_path, field_path="sftp_known_hosts_path"
+        )
+        object.__setattr__(self, "sftp_known_hosts_path", known_hosts)
+        if known_hosts is not None:
+            validate_windows_local_path(known_hosts, field_path="sftp_known_hosts_path")
+        fingerprint = require_optional_string(
+            self.sftp_host_key_sha256, field_path="sftp_host_key_sha256"
+        )
+        if fingerprint is not None:
+            if not _HOST_KEY_SHA256.fullmatch(fingerprint):
+                raise DomainValidationError(
+                    "expected a SHA-256 host-key fingerprint",
+                    field_path="sftp_host_key_sha256",
+                )
+            if not fingerprint.startswith("SHA256:"):
+                fingerprint = f"SHA256:{fingerprint}"
+        object.__setattr__(self, "sftp_host_key_sha256", fingerprint)
+        if known_hosts is None and fingerprint is None:
+            raise DomainValidationError(
+                "either sftp_known_hosts_path or sftp_host_key_sha256 is required",
+                field_path="sftp_host_key_sha256",
+            )
+        if known_hosts is not None and fingerprint is not None:
+            raise DomainValidationError(
+                "sftp_known_hosts_path and sftp_host_key_sha256 are mutually exclusive",
+                field_path="sftp_host_key_sha256",
+            )
 
     def secret_values(self) -> tuple[str, ...]:
         """Known secret values for text redaction (see FR-012)."""
         secrets: list[str] = []
         if self.sftp_password is not None:
             secrets.append(self.sftp_password)
+        if self.sftp_private_key_passphrase is not None:
+            secrets.append(self.sftp_private_key_passphrase)
         if self.sftp_private_key_path is not None:
             secrets.append(self.sftp_private_key_path)
         return tuple(secrets)
@@ -188,9 +251,15 @@ class GlobalConfig:
             "civ4_executable": self.civ4_executable,
             "log_level": self.log_level,
             "poll_interval_seconds": self.poll_interval_seconds,
+            "sftp_connect_timeout_seconds": self.sftp_connect_timeout_seconds,
             "sftp_host": self.sftp_host,
+            "sftp_host_key_sha256": self.sftp_host_key_sha256,
+            "sftp_known_hosts_path": self.sftp_known_hosts_path,
             "sftp_password": (None if self.sftp_password is None else REDACTED),
             "sftp_port": self.sftp_port,
+            "sftp_private_key_passphrase": (
+                None if self.sftp_private_key_passphrase is None else REDACTED
+            ),
             "sftp_private_key_path": (
                 None if self.sftp_private_key_path is None else REDACTED
             ),
@@ -244,6 +313,14 @@ def global_config_from_env_mapping(env: Mapping[str, str]) -> GlobalConfig:
             poll_text, field_path=ENV_PREFIX + "POLL_INTERVAL_SECONDS"
         )
     )
+    timeout_text = value_of("SFTP_CONNECT_TIMEOUT_SECONDS")
+    connect_timeout = (
+        DEFAULT_SFTP_CONNECT_TIMEOUT_SECONDS
+        if timeout_text is None
+        else _parse_env_integer(
+            timeout_text, field_path=ENV_PREFIX + "SFTP_CONNECT_TIMEOUT_SECONDS"
+        )
+    )
     return GlobalConfig(
         sftp_host=required("SFTP_HOST"),
         sftp_port=port,
@@ -253,7 +330,11 @@ def global_config_from_env_mapping(env: Mapping[str, str]) -> GlobalConfig:
         poll_interval_seconds=poll_interval,
         civ4_executable=value_of("CIV4_EXECUTABLE"),
         sftp_private_key_path=value_of("SFTP_PRIVATE_KEY_PATH"),
+        sftp_private_key_passphrase=value_of("SFTP_PRIVATE_KEY_PASSPHRASE"),
         sftp_password=value_of("SFTP_PASSWORD"),
+        sftp_known_hosts_path=value_of("SFTP_KNOWN_HOSTS_PATH"),
+        sftp_host_key_sha256=value_of("SFTP_HOST_KEY_SHA256"),
+        sftp_connect_timeout_seconds=connect_timeout,
     )
 
 

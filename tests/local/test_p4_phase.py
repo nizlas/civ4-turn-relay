@@ -358,20 +358,42 @@ def test_reconcile_stale_evidence_redownloads(tmp_path: Path) -> None:
     assert result.records.downloaded_save.sha256 == digest
 
 
+def _handoff_evidence(
+    *,
+    game_id: str,
+    digest: str,
+    data: bytes,
+    outcome: HandoffOutcome,
+    local_player_id: str = "player_a",
+    operation_id: str = OP_ID,
+    source_protocol_sequence: int = 0,
+) -> HandoffEvidence:
+    return HandoffEvidence(
+        outcome=outcome,
+        game_id=game_id,
+        operation_id=operation_id,
+        local_player_id=local_player_id,
+        sha256=digest,
+        size_bytes=len(data),
+        source_protocol_sequence=source_protocol_sequence,
+        result_protocol_sequence=source_protocol_sequence + 1,
+    )
+
+
 def test_reconcile_committed_handoff_waiting_with_processed_hash(
     tmp_path: Path,
 ) -> None:
     storage = FakeStorage()
     game_id, digest = _commit_player_a_turn(storage)
     store = _local_store(tmp_path)
-    config = _match_config(tmp_path, local_player_id="player_b")
+    config = _match_config(tmp_path, local_player_id="player_a")
     store.write_match_config(config)
 
-    evidence = HandoffEvidence(
-        outcome_name="committed",
-        sha256=digest,
-        protocol_sequence=1,
-        operation_id=OP_ID,
+    evidence = _handoff_evidence(
+        game_id=game_id,
+        digest=digest,
+        data=SAVE_A,
+        outcome=HandoffOutcome.COMMITTED,
     )
     result = _reconcile(storage, store, config, handoff_evidence=evidence)
 
@@ -384,12 +406,13 @@ def test_reconcile_idempotent_handoff_evidence(tmp_path: Path) -> None:
     storage = FakeStorage()
     game_id, digest = _commit_player_a_turn(storage)
     store = _local_store(tmp_path)
-    config = _match_config(tmp_path, local_player_id="player_b")
+    config = _match_config(tmp_path, local_player_id="player_a")
     store.write_match_config(config)
-    evidence = HandoffEvidence(
-        outcome_name="idempotent_ack",
-        sha256=digest,
-        protocol_sequence=1,
+    evidence = _handoff_evidence(
+        game_id=game_id,
+        digest=digest,
+        data=SAVE_A,
+        outcome=HandoffOutcome.IDEMPOTENT_ACK,
     )
 
     first = _reconcile(storage, store, config, handoff_evidence=evidence)
@@ -586,7 +609,7 @@ def test_pt21_path_overwrite_new_hash_eligible(tmp_path: Path) -> None:
 @pytest.mark.pt("PT-22")
 def test_pt22_baseline_survives_restart_while_civ_running(tmp_path: Path) -> None:
     storage = FakeStorage()
-    _commit_player_a_turn(storage)
+    game_id, digest = _commit_player_a_turn(storage)
     store = _local_store(tmp_path)
     config = _match_config(tmp_path, local_player_id="player_b")
     store.write_match_config(config)
@@ -596,7 +619,21 @@ def test_pt22_baseline_survives_restart_while_civ_running(tmp_path: Path) -> Non
     assert baseline is not None
     assert any(i.kind is OrchestrationIntentKind.START_CIV for i in launched.intents)
 
-    running = _reconcile(storage, store, config, process_observation=_process_obs())
+    obs = _process_obs()
+    store.write_match_state(
+        replace(
+            launched.records,
+            process_association=ProcessAssociationRecord(
+                protocol_sequence=1,
+                accepted_sha256=digest,
+                pid=obs.pid,
+                process_start_time_utc=obs.process_start_time_utc,
+                executable_path=obs.executable_path,
+                associated_at=NOW_UTC,
+            ),
+        )
+    )
+    running = _reconcile(storage, store, config, process_observation=obs)
     assert running.operational_state is OperationalState.CIV_RUNNING
     assert running.records.play_session_baseline == baseline
 
@@ -605,7 +642,7 @@ def test_pt22_baseline_survives_restart_while_civ_running(tmp_path: Path) -> Non
         storage,
         reloaded_store,
         config,
-        process_observation=_process_obs(),
+        process_observation=obs,
     )
 
     assert restarted.operational_state is OperationalState.CIV_RUNNING
@@ -907,10 +944,19 @@ def test_process_association_suppresses_relaunch(tmp_path: Path) -> None:
 
     managed = _match_config(tmp_path, local_player_id="player_b")
     store.write_match_config(managed)
+    # Association without a matching live observation suppresses relaunch
+    # and must not invent RESUME/FOCUS for an unverified process.
     second = _reconcile(storage, store, managed)
     kinds = {intent.kind for intent in second.intents}
     assert OrchestrationIntentKind.START_CIV not in kinds
-    assert OrchestrationIntentKind.RESUME_OR_FOCUS_CIV in kinds
+    assert OrchestrationIntentKind.RESUME_OR_FOCUS_CIV not in kinds
+
+    resumed = _reconcile(
+        storage, store, managed, process_observation=_process_obs(running=True)
+    )
+    assert OrchestrationIntentKind.RESUME_OR_FOCUS_CIV in {
+        intent.kind for intent in resumed.intents
+    }
 
 
 def test_prepare_or_send_on_one_candidate(tmp_path: Path) -> None:
@@ -950,15 +996,11 @@ def test_no_close_before_commit(tmp_path: Path) -> None:
 def test_close_after_committed_or_idempotent(tmp_path: Path) -> None:
     storage = FakeStorage()
     game_id, digest = _commit_player_a_turn(storage)
-    store = _local_store(tmp_path)
-    config = _match_config(tmp_path, local_player_id="player_b")
-    store.write_match_config(config)
-    running = _reconcile(storage, store, config, process_observation=_process_obs())
-    records = replace(
-        running.records,
+    records = MatchLocalRecords(
+        game_id=game_id,
         process_association=ProcessAssociationRecord(
-            protocol_sequence=1,
-            accepted_sha256=digest,
+            protocol_sequence=0,
+            accepted_sha256=None,
             pid=4242,
             process_start_time_utc=NOW_UTC,
             executable_path=r"C:\Games\Civ4\BeyondSword.exe",
@@ -966,16 +1008,19 @@ def test_close_after_committed_or_idempotent(tmp_path: Path) -> None:
         ),
     )
 
-    for outcome in ("committed", "idempotent_ack"):
-        evidence = HandoffEvidence(
-            outcome_name=outcome,
-            sha256=digest,
-            protocol_sequence=1,
+    for outcome in (HandoffOutcome.COMMITTED, HandoffOutcome.IDEMPOTENT_ACK):
+        evidence = _handoff_evidence(
+            game_id=game_id,
+            digest=digest,
+            data=SAVE_A,
+            outcome=outcome,
+            local_player_id="player_a",
+            source_protocol_sequence=0,
         )
         intents = decide_intents(
             TurnHandlingMode.FULLY_MANAGED,
             False,
-            OperationalState.CIV_RUNNING,
+            OperationalState.WAITING_FOR_OTHER_PLAYER,
             records,
             None,
             _process_obs(running=True),
@@ -985,6 +1030,30 @@ def test_close_after_committed_or_idempotent(tmp_path: Path) -> None:
         assert OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE in {
             i.kind for i in intents
         }
+
+    mismatched = decide_intents(
+        TurnHandlingMode.FULLY_MANAGED,
+        False,
+        OperationalState.WAITING_FOR_OTHER_PLAYER,
+        records,
+        None,
+        ProcessObservation(
+            pid=9999,
+            process_start_time_utc=NOW_UTC,
+            executable_path=r"C:\Games\Civ4\BeyondSword.exe",
+            running=True,
+        ),
+        _handoff_evidence(
+            game_id=game_id,
+            digest=digest,
+            data=SAVE_A,
+            outcome=HandoffOutcome.COMMITTED,
+        ),
+        False,
+    )
+    assert OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE not in {
+        i.kind for i in mismatched
+    }
 
 
 def test_standard_never_auto_start_civ(tmp_path: Path) -> None:
@@ -1005,17 +1074,18 @@ def test_standard_never_auto_start_civ(tmp_path: Path) -> None:
 
 def test_allow_force_close_never_emits_terminate(tmp_path: Path) -> None:
     storage = FakeStorage()
-    _game_id, digest = _commit_player_a_turn(storage)
-    evidence = HandoffEvidence(
-        outcome_name="committed",
-        sha256=digest,
-        protocol_sequence=1,
+    game_id, digest = _commit_player_a_turn(storage)
+    evidence = _handoff_evidence(
+        game_id=game_id,
+        digest=digest,
+        data=SAVE_A,
+        outcome=HandoffOutcome.COMMITTED,
     )
     records = MatchLocalRecords(
-        game_id="example-match",
+        game_id=game_id,
         process_association=ProcessAssociationRecord(
-            protocol_sequence=1,
-            accepted_sha256=digest,
+            protocol_sequence=0,
+            accepted_sha256=None,
             pid=4242,
             process_start_time_utc=NOW_UTC,
             executable_path=r"C:\Games\Civ4\BeyondSword.exe",
@@ -1025,7 +1095,7 @@ def test_allow_force_close_never_emits_terminate(tmp_path: Path) -> None:
     intents = decide_intents(
         TurnHandlingMode.FULLY_MANAGED,
         True,
-        OperationalState.CIV_RUNNING,
+        OperationalState.WAITING_FOR_OTHER_PLAYER,
         records,
         None,
         _process_obs(running=True),

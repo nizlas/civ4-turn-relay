@@ -15,11 +15,12 @@ from civ4_turn_relay.domain import (
     validate_original_filename,
     validate_windows_local_path,
 )
+from civ4_turn_relay.local.json_store import PublishNoReplaceFn, publish_no_replace
 from civ4_turn_relay.local.records import DownloadedSaveRecord
 from civ4_turn_relay.protocol.download import VerifiedDownloadArtifact
 
-ReplaceFn = Callable[[str, str], None]
 FsyncFn = Callable[[int], None]
+UuidFactory = Callable[[], uuid.UUID]
 
 
 @unique
@@ -71,14 +72,47 @@ def _resolve_destination(pbem_dir: Path, original_filename: str) -> Path | None:
         return None
 
 
+def _record_for(
+    destination: Path, artifact: VerifiedDownloadArtifact
+) -> DownloadedSaveRecord | None:
+    try:
+        local_path = validate_windows_local_path(
+            str(destination), field_path="local_path"
+        )
+    except DomainValidationError:
+        return None
+    return DownloadedSaveRecord(
+        local_path=local_path,
+        sha256=artifact.sha256,
+        size_bytes=artifact.size_bytes,
+        protocol_sequence=artifact.protocol_sequence,
+    )
+
+
+def _exact_match(path: Path, artifact: VerifiedDownloadArtifact) -> bool | None:
+    """Return True/False for match, or None on I/O failure."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return False
+        existing = path.read_bytes()
+    except OSError:
+        return None
+    return (
+        len(existing) == artifact.size_bytes
+        and sha256_hex(existing) == artifact.sha256
+        and existing == artifact.verified_bytes
+    )
+
+
 def promote_verified_download(
     artifact: VerifiedDownloadArtifact,
     pbem_save_directory: str,
     *,
-    replace_fn: ReplaceFn = os.replace,
     fsync_fn: FsyncFn = os.fsync,
+    uuid_factory: UuidFactory = uuid.uuid4,
+    publish_no_replace_fn: PublishNoReplaceFn = publish_no_replace,
 ) -> PromoteResult:
-    """Promote verified bytes into the match PBEM directory atomically."""
+    """Promote verified bytes with atomic no-replace semantics (never overwrite)."""
     if not isinstance(artifact, VerifiedDownloadArtifact):
         raise TypeError("artifact must be a VerifiedDownloadArtifact")
 
@@ -94,27 +128,15 @@ def promote_verified_download(
     if destination is None:
         return PromoteResult(PromoteOutcome.PATH_VIOLATION)
 
-    if destination.is_file():
-        try:
-            existing = destination.read_bytes()
-        except OSError:
+    if destination.exists():
+        match = _exact_match(destination, artifact)
+        if match is None:
             return PromoteResult(PromoteOutcome.IO_FAILURE)
-        if existing == artifact.verified_bytes:
-            try:
-                local_path = validate_windows_local_path(
-                    str(destination), field_path="local_path"
-                )
-            except DomainValidationError:
+        if match:
+            record = _record_for(destination, artifact)
+            if record is None:
                 return PromoteResult(PromoteOutcome.PATH_VIOLATION)
-            return PromoteResult(
-                PromoteOutcome.ALREADY_PRESENT,
-                record=DownloadedSaveRecord(
-                    local_path=local_path,
-                    sha256=artifact.sha256,
-                    size_bytes=artifact.size_bytes,
-                    protocol_sequence=artifact.protocol_sequence,
-                ),
-            )
+            return PromoteResult(PromoteOutcome.ALREADY_PRESENT, record=record)
         return PromoteResult(PromoteOutcome.CONFLICT)
 
     parent = destination.parent
@@ -123,7 +145,8 @@ def promote_verified_download(
     except OSError:
         return PromoteResult(PromoteOutcome.IO_FAILURE)
 
-    temporary = parent / f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    temporary = parent / f".{destination.name}.{uuid_factory().hex}.tmp"
+    published = False
     try:
         try:
             with temporary.open("wb") as handle:
@@ -133,7 +156,7 @@ def promote_verified_download(
         except OSError:
             return PromoteResult(PromoteOutcome.IO_FAILURE)
         try:
-            replace_fn(str(temporary), str(destination))
+            published = publish_no_replace_fn(str(temporary), str(destination))
         except OSError:
             return PromoteResult(PromoteOutcome.IO_FAILURE)
     finally:
@@ -143,6 +166,18 @@ def promote_verified_download(
             except OSError:
                 pass
 
+    if not published:
+        # Another writer won the race; never overwrite — compare bytes.
+        match = _exact_match(destination, artifact)
+        if match is None:
+            return PromoteResult(PromoteOutcome.IO_FAILURE)
+        if match:
+            record = _record_for(destination, artifact)
+            if record is None:
+                return PromoteResult(PromoteOutcome.PATH_VIOLATION)
+            return PromoteResult(PromoteOutcome.ALREADY_PRESENT, record=record)
+        return PromoteResult(PromoteOutcome.CONFLICT)
+
     try:
         reread = destination.read_bytes()
     except OSError:
@@ -150,19 +185,7 @@ def promote_verified_download(
     if len(reread) != artifact.size_bytes or sha256_hex(reread) != artifact.sha256:
         return PromoteResult(PromoteOutcome.VERIFY_FAILURE)
 
-    try:
-        local_path = validate_windows_local_path(
-            str(destination), field_path="local_path"
-        )
-    except DomainValidationError:
+    record = _record_for(destination, artifact)
+    if record is None:
         return PromoteResult(PromoteOutcome.PATH_VIOLATION)
-
-    return PromoteResult(
-        PromoteOutcome.PROMOTED,
-        record=DownloadedSaveRecord(
-            local_path=local_path,
-            sha256=artifact.sha256,
-            size_bytes=artifact.size_bytes,
-            protocol_sequence=artifact.protocol_sequence,
-        ),
-    )
+    return PromoteResult(PromoteOutcome.PROMOTED, record=record)

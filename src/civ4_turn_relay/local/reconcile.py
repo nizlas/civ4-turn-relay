@@ -1,4 +1,4 @@
-"""Startup reconciliation: manifest, download, detect, intents (design §9.1)."""
+"""Startup reconciliation: manifest, download, journal recovery, intents."""
 
 from __future__ import annotations
 
@@ -18,24 +18,29 @@ from civ4_turn_relay.local.detect import (
     observe_outgoing_candidates,
 )
 from civ4_turn_relay.local.diagnostics import DiagnosticEvent, emit_diagnostic
+from civ4_turn_relay.local.download_validate import validated_prior_download_evidence
+from civ4_turn_relay.local.handoff_evidence import (
+    HandoffEvidence,
+    attribute_journal_against_manifest,
+)
 from civ4_turn_relay.local.intents import OrchestrationIntent, OrchestrationIntentKind
 from civ4_turn_relay.local.journal import DurableHandoffJournal
 from civ4_turn_relay.local.orchestrate import (
-    HandoffEvidence,
     ProcessObservation,
     decide_intents,
+    observation_matches_association,
 )
 from civ4_turn_relay.local.promote import PromoteOutcome, promote_verified_download
 from civ4_turn_relay.local.records import (
     LaunchAttemptRecord,
     MatchLocalRecords,
+    PostCommitCloseRecord,
     VerifiedRemoteRecord,
 )
 from civ4_turn_relay.local.store import LocalStore
 from civ4_turn_relay.protocol.download import (
     DownloadOutcome,
     DownloadRequest,
-    VerifiedDownloadEvidence,
     download_accepted_save,
 )
 from civ4_turn_relay.protocol.handoff import DEFAULT_MAX_SAVE_BYTES
@@ -75,6 +80,13 @@ class ReconcileRequest:
                 f"max_save_bytes must be in 1..{DEFAULT_MAX_SAVE_BYTES}",
                 field_path="max_save_bytes",
             )
+        if self.handoff_evidence is not None and not isinstance(
+            self.handoff_evidence, HandoffEvidence
+        ):
+            raise DomainValidationError(
+                "expected typed HandoffEvidence",
+                field_path="handoff_evidence",
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,20 +109,6 @@ def _launch_key_from_verified(
     return (verified.protocol_sequence, verified.accepted_sha256)
 
 
-def _prior_download_evidence(
-    records: MatchLocalRecords,
-) -> VerifiedDownloadEvidence | None:
-    downloaded = records.downloaded_save
-    if downloaded is None:
-        return None
-    return VerifiedDownloadEvidence(
-        game_id=records.game_id,
-        protocol_sequence=downloaded.protocol_sequence,
-        sha256=downloaded.sha256,
-        size_bytes=downloaded.size_bytes,
-    )
-
-
 def _apply_detection(
     records: MatchLocalRecords,
     detection: DetectionResult | None,
@@ -124,7 +122,145 @@ def _apply_detection(
             outgoing_candidate=detection.candidates[0],
         )
         return updated, OperationalState.OUTGOING_SAVE_DETECTED
+    if detection.outcome is DetectionOutcome.MULTIPLE_CANDIDATES:
+        updated = replace(updated, outgoing_candidate=None)
     return updated, None
+
+
+def _apply_exact_handoff_evidence(
+    records: MatchLocalRecords,
+    evidence: HandoffEvidence,
+    *,
+    journal: DurableHandoffJournal,
+    process_observation: ProcessObservation | None,
+) -> MatchLocalRecords:
+    """Mark processed / clear journal only for the exact attributed operation."""
+    in_progress = records.in_progress_handoff
+    if in_progress is not None and (
+        in_progress.operation_id != evidence.operation_id
+        or in_progress.sha256 != evidence.sha256
+        or in_progress.game_id != evidence.game_id
+        or in_progress.player_id != evidence.local_player_id
+    ):
+        # Foreign/stale evidence must not clear an unrelated journal.
+        return records
+
+    processed = records.processed_outgoing_hashes
+    if evidence.sha256 not in processed:
+        processed = (*processed, evidence.sha256)
+
+    pending = records.pending_post_commit_close
+    association = records.process_association
+    if pending is None and association is not None:
+        if association.protocol_sequence == evidence.source_protocol_sequence:
+            pending = PostCommitCloseRecord(
+                game_id=evidence.game_id,
+                source_protocol_sequence=evidence.source_protocol_sequence,
+                operation_id=evidence.operation_id,
+                sha256=evidence.sha256,
+                pid=association.pid,
+                process_start_time_utc=association.process_start_time_utc,
+                executable_path=association.executable_path,
+                close_requested=False,
+            )
+
+    if (
+        pending is not None
+        and process_observation is not None
+        and observation_matches_association(
+            process_observation,
+            pid=pending.pid,
+            process_start_time_utc=pending.process_start_time_utc,
+            executable_path=pending.executable_path,
+        )
+        and not process_observation.running
+    ):
+        pending = None
+
+    journal.clear()
+    return replace(
+        records,
+        processed_outgoing_hashes=processed,
+        outgoing_candidate=None,
+        in_progress_handoff=None,
+        pending_post_commit_close=pending,
+        last_transition_reason=f"handoff_{evidence.outcome.value}",
+    )
+
+
+def _recover_journal(
+    storage: Storage,
+    config: MatchConfig,
+    records: MatchLocalRecords,
+    *,
+    client_id: str,
+    journal: DurableHandoffJournal,
+) -> tuple[MatchLocalRecords, HandoffEvidence | None, list[DiagnosticEvent]]:
+    """Attribute in-progress journal against the authoritative manifest."""
+    diagnostics: list[DiagnosticEvent] = []
+    in_progress = records.in_progress_handoff
+    if in_progress is None:
+        return records, None, diagnostics
+
+    if (
+        in_progress.game_id != config.game_id
+        or in_progress.player_id != config.local_player_id
+        or in_progress.client_id != client_id
+    ):
+        diagnostics.append(
+            emit_diagnostic(
+                "foreign_or_stale_journal",
+                message="in-progress journal does not belong to this client/match",
+            )
+        )
+        return records, None, diagnostics
+
+    read = read_authoritative_manifest(storage, config.game_id)
+    if read.outcome is not ManifestReadOutcome.OK or read.manifest is None:
+        return records, None, diagnostics
+
+    size_bytes = (
+        None
+        if read.manifest.accepted_save is None
+        else read.manifest.accepted_save.size_bytes
+    )
+    evidence = attribute_journal_against_manifest(
+        manifest=read.manifest,
+        game_id=config.game_id,
+        operation_id=in_progress.operation_id,
+        client_id=client_id,
+        local_player_id=config.local_player_id,
+        sha256=in_progress.sha256,
+        size_bytes=size_bytes,
+        source_protocol_sequence=in_progress.protocol_sequence,
+        journal_client_id=in_progress.client_id,
+        journal_player_id=in_progress.player_id,
+        journal_game_id=in_progress.game_id,
+    )
+    if evidence is None:
+        diagnostics.append(
+            emit_diagnostic(
+                "journal_unattributed",
+                message="in-progress journal retained for retry",
+                fields={"operation_id": in_progress.operation_id},
+            )
+        )
+        return records, None, diagnostics
+
+    updated = _apply_exact_handoff_evidence(
+        records,
+        evidence,
+        journal=journal,
+        process_observation=None,
+    )
+    diagnostics.append(
+        emit_diagnostic(
+            "journal_attributed_idempotent",
+            message="exact committed handoff recovered from journal+manifest",
+            fields={"operation_id": evidence.operation_id},
+        )
+    )
+    return updated, evidence, diagnostics
 
 
 def reconcile_match(
@@ -142,7 +278,8 @@ def reconcile_match(
     handoff_evidence: HandoffEvidence | None = None,
 ) -> ReconcileResult:
     """Reconcile local state against the authoritative remote manifest."""
-    del journal  # reserved for in-progress cleanup extensions
+    if not isinstance(journal, DurableHandoffJournal):
+        raise TypeError("journal must be a DurableHandoffJournal")
     request = ReconcileRequest(
         client_id=client_id,
         now_utc=now_utc,
@@ -156,8 +293,21 @@ def reconcile_match(
     retry_required = False
     detection: DetectionResult | None = None
     records = store.load_match_state_or_empty(config.game_id)
-    read = read_authoritative_manifest(storage, config.game_id)
 
+    recovered_evidence: HandoffEvidence | None = None
+    if records.in_progress_handoff is not None and request.handoff_evidence is None:
+        records, recovered_evidence, journal_diags = _recover_journal(
+            storage,
+            config,
+            records,
+            client_id=request.client_id,
+            journal=journal,
+        )
+        diagnostics.extend(journal_diags)
+
+    effective_evidence = request.handoff_evidence or recovered_evidence
+
+    read = read_authoritative_manifest(storage, config.game_id)
     if read.outcome is not ManifestReadOutcome.OK or read.manifest is None:
         diagnostics.append(
             emit_diagnostic(
@@ -180,7 +330,7 @@ def reconcile_match(
             records,
             None,
             process_observation,
-            handoff_evidence,
+            effective_evidence,
             user_requested_start,
         )
         store.write_match_state(records)
@@ -202,17 +352,67 @@ def reconcile_match(
     )
     records = replace(records, verified_remote=verified)
 
+    if effective_evidence is not None:
+        if (
+            effective_evidence.game_id != config.game_id
+            or effective_evidence.local_player_id != config.local_player_id
+            or effective_evidence.sha256 not in manifest.accepted_save_hashes
+            or effective_evidence.result_protocol_sequence != manifest.protocol_sequence
+            or (
+                manifest.accepted_save is not None
+                and (
+                    manifest.accepted_save.sha256 != effective_evidence.sha256
+                    or manifest.accepted_save.size_bytes
+                    != effective_evidence.size_bytes
+                )
+            )
+            or manifest.protocol.last_operation_id != effective_evidence.operation_id
+            or manifest.last_sender_id != effective_evidence.local_player_id
+            or effective_evidence.result_protocol_sequence
+            != effective_evidence.source_protocol_sequence + 1
+        ):
+            diagnostics.append(
+                emit_diagnostic(
+                    "stale_handoff_evidence_rejected",
+                    message="handoff evidence does not match authoritative manifest",
+                )
+            )
+            effective_evidence = None
+        else:
+            records = _apply_exact_handoff_evidence(
+                records,
+                effective_evidence,
+                journal=journal,
+                process_observation=process_observation,
+            )
+
+    # Clear pending close when the exact associated process has exited.
+    pending = records.pending_post_commit_close
+    if (
+        pending is not None
+        and process_observation is not None
+        and observation_matches_association(
+            process_observation,
+            pid=pending.pid,
+            process_start_time_utc=pending.process_start_time_utc,
+            executable_path=pending.executable_path,
+        )
+        and not process_observation.running
+    ):
+        records = replace(records, pending_post_commit_close=None)
+
     is_owner = manifest.current_player_id == config.local_player_id
     in_progress = records.in_progress_handoff is not None
 
     if not is_owner:
-        if in_progress:
+        if in_progress and effective_evidence is None:
             state = OperationalState.UPLOADING
             records = replace(
                 records,
                 last_operational_state=state,
-                last_transition_reason="handoff_in_progress",
+                last_transition_reason="handoff_in_progress_unattributed",
             )
+            retry_required = True
         else:
             state = OperationalState.WAITING_FOR_OTHER_PLAYER
             records = replace(
@@ -239,7 +439,21 @@ def reconcile_match(
         if detected_state is not None:
             state = detected_state
     elif is_owner and manifest.accepted_save is not None:
-        prior = _prior_download_evidence(records)
+        prior = validated_prior_download_evidence(
+            records,
+            pbem_save_directory=config.pbem_save_directory,
+            protocol_sequence=manifest.protocol_sequence,
+            accepted_sha256=manifest.accepted_save.sha256,
+            max_save_bytes=request.max_save_bytes,
+        )
+        if prior is None and records.downloaded_save is not None:
+            records = replace(records, downloaded_save=None)
+            diagnostics.append(
+                emit_diagnostic(
+                    "local_download_evidence_invalidated",
+                    message="promoted local save missing or mismatched; redownloading",
+                )
+            )
         download = download_accepted_save(
             storage,
             DownloadRequest(
@@ -332,8 +546,23 @@ def reconcile_match(
             last_transition_reason="no_actionable_turn",
         )
 
+    if effective_evidence is not None:
+        state = OperationalState.WAITING_FOR_OTHER_PLAYER
+        records = replace(
+            records,
+            last_operational_state=state,
+            last_transition_reason=f"handoff_{effective_evidence.outcome.value}",
+        )
+
     if (
         process_observation is not None
+        and records.process_association is not None
+        and observation_matches_association(
+            process_observation,
+            pid=records.process_association.pid,
+            process_start_time_utc=records.process_association.process_start_time_utc,
+            executable_path=records.process_association.executable_path,
+        )
         and process_observation.running
         and records.play_session_baseline is not None
         and state
@@ -349,23 +578,6 @@ def reconcile_match(
             last_transition_reason="civ_running",
         )
 
-    if handoff_evidence is not None and handoff_evidence.outcome_name in {
-        "committed",
-        "idempotent_ack",
-    }:
-        processed = records.processed_outgoing_hashes
-        if handoff_evidence.sha256 not in processed:
-            processed = (*processed, handoff_evidence.sha256)
-        state = OperationalState.WAITING_FOR_OTHER_PLAYER
-        records = replace(
-            records,
-            processed_outgoing_hashes=processed,
-            outgoing_candidate=None,
-            in_progress_handoff=None,
-            last_operational_state=state,
-            last_transition_reason=f"handoff_{handoff_evidence.outcome_name}",
-        )
-
     intents = decide_intents(
         config.turn_handling_mode,
         config.allow_force_close_after_commit,
@@ -373,9 +585,21 @@ def reconcile_match(
         records,
         detection,
         process_observation,
-        handoff_evidence,
+        effective_evidence,
         user_requested_start,
     )
+
+    # Persist close_requested once a close intent is emitted.
+    if any(
+        intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+        for intent in intents
+    ):
+        pending = records.pending_post_commit_close
+        if pending is not None and not pending.close_requested:
+            records = replace(
+                records,
+                pending_post_commit_close=replace(pending, close_requested=True),
+            )
 
     start_requested = any(
         intent.kind is OrchestrationIntentKind.START_CIV for intent in intents
@@ -406,7 +630,13 @@ def reconcile_match(
                 )
             )
         else:
-            records = replace(records, play_session_baseline=baseline)
+            # New baseline resets prior session stability/candidate state.
+            records = replace(
+                records,
+                play_session_baseline=baseline,
+                stability_observations=(),
+                outgoing_candidate=None,
+            )
             if key is not None:
                 records = replace(
                     records,

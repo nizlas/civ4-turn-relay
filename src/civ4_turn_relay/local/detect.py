@@ -1,4 +1,4 @@
-"""Outgoing save detection with stability sampling (protocol §6.2)."""
+"""Outgoing save detection with session-scoped stability sampling (§6.2)."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from civ4_turn_relay.local.records import (
 )
 
 STABILITY_INTERVAL_SECONDS = 1.0
+MAX_OBSERVATIONS_PER_PATH = 2
 
 
 @unique
@@ -92,6 +93,35 @@ def _excluded_hashes(
     return excluded
 
 
+def _session_key(
+    records: MatchLocalRecords,
+) -> tuple[int, str | None, str] | None:
+    baseline = records.play_session_baseline
+    if baseline is None:
+        return None
+    return (
+        baseline.protocol_sequence,
+        baseline.accepted_sha256,
+        baseline.recorded_at,
+    )
+
+
+def _filter_session_observations(
+    observations: tuple[StabilityObservation, ...],
+    *,
+    session_protocol_sequence: int,
+    session_accepted_sha256: str | None,
+    session_baseline_recorded_at: str,
+) -> tuple[StabilityObservation, ...]:
+    return tuple(
+        item
+        for item in observations
+        if item.session_protocol_sequence == session_protocol_sequence
+        and item.session_accepted_sha256 == session_accepted_sha256
+        and item.session_baseline_recorded_at == session_baseline_recorded_at
+    )
+
+
 def _observations_for_path(
     observations: tuple[StabilityObservation, ...], path: str
 ) -> tuple[StabilityObservation, ...]:
@@ -100,18 +130,45 @@ def _observations_for_path(
 
 def _merge_observations(
     existing: tuple[StabilityObservation, ...],
+    *,
     path: str,
     size_bytes: int,
+    mtime_ns: int,
     observed_at: float,
+    session_protocol_sequence: int,
+    session_accepted_sha256: str | None,
+    session_baseline_recorded_at: str,
 ) -> tuple[StabilityObservation, ...]:
-    return (
-        *existing,
+    scoped = _filter_session_observations(
+        existing,
+        session_protocol_sequence=session_protocol_sequence,
+        session_accepted_sha256=session_accepted_sha256,
+        session_baseline_recorded_at=session_baseline_recorded_at,
+    )
+    others = tuple(item for item in scoped if item.path != path)
+    path_samples = list(_observations_for_path(scoped, path))
+    # Same-size rewrite with a new mtime invalidates prior samples for this path.
+    if path_samples and (
+        path_samples[-1].size_bytes != size_bytes
+        or path_samples[-1].mtime_ns != mtime_ns
+    ):
+        path_samples = []
+    path_samples.append(
         StabilityObservation(
             path=path,
             size_bytes=size_bytes,
             observed_at_seconds=observed_at,
-        ),
+            mtime_ns=mtime_ns,
+            session_protocol_sequence=session_protocol_sequence,
+            session_accepted_sha256=session_accepted_sha256,
+            session_baseline_recorded_at=session_baseline_recorded_at,
+        )
     )
+    if len(path_samples) > MAX_OBSERVATIONS_PER_PATH:
+        # Keep oldest + newest so a later same-time poll cannot erase the
+        # stability gap proven by the first sample.
+        path_samples = [path_samples[0], path_samples[-1]]
+    return (*others, *path_samples)
 
 
 def _is_stable(
@@ -119,20 +176,22 @@ def _is_stable(
     *,
     path: str,
     size_bytes: int,
+    mtime_ns: int,
     now_seconds: float,
 ) -> bool:
-    samples = _observations_for_path(observations, path)
+    samples = [
+        item
+        for item in _observations_for_path(observations, path)
+        if item.size_bytes == size_bytes and item.mtime_ns == mtime_ns
+    ]
     if len(samples) < 2:
         return False
-    matching = [item for item in samples if item.size_bytes == size_bytes]
-    if len(matching) < 2:
-        return False
-    times = sorted(item.observed_at_seconds for item in matching)
+    times = sorted(item.observed_at_seconds for item in samples)
     for earlier, later in zip(times, times[1:], strict=False):
         if later - earlier >= STABILITY_INTERVAL_SECONDS:
             return True
-    if now_seconds - matching[0].observed_at_seconds >= STABILITY_INTERVAL_SECONDS:
-        return len(matching) >= 2
+    if now_seconds - samples[0].observed_at_seconds >= STABILITY_INTERVAL_SECONDS:
+        return len(samples) >= 2
     return False
 
 
@@ -146,11 +205,15 @@ def observe_outgoing_candidates(
     max_save_bytes: int,
 ) -> DetectionResult:
     """Scan PBEM files, update stability observations, return candidates."""
-    if records.play_session_baseline is None:
+    session = _session_key(records)
+    if session is None:
         return DetectionResult(
             DetectionOutcome.MISSING_BASELINE,
             reason="play_session_baseline_missing",
         )
+    session_protocol_sequence, session_accepted_sha256, session_baseline_recorded_at = (
+        session
+    )
 
     try:
         validate_windows_local_path(pbem_dir, field_path="pbem_dir")
@@ -183,7 +246,12 @@ def observe_outgoing_candidates(
         return DetectionResult(DetectionOutcome.IO_FAILURE, reason="pbem_dir_missing")
 
     now_seconds = clock.now()
-    observations = records.stability_observations
+    observations = _filter_session_observations(
+        records.stability_observations,
+        session_protocol_sequence=session_protocol_sequence,
+        session_accepted_sha256=session_accepted_sha256,
+        session_baseline_recorded_at=session_baseline_recorded_at,
+    )
     stable_candidates: list[OutgoingCandidateRecord] = []
     saw_potential = False
 
@@ -201,7 +269,11 @@ def observe_outgoing_candidates(
                 reason="path_escapes_pbem_root",
             )
         try:
-            size = contained.stat().st_size
+            stat_result = contained.stat()
+            size = stat_result.st_size
+            mtime_ns = int(
+                getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1e9))
+            )
         except OSError:
             return DetectionResult(DetectionOutcome.IO_FAILURE, reason="stat_failed")
         if size > max_save_bytes:
@@ -226,11 +298,21 @@ def observe_outgoing_candidates(
         else:
             saw_potential = True
 
-        observations = _merge_observations(observations, local_path, size, now_seconds)
+        observations = _merge_observations(
+            observations,
+            path=local_path,
+            size_bytes=size,
+            mtime_ns=mtime_ns,
+            observed_at=now_seconds,
+            session_protocol_sequence=session_protocol_sequence,
+            session_accepted_sha256=session_accepted_sha256,
+            session_baseline_recorded_at=session_baseline_recorded_at,
+        )
         if not _is_stable(
             observations,
             path=local_path,
             size_bytes=size,
+            mtime_ns=mtime_ns,
             now_seconds=now_seconds,
         ):
             continue
@@ -278,3 +360,36 @@ def observe_outgoing_candidates(
         DetectionOutcome.NO_CANDIDATE,
         observations=observations,
     )
+
+
+def revalidate_candidate_file(
+    candidate: OutgoingCandidateRecord,
+    *,
+    pbem_save_directory: str,
+    max_save_bytes: int,
+) -> bytes | None:
+    """Re-read the candidate; return bytes only when path/size/hash still match."""
+    try:
+        validate_windows_local_path(
+            pbem_save_directory, field_path="pbem_save_directory"
+        )
+        validate_windows_local_path(candidate.path, field_path="path")
+    except DomainValidationError:
+        return None
+    root = Path(pbem_save_directory).resolve(strict=False)
+    path = Path(candidate.path)
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        resolved = path.resolve(strict=False)
+        resolved.relative_to(root)
+        data = resolved.read_bytes()
+    except (OSError, ValueError):
+        return None
+    if len(data) > max_save_bytes:
+        return None
+    if len(data) != candidate.size_bytes:
+        return None
+    if sha256_hex(data) != candidate.sha256:
+        return None
+    return data

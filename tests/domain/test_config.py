@@ -26,6 +26,9 @@ FAKE_PASSWORD = "placeholder-not-a-real-password"
 FAKE_PRIVATE_KEY_PATH = "C:\\Placeholder\\Keys\\id_ed25519_placeholder"
 
 
+FAKE_HOST_KEY = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+
 def env_mapping() -> dict[str, str]:
     return {
         "CIV4_RELAY_LOG_LEVEL": "DEBUG",
@@ -37,6 +40,8 @@ def env_mapping() -> dict[str, str]:
         "CIV4_RELAY_SFTP_REMOTE_ROOT": "/placeholder/civ4-relay",
         "CIV4_RELAY_SFTP_PRIVATE_KEY_PATH": "",
         "CIV4_RELAY_SFTP_PASSWORD": FAKE_PASSWORD,
+        "CIV4_RELAY_SFTP_HOST_KEY_SHA256": FAKE_HOST_KEY,
+        "CIV4_RELAY_SFTP_CONNECT_TIMEOUT_SECONDS": "15",
     }
 
 
@@ -82,12 +87,15 @@ class TestGlobalConfig:
         del env["CIV4_RELAY_LOG_LEVEL"]
         del env["CIV4_RELAY_POLL_INTERVAL_SECONDS"]
         del env["CIV4_RELAY_CIV4_EXECUTABLE"]
+        del env["CIV4_RELAY_SFTP_CONNECT_TIMEOUT_SECONDS"]
+        env["CIV4_RELAY_SFTP_PRIVATE_KEY_PATH"] = FAKE_PRIVATE_KEY_PATH
         del env["CIV4_RELAY_SFTP_PASSWORD"]
         config = global_config_from_env_mapping(env)
         assert config.log_level == DEFAULT_LOG_LEVEL
         assert config.poll_interval_seconds == DEFAULT_POLL_INTERVAL_SECONDS
         assert config.civ4_executable is None
         assert config.sftp_password is None
+        assert config.sftp_connect_timeout_seconds == 30
 
     def test_unrelated_env_keys_ignored(self) -> None:
         env = env_mapping() | {"PATH": "/usr/bin", "HOME": "/home/placeholder"}
@@ -167,14 +175,46 @@ class TestGlobalConfig:
 
     def test_redacted_diagnostics_show_absent_secrets_as_none(self) -> None:
         env = env_mapping()
+        env["CIV4_RELAY_SFTP_PRIVATE_KEY_PATH"] = FAKE_PRIVATE_KEY_PATH
         del env["CIV4_RELAY_SFTP_PASSWORD"]
         redacted = global_config_from_env_mapping(env).to_redacted_mapping()
         assert redacted["sftp_password"] is None
-        assert redacted["sftp_private_key_path"] is None
+        assert redacted["sftp_private_key_path"] == REDACTED
 
     def test_secret_values_include_password_and_private_key_path(self) -> None:
         config = global_config_from_env_mapping(env_mapping_with_key())
         assert config.secret_values() == (FAKE_PASSWORD, FAKE_PRIVATE_KEY_PATH)
+
+    def test_missing_auth_rejected(self) -> None:
+        env = env_mapping()
+        del env["CIV4_RELAY_SFTP_PASSWORD"]
+        with pytest.raises(DomainValidationError):
+            global_config_from_env_mapping(env)
+
+    def test_missing_host_key_verification_rejected(self) -> None:
+        env = env_mapping()
+        del env["CIV4_RELAY_SFTP_HOST_KEY_SHA256"]
+        with pytest.raises(DomainValidationError):
+            global_config_from_env_mapping(env)
+
+    def test_known_hosts_and_fingerprint_are_mutually_exclusive(self) -> None:
+        with pytest.raises(DomainValidationError, match="mutually exclusive"):
+            GlobalConfig(
+                sftp_host="sftp.example.invalid",
+                sftp_port=22,
+                sftp_username="placeholder-user",
+                sftp_remote_root="/placeholder",
+                sftp_password=FAKE_PASSWORD,
+                sftp_known_hosts_path=r"C:\Placeholder\known_hosts",
+                sftp_host_key_sha256=FAKE_HOST_KEY,
+            )
+
+    def test_passphrase_without_key_rejected(self) -> None:
+        env = env_mapping() | {
+            "CIV4_RELAY_SFTP_PRIVATE_KEY_PASSPHRASE": "placeholder-passphrase",
+        }
+        with pytest.raises(DomainValidationError):
+            global_config_from_env_mapping(env)
 
     def test_known_secret_text_redaction_covers_password_and_key_path(self) -> None:
         config = global_config_from_env_mapping(env_mapping_with_key())
@@ -196,10 +236,12 @@ class TestGlobalConfig:
             sftp_remote_root="/placeholder",
             sftp_private_key_path=FAKE_PRIVATE_KEY_PATH,
             sftp_password=FAKE_PASSWORD,
+            sftp_host_key_sha256=FAKE_HOST_KEY,
         )
         assert config.sftp_private_key_path == FAKE_PRIVATE_KEY_PATH
         assert config.sftp_password == FAKE_PASSWORD
         assert FAKE_PRIVATE_KEY_PATH not in repr(config)
+        assert config.sftp_host_key_sha256 == FAKE_HOST_KEY
 
 
 class TestMatchConfig:
@@ -357,7 +399,11 @@ class TestConfigSeparation:
             "sftp_username",
             "sftp_remote_root",
             "sftp_private_key_path",
+            "sftp_private_key_passphrase",
             "sftp_password",
+            "sftp_known_hosts_path",
+            "sftp_host_key_sha256",
+            "sftp_connect_timeout_seconds",
         }
 
     def test_expected_match_shape(self) -> None:

@@ -8,13 +8,13 @@ from civ4_turn_relay.domain import (
     DomainValidationError,
     OperationalState,
     TurnHandlingMode,
-    validate_sha256_hex,
     validate_utc_timestamp,
     validate_windows_local_path,
 )
 from civ4_turn_relay.local.detect import DetectionOutcome, DetectionResult
+from civ4_turn_relay.local.handoff_evidence import HandoffEvidence
 from civ4_turn_relay.local.intents import OrchestrationIntent, OrchestrationIntentKind
-from civ4_turn_relay.local.records import MatchLocalRecords
+from civ4_turn_relay.local.records import MatchLocalRecords, PostCommitCloseRecord
 from civ4_turn_relay.protocol.handoff import HandoffOutcome
 
 
@@ -53,36 +53,21 @@ class ProcessObservation:
             )
 
 
-@dataclass(frozen=True, slots=True)
-class HandoffEvidence:
-    """Local proof of a completed or idempotent handoff."""
-
-    outcome_name: str
-    sha256: str
-    protocol_sequence: int
-    operation_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.outcome_name, str) or not self.outcome_name:
-            raise DomainValidationError(
-                "expected a non-empty outcome name",
-                field_path="outcome_name",
-            )
-        object.__setattr__(
-            self, "sha256", validate_sha256_hex(self.sha256, field_path="sha256")
-        )
-        if isinstance(self.protocol_sequence, bool) or not isinstance(
-            self.protocol_sequence, int
-        ):
-            raise DomainValidationError(
-                "expected an integer protocol_sequence",
-                field_path="protocol_sequence",
-            )
-        if self.operation_id is not None and not isinstance(self.operation_id, str):
-            raise DomainValidationError(
-                "expected a string operation_id or None",
-                field_path="operation_id",
-            )
+def observation_matches_association(
+    observation: ProcessObservation | None,
+    *,
+    pid: int,
+    process_start_time_utc: str,
+    executable_path: str,
+) -> bool:
+    """True only when observation identity exactly matches the durable association."""
+    if observation is None:
+        return False
+    return (
+        observation.pid == pid
+        and observation.process_start_time_utc == process_start_time_utc
+        and observation.executable_path == executable_path
+    )
 
 
 def _launch_key(records: MatchLocalRecords) -> tuple[int, str | None] | None:
@@ -103,22 +88,61 @@ def _launch_already_attempted(records: MatchLocalRecords) -> bool:
     ) == key
 
 
-def _process_running(
+def _matched_running_process(
     records: MatchLocalRecords, observation: ProcessObservation | None
 ) -> bool:
-    if observation is not None and observation.running:
-        return True
     association = records.process_association
-    return association is not None and observation is not None and observation.running
+    if association is None:
+        return False
+    return (
+        observation_matches_association(
+            observation,
+            pid=association.pid,
+            process_start_time_utc=association.process_start_time_utc,
+            executable_path=association.executable_path,
+        )
+        and observation is not None
+        and observation.running
+    )
 
 
 def _post_commit_outcome(handoff: HandoffEvidence | None) -> bool:
     if handoff is None:
         return False
-    return handoff.outcome_name in {
-        HandoffOutcome.COMMITTED.value,
-        HandoffOutcome.IDEMPOTENT_ACK.value,
+    return handoff.outcome in {
+        HandoffOutcome.COMMITTED,
+        HandoffOutcome.IDEMPOTENT_ACK,
     }
+
+
+def _close_target(
+    records: MatchLocalRecords,
+    handoff: HandoffEvidence | None,
+) -> PostCommitCloseRecord | None:
+    pending = records.pending_post_commit_close
+    if pending is not None:
+        if handoff is not None and (
+            pending.operation_id != handoff.operation_id
+            or pending.sha256 != handoff.sha256
+            or pending.source_protocol_sequence != handoff.source_protocol_sequence
+        ):
+            return None
+        return pending
+    association = records.process_association
+    if handoff is None or association is None:
+        return None
+    if association.protocol_sequence != handoff.source_protocol_sequence:
+        return None
+    return PostCommitCloseRecord(
+        game_id=handoff.game_id,
+        source_protocol_sequence=handoff.source_protocol_sequence,
+        operation_id=handoff.operation_id,
+        sha256=handoff.sha256,
+        pid=association.pid,
+        process_start_time_utc=association.process_start_time_utc,
+        executable_path=association.executable_path,
+        close_requested=False,
+    )
 
 
 def decide_intents(
@@ -135,6 +159,41 @@ def decide_intents(
     del allow_force_close_after_commit  # never creates terminate intents
 
     intents: list[OrchestrationIntent] = []
+    matched_running = _matched_running_process(records, process_observation)
+
+    if turn_handling_mode is TurnHandlingMode.FULLY_MANAGED:
+        close_target = None
+        if _post_commit_outcome(handoff_evidence):
+            close_target = _close_target(records, handoff_evidence)
+        elif records.pending_post_commit_close is not None:
+            close_target = records.pending_post_commit_close
+        if (
+            close_target is not None
+            and not close_target.close_requested
+            and observation_matches_association(
+                process_observation,
+                pid=close_target.pid,
+                process_start_time_utc=close_target.process_start_time_utc,
+                executable_path=close_target.executable_path,
+            )
+            and process_observation is not None
+            and process_observation.running
+        ):
+            intents.append(
+                OrchestrationIntent(
+                    OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE,
+                    payload={
+                        "pid": close_target.pid,
+                        "process_start_time_utc": close_target.process_start_time_utc,
+                        "executable_path": close_target.executable_path,
+                        "operation_id": close_target.operation_id,
+                        "sha256": close_target.sha256,
+                        "source_protocol_sequence": (
+                            close_target.source_protocol_sequence
+                        ),
+                    },
+                )
+            )
 
     if state in {
         OperationalState.WAITING_FOR_OTHER_PLAYER,
@@ -167,27 +226,19 @@ def decide_intents(
                 OrchestrationIntent(OrchestrationIntentKind.PREPARE_OR_SEND_HANDOFF)
             )
 
-    running = _process_running(records, process_observation)
     launch_states = {
         OperationalState.WAITING_FOR_MY_FIRST_SAVE,
         OperationalState.MY_TURN_DOWNLOADED,
     }
 
     if turn_handling_mode is TurnHandlingMode.FULLY_MANAGED:
-        if _post_commit_outcome(handoff_evidence) and (
-            running or records.process_association is not None
-        ):
-            intents.append(
-                OrchestrationIntent(OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE)
-            )
-
         if state in launch_states:
             has_outgoing = detection is not None and detection.outcome in {
                 DetectionOutcome.ONE_CANDIDATE,
                 DetectionOutcome.STABILIZING,
                 DetectionOutcome.MULTIPLE_CANDIDATES,
             }
-            if running:
+            if matched_running:
                 intents.append(
                     OrchestrationIntent(OrchestrationIntentKind.RESUME_OR_FOCUS_CIV)
                 )
@@ -203,18 +254,18 @@ def decide_intents(
             elif user_requested_start:
                 intents.append(OrchestrationIntent(OrchestrationIntentKind.START_CIV))
             elif not _launch_already_attempted(records):
-                if records.process_association is not None:
+                if records.process_association is not None and matched_running:
                     intents.append(
                         OrchestrationIntent(OrchestrationIntentKind.RESUME_OR_FOCUS_CIV)
                     )
-                else:
+                elif records.process_association is None:
                     intents.append(
                         OrchestrationIntent(OrchestrationIntentKind.START_CIV)
                     )
     else:
         # Standard: never auto-launch or auto-close; user Start/Resume only.
         if user_requested_start and state in launch_states:
-            if running:
+            if matched_running:
                 intents.append(
                     OrchestrationIntent(OrchestrationIntentKind.RESUME_OR_FOCUS_CIV)
                 )

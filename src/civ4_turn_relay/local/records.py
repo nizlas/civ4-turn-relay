@@ -13,6 +13,7 @@ from civ4_turn_relay.domain import (
     DomainValidationError,
     OperationalState,
     validate_game_id,
+    validate_operation_id,
     validate_sha256_hex,
     validate_utc_timestamp,
     validate_windows_local_path,
@@ -43,7 +44,25 @@ _PLAY_SESSION_BASELINE_KEYS = (
     "protocol_sequence",
     "recorded_at",
 )
-_STABILITY_OBSERVATION_KEYS = ("observed_at_seconds", "path", "size_bytes")
+_STABILITY_OBSERVATION_KEYS = (
+    "mtime_ns",
+    "observed_at_seconds",
+    "path",
+    "session_accepted_sha256",
+    "session_baseline_recorded_at",
+    "session_protocol_sequence",
+    "size_bytes",
+)
+_POST_COMMIT_CLOSE_KEYS = (
+    "close_requested",
+    "executable_path",
+    "game_id",
+    "operation_id",
+    "pid",
+    "process_start_time_utc",
+    "sha256",
+    "source_protocol_sequence",
+)
 _VERIFIED_REMOTE_KEYS = ("accepted_sha256", "protocol_sequence")
 _DOWNLOADED_SAVE_KEYS = ("local_path", "protocol_sequence", "sha256", "size_bytes")
 _OUTGOING_CANDIDATE_KEYS = ("path", "sha256", "size_bytes")
@@ -67,6 +86,7 @@ _MATCH_LOCAL_OPTIONAL_KEYS = (
     "last_transition_reason",
     "launch_attempt",
     "outgoing_candidate",
+    "pending_post_commit_close",
     "play_session_baseline",
     "process_association",
     "processed_outgoing_hashes",
@@ -237,15 +257,23 @@ class PlaySessionBaseline:
 
 @dataclass(frozen=True, slots=True)
 class StabilityObservation:
-    """One durable size sample for outgoing-candidate stability."""
+    """One durable size/mtime sample scoped to a play-session launch key."""
 
     path: str
     size_bytes: int
     observed_at_seconds: float
+    mtime_ns: int
+    session_protocol_sequence: int
+    session_accepted_sha256: str | None
+    session_baseline_recorded_at: str
 
     def __post_init__(self) -> None:
         validate_windows_local_path(self.path, field_path="path")
         _require_non_negative_int(self.size_bytes, "size_bytes")
+        _require_non_negative_int(self.mtime_ns, "mtime_ns")
+        _require_non_negative_int(
+            self.session_protocol_sequence, "session_protocol_sequence"
+        )
         if isinstance(self.observed_at_seconds, bool) or not isinstance(
             self.observed_at_seconds, int | float
         ):
@@ -254,11 +282,30 @@ class StabilityObservation:
                 field_path="observed_at_seconds",
             )
         object.__setattr__(self, "observed_at_seconds", float(self.observed_at_seconds))
+        object.__setattr__(
+            self,
+            "session_accepted_sha256",
+            _optional_sha256(
+                self.session_accepted_sha256, field_path="session_accepted_sha256"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "session_baseline_recorded_at",
+            validate_utc_timestamp(
+                self.session_baseline_recorded_at,
+                field_path="session_baseline_recorded_at",
+            ),
+        )
 
     def to_mapping(self) -> dict[str, object]:
         return {
+            "mtime_ns": self.mtime_ns,
             "observed_at_seconds": self.observed_at_seconds,
             "path": self.path,
+            "session_accepted_sha256": self.session_accepted_sha256,
+            "session_baseline_recorded_at": self.session_baseline_recorded_at,
+            "session_protocol_sequence": self.session_protocol_sequence,
             "size_bytes": self.size_bytes,
         }
 
@@ -280,6 +327,101 @@ class StabilityObservation:
                 path=get_string(mapping, "path", path=path),
                 size_bytes=get_integer(mapping, "size_bytes", path=path),
                 observed_at_seconds=float(raw_time),
+                mtime_ns=get_integer(mapping, "mtime_ns", path=path),
+                session_protocol_sequence=get_integer(
+                    mapping, "session_protocol_sequence", path=path
+                ),
+                session_accepted_sha256=get_optional_string(
+                    mapping, "session_accepted_sha256", path=path
+                ),
+                session_baseline_recorded_at=get_string(
+                    mapping, "session_baseline_recorded_at", path=path
+                ),
+            )
+        except DomainValidationError as error:
+            raise error.with_prefix(path) from None
+
+
+@dataclass(frozen=True, slots=True)
+class PostCommitCloseRecord:
+    """Durable entitlement to close the exact Relay-launched Civ process."""
+
+    game_id: str
+    source_protocol_sequence: int
+    operation_id: str
+    sha256: str
+    pid: int
+    process_start_time_utc: str
+    executable_path: str
+    close_requested: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "game_id", validate_game_id(self.game_id, field_path="game_id")
+        )
+        _require_non_negative_int(
+            self.source_protocol_sequence, "source_protocol_sequence"
+        )
+        object.__setattr__(
+            self,
+            "operation_id",
+            validate_operation_id(self.operation_id, field_path="operation_id"),
+        )
+        object.__setattr__(
+            self, "sha256", validate_sha256_hex(self.sha256, field_path="sha256")
+        )
+        _require_true_int(self.pid, "pid")
+        if self.pid <= 0:
+            raise DomainValidationError(
+                "expected a positive process id", field_path="pid"
+            )
+        object.__setattr__(
+            self,
+            "process_start_time_utc",
+            validate_utc_timestamp(
+                self.process_start_time_utc, field_path="process_start_time_utc"
+            ),
+        )
+        validate_windows_local_path(self.executable_path, field_path="executable_path")
+        if not isinstance(self.close_requested, bool):
+            raise DomainValidationError(
+                "expected a boolean",
+                field_path="close_requested",
+            )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "close_requested": self.close_requested,
+            "executable_path": self.executable_path,
+            "game_id": self.game_id,
+            "operation_id": self.operation_id,
+            "pid": self.pid,
+            "process_start_time_utc": self.process_start_time_utc,
+            "sha256": self.sha256,
+            "source_protocol_sequence": self.source_protocol_sequence,
+        }
+
+    @classmethod
+    def from_mapping(
+        cls, mapping: Mapping[str, object], *, path: str = ""
+    ) -> PostCommitCloseRecord:
+        check_exact_keys(mapping, _POST_COMMIT_CLOSE_KEYS, path=path)
+        from civ4_turn_relay.domain.serialization import get_boolean
+
+        try:
+            return cls(
+                game_id=get_string(mapping, "game_id", path=path),
+                source_protocol_sequence=get_integer(
+                    mapping, "source_protocol_sequence", path=path
+                ),
+                operation_id=get_string(mapping, "operation_id", path=path),
+                sha256=get_string(mapping, "sha256", path=path),
+                pid=get_integer(mapping, "pid", path=path),
+                process_start_time_utc=get_string(
+                    mapping, "process_start_time_utc", path=path
+                ),
+                executable_path=get_string(mapping, "executable_path", path=path),
+                close_requested=get_boolean(mapping, "close_requested", path=path),
             )
         except DomainValidationError as error:
             raise error.with_prefix(path) from None
@@ -605,6 +747,7 @@ class MatchLocalRecords:
     retry_count: int = 0
     launch_attempt: LaunchAttemptRecord | None = None
     process_association: ProcessAssociationRecord | None = None
+    pending_post_commit_close: PostCommitCloseRecord | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -746,6 +889,23 @@ class MatchLocalRecords:
                 field_path="process_association",
             ),
         )
+        object.__setattr__(
+            self,
+            "pending_post_commit_close",
+            require_optional_instance(
+                self.pending_post_commit_close,
+                PostCommitCloseRecord,
+                field_path="pending_post_commit_close",
+            ),
+        )
+        if (
+            self.pending_post_commit_close is not None
+            and self.pending_post_commit_close.game_id != self.game_id
+        ):
+            raise DomainValidationError(
+                "post-commit close game_id must match local records game_id",
+                field_path="pending_post_commit_close.game_id",
+            )
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -783,6 +943,11 @@ class MatchLocalRecords:
                 None
                 if self.play_session_baseline is None
                 else self.play_session_baseline.to_mapping()
+            ),
+            "pending_post_commit_close": (
+                None
+                if self.pending_post_commit_close is None
+                else self.pending_post_commit_close.to_mapping()
             ),
             "process_association": (
                 None
@@ -837,6 +1002,11 @@ class MatchLocalRecords:
         process_raw = (
             get_optional_object(mapping, "process_association")
             if "process_association" in mapping
+            else None
+        )
+        close_raw = (
+            get_optional_object(mapping, "pending_post_commit_close")
+            if "pending_post_commit_close" in mapping
             else None
         )
         in_progress_raw = (
@@ -960,6 +1130,13 @@ class MatchLocalRecords:
                 if process_raw is None
                 else ProcessAssociationRecord.from_mapping(
                     process_raw, path="process_association"
+                )
+            ),
+            pending_post_commit_close=(
+                None
+                if close_raw is None
+                else PostCommitCloseRecord.from_mapping(
+                    close_raw, path="pending_post_commit_close"
                 )
             ),
         )

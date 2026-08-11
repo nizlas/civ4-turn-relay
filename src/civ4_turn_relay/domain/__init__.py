@@ -8,6 +8,7 @@ and transforms in-memory values.
 from civ4_turn_relay.domain.config import (
     DEFAULT_LOG_LEVEL,
     DEFAULT_POLL_INTERVAL_SECONDS,
+    DEFAULT_SFTP_CONNECT_TIMEOUT_SECONDS,
     ENV_PREFIX,
     GlobalConfig,
     MatchConfig,
@@ -57,6 +58,7 @@ from civ4_turn_relay.domain.states import OperationalState
 __all__ = [
     "DEFAULT_LOG_LEVEL",
     "DEFAULT_POLL_INTERVAL_SECONDS",
+    "DEFAULT_SFTP_CONNECT_TIMEOUT_SECONDS",
     "ENV_PREFIX",
     "MANIFEST_SCHEMA_VERSION",
     "MIN_CLIENT_PROTOCOL",
