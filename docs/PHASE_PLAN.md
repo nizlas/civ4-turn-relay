@@ -29,8 +29,8 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 |-------|------|--------|
 | P0 | Python project skeleton and quality gates | **COMPLETE** |
 | P1 | Domain types, configuration models, validation, deterministic serialization | **COMPLETE** |
-| P2 | Storage abstraction and failure-injectable fake storage | **ACTIVE** |
-| P3 | Core sync protocol engine | NOT STARTED |
+| P2 | Storage abstraction and failure-injectable fake storage | **COMPLETE** |
+| P3 | Core sync protocol engine | **ACTIVE** |
 | P4 | Local persistence, reconciliation, baseline, save detection, watching | NOT STARTED |
 | P5 | Headless two-client end-to-end (fake storage) | NOT STARTED |
 | P6 | Paramiko SFTP adapter and disposable-server integration tests | NOT STARTED |
@@ -40,7 +40,7 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 
 ## 4. Active implementation phase
 
-**P2 — Storage abstraction and failure-injectable fake storage** is the only ACTIVE phase.
+**P3 — Core sync protocol engine** is the only ACTIVE phase.
 
 ## 5. Phase-gate process
 
@@ -264,7 +264,7 @@ None required.
 
 ## P2 — Storage abstraction and failure-injectable fake storage
 
-**Status:** ACTIVE
+**Status:** COMPLETE
 
 ### Goal
 
@@ -322,13 +322,13 @@ None.
 
 ### Risks / decisions
 
-- In-memory vs temp-directory fake as default — prefer one primary fake that models OpenSSH semantics closely enough for PT coverage
+- In-memory vs temp-directory fake as default — **resolved:** in-memory `FakeStorage` is the primary fake; it models OpenSSH/SFTP semantics closely enough for P3 PT coverage (exclusive mkdir, immutable no-replace publication, posix-rename-equivalent replace, full read-back, deterministic fault injection). A temp-directory fake was not needed.
 
 ---
 
 ## P3 — Core sync protocol engine
 
-**Status:** NOT STARTED
+**Status:** ACTIVE
 
 ### Goal
 
