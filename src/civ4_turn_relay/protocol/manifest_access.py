@@ -3,6 +3,10 @@
 Reads ``{game_id}/manifest.json``, parses it through P1
 ``Manifest.from_json_bytes``, and verifies directory ``game_id`` equality.
 Never repairs, rewrites, or infers ownership from local state.
+
+Successful reads preserve the exact immutable ``bytes`` returned by storage so
+callers can attribute an operation to a specific committed payload without
+relying on canonical reserialization.
 """
 
 from __future__ import annotations
@@ -34,14 +38,66 @@ class ManifestReadOutcome(Enum):
 
 @dataclass(frozen=True, slots=True)
 class ManifestReadResult:
-    """Immutable result of reading the authoritative remote manifest."""
+    """Immutable result of reading the authoritative remote manifest.
+
+    Field invariants:
+
+    - ``OK`` requires both ``manifest`` and exact ``raw_bytes``.
+    - Non-``OK`` outcomes never carry a parsed ``manifest``.
+    - ``MISSING`` and ``TRANSPORT_FAILURE`` require ``raw_bytes is None``.
+    - ``INVALID`` and ``GAME_ID_MISMATCH`` MAY retain exact storage ``raw_bytes``
+      as diagnostics of what was read; otherwise ``raw_bytes`` is ``None``
+      (e.g. wrong-kind path with no readable file bytes).
+    - When present, ``raw_bytes`` must be exact ``bytes`` (not ``bytearray``).
+    """
 
     outcome: ManifestReadOutcome
     manifest: Manifest | None = None
+    raw_bytes: bytes | None = None
+
+    def __post_init__(self) -> None:
+        if self.raw_bytes is not None and type(self.raw_bytes) is not bytes:
+            raise DomainValidationError(
+                "raw_bytes must be exact bytes",
+                field_path="raw_bytes",
+            )
+        if self.outcome is ManifestReadOutcome.OK:
+            if self.manifest is None:
+                raise DomainValidationError(
+                    "OK requires a parsed manifest",
+                    field_path="manifest",
+                )
+            if self.raw_bytes is None:
+                raise DomainValidationError(
+                    "OK requires exact storage raw_bytes",
+                    field_path="raw_bytes",
+                )
+            return
+        if self.manifest is not None:
+            raise DomainValidationError(
+                "non-OK outcomes must not carry a manifest",
+                field_path="manifest",
+            )
+        if (
+            self.outcome
+            in {
+                ManifestReadOutcome.MISSING,
+                ManifestReadOutcome.TRANSPORT_FAILURE,
+            }
+            and self.raw_bytes is not None
+        ):
+            raise DomainValidationError(
+                "this outcome must not carry raw_bytes",
+                field_path="raw_bytes",
+            )
 
     @property
     def ok(self) -> bool:
-        return self.outcome is ManifestReadOutcome.OK and self.manifest is not None
+        return (
+            self.outcome is ManifestReadOutcome.OK
+            and self.manifest is not None
+            and self.raw_bytes is not None
+        )
 
 
 def read_authoritative_manifest(storage: Storage, game_id: str) -> ManifestReadResult:
@@ -49,7 +105,8 @@ def read_authoritative_manifest(storage: Storage, game_id: str) -> ManifestReadR
 
     Validates ``game_id`` before any storage I/O. Distinguishes missing,
     invalid schema/hash-list, directory/manifest game-ID mismatch, and
-    transport failures. Does not mutate storage.
+    transport failures. Does not mutate storage. On success, ``raw_bytes`` are
+    exactly the bytes returned by ``Storage.read_file`` (no canonicalization).
     """
     validate_game_id(game_id, field_path="game_id")
     paths = GamePaths(game_id)
@@ -66,12 +123,16 @@ def read_authoritative_manifest(storage: Storage, game_id: str) -> ManifestReadR
     except StorageError:
         return ManifestReadResult(ManifestReadOutcome.TRANSPORT_FAILURE)
 
+    if type(raw) is not bytes:
+        # Storage port contracts bytes; reject other bytes-like values early.
+        return ManifestReadResult(ManifestReadOutcome.INVALID)
+
     try:
         manifest = Manifest.from_json_bytes(raw)
     except DomainValidationError:
-        return ManifestReadResult(ManifestReadOutcome.INVALID)
+        return ManifestReadResult(ManifestReadOutcome.INVALID, raw_bytes=raw)
 
     if manifest.game_id != game_id:
-        return ManifestReadResult(ManifestReadOutcome.GAME_ID_MISMATCH)
+        return ManifestReadResult(ManifestReadOutcome.GAME_ID_MISMATCH, raw_bytes=raw)
 
-    return ManifestReadResult(ManifestReadOutcome.OK, manifest)
+    return ManifestReadResult(ManifestReadOutcome.OK, manifest=manifest, raw_bytes=raw)

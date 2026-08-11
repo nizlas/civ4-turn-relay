@@ -160,9 +160,10 @@ def _classify_uncertain_commit(
     """
     recovered = read_authoritative_manifest(storage, game_id)
     if recovered.outcome is ManifestReadOutcome.OK and recovered.manifest is not None:
-        if recovered.manifest.to_json_bytes() == intended_payload:
+        # Exact remote bytes only — never attribute via canonical reserialization.
+        if recovered.raw_bytes == intended_payload:
             return InitializeResult(InitializeOutcome.CREATED, recovered.manifest)
-        # A different valid authoritative manifest must not be credited to us.
+        # Semantically valid but byte-different: authoritative existing match.
         return InitializeResult(InitializeOutcome.JOINED_EXISTING, recovered.manifest)
     if recovered.outcome is ManifestReadOutcome.INVALID:
         return InitializeResult(InitializeOutcome.INVALID_MANIFEST)

@@ -133,4 +133,84 @@ def test_manifest_path_as_directory_is_invalid_not_missing() -> None:
     result = read_authoritative_manifest(storage, "example-match")
     assert result.outcome is ManifestReadOutcome.INVALID
     assert result.manifest is None
+    assert result.raw_bytes is None
     assert storage.snapshot() == before
+
+
+def test_read_exposes_exact_storage_raw_bytes() -> None:
+    import json
+
+    storage = FakeStorage()
+    config = sample_match_config()
+    created = initialize_match(storage, config, operation_id=OP_ID)
+    assert created.manifest is not None
+    paths = GamePaths(config.game_id)
+
+    # Overwrite with noncanonical but valid JSON for the same semantic manifest.
+    mapping = created.manifest.to_mapping()
+    noncanonical_obj = {key: mapping[key] for key in reversed(list(mapping))}
+    noncanonical = json.dumps(
+        noncanonical_obj, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    storage.write_file(paths.manifest, noncanonical, overwrite=True)
+
+    result = read_authoritative_manifest(storage, config.game_id)
+    assert result.outcome is ManifestReadOutcome.OK
+    assert result.raw_bytes == noncanonical
+    assert result.raw_bytes == storage.read_file(paths.manifest)
+    assert result.raw_bytes != created.manifest.to_json_bytes()
+    assert result.manifest == created.manifest
+    assert type(result.raw_bytes) is bytes
+
+
+def test_manifest_read_result_invariants_for_non_ok_outcomes() -> None:
+    from civ4_turn_relay.protocol import ManifestReadResult
+
+    storage = FakeStorage()
+    missing = read_authoritative_manifest(storage, "example-match")
+    assert missing.outcome is ManifestReadOutcome.MISSING
+    assert missing.manifest is None
+    assert missing.raw_bytes is None
+
+    storage.mkdir("example-match")
+    storage.write_file("example-match/manifest.json", b"{not-json")
+    invalid = read_authoritative_manifest(storage, "example-match")
+    assert invalid.outcome is ManifestReadOutcome.INVALID
+    assert invalid.manifest is None
+    assert invalid.raw_bytes == b"{not-json"
+
+    good = initialize_match(
+        FakeStorage(), sample_match_config(game_id="other-match"), operation_id=OP_ID
+    )
+    assert good.manifest is not None
+    mismatched_bytes = good.manifest.to_json_bytes()
+    storage.write_file("example-match/manifest.json", mismatched_bytes, overwrite=True)
+    mismatch = read_authoritative_manifest(storage, "example-match")
+    assert mismatch.outcome is ManifestReadOutcome.GAME_ID_MISMATCH
+    assert mismatch.manifest is None
+    assert mismatch.raw_bytes == mismatched_bytes
+
+    next_read = storage.faults.call_count(StorageOp.READ) + 1
+    storage.faults.inject(
+        StorageOp.READ, moment=FaultMoment.BEFORE, occurrence=next_read
+    )
+    transport = read_authoritative_manifest(storage, "example-match")
+    assert transport.outcome is ManifestReadOutcome.TRANSPORT_FAILURE
+    assert transport.manifest is None
+    assert transport.raw_bytes is None
+
+    with pytest.raises(DomainValidationError):
+        ManifestReadResult(ManifestReadOutcome.OK, manifest=None, raw_bytes=b"{}")
+    with pytest.raises(DomainValidationError):
+        ManifestReadResult(ManifestReadOutcome.MISSING, raw_bytes=b"unexpected")
+    with pytest.raises(DomainValidationError):
+        ManifestReadResult(
+            ManifestReadOutcome.INVALID,
+            manifest=good.manifest,
+            raw_bytes=b"{}",
+        )
+    with pytest.raises(DomainValidationError):
+        ManifestReadResult(
+            ManifestReadOutcome.INVALID,
+            raw_bytes=bytearray(b"{}"),  # type: ignore[arg-type]
+        )
