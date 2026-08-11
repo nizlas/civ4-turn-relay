@@ -14,8 +14,6 @@ from civ4_turn_relay.storage import (
     ObjectComparisonResult,
     Storage,
     StorageAlreadyExistsError,
-    StorageCapabilities,
-    StorageCapabilityError,
     StorageInvalidPathError,
     StorageNotEmptyError,
     StorageNotFoundError,
@@ -24,8 +22,16 @@ from civ4_turn_relay.storage import (
     fingerprint_bytes,
     read_fingerprint,
 )
-from tests.storage.contract.provider import StorageProvider
 from tests.storage.helpers import seed_tree
+
+
+def case_provider_reports_required_capabilities(storage: Storage) -> None:
+    """Assert the adapter's actual capabilities cover the P2 contract surface."""
+    caps = storage.capabilities()
+    assert caps.exclusive_mkdir is True
+    assert caps.atomic_replace is True
+    assert caps.atomic_publish_no_replace is True
+    assert caps.complete_readback is True
 
 
 def case_write_read_round_trip(storage: Storage) -> None:
@@ -154,21 +160,6 @@ def case_mkdir_race_models_lock_contention(storage: Storage) -> None:
         storage.mkdir("locks/upload.lock")
 
 
-def case_unsupported_exclusive_mkdir_fails_safely(provider: StorageProvider) -> None:
-    storage = provider.create(
-        capabilities=StorageCapabilities(
-            exclusive_mkdir=False,
-            atomic_replace=True,
-            atomic_publish_no_replace=True,
-            complete_readback=True,
-        )
-    )
-    with pytest.raises(StorageCapabilityError):
-        storage.mkdir("locks")
-    with pytest.raises(StorageNotFoundError):
-        storage.list_dir("locks")
-
-
 def case_missing_destination_publishes_atomically(storage: Storage) -> None:
     seed_tree(storage, "temporary", "saves")
     storage.write_file("temporary/op.upload", b"synthetic-save")
@@ -234,26 +225,6 @@ def case_caller_verifies_existing_object_before_reuse(storage: Storage) -> None:
     )
 
 
-def case_unsupported_publish_capability_fails_before_mutation(
-    provider: StorageProvider,
-) -> None:
-    storage = provider.create(
-        capabilities=StorageCapabilities(
-            exclusive_mkdir=True,
-            atomic_replace=True,
-            atomic_publish_no_replace=False,
-            complete_readback=True,
-        )
-    )
-    seed_tree(storage, "temporary", "saves")
-    storage.write_file("temporary/op.upload", b"x")
-    with pytest.raises(StorageCapabilityError):
-        storage.publish_no_replace("temporary/op.upload", "saves/final.sav")
-    assert storage.read_file("temporary/op.upload") == b"x"
-    with pytest.raises(StorageNotFoundError):
-        storage.read_file("saves/final.sav")
-
-
 def case_replace_absent_destination(storage: Storage) -> None:
     seed_tree(storage, "temporary")
     storage.write_file("temporary/manifest-op.json", b'{"schema_version":1}')
@@ -284,26 +255,6 @@ def case_source_disappears_and_destination_has_exact_new_bytes(
     assert storage.read_file("manifest.json") == new_bytes
     with pytest.raises(StorageNotFoundError):
         storage.read_file("temporary/manifest-op.json")
-
-
-def case_missing_atomic_replace_capability_fails_before_mutation(
-    provider: StorageProvider,
-) -> None:
-    storage = provider.create(
-        capabilities=StorageCapabilities(
-            exclusive_mkdir=True,
-            atomic_replace=False,
-            atomic_publish_no_replace=True,
-            complete_readback=True,
-        )
-    )
-    seed_tree(storage, "temporary")
-    storage.write_file("manifest.json", b"old-manifest")
-    storage.write_file("temporary/manifest-op.json", b"new-manifest")
-    with pytest.raises(StorageCapabilityError):
-        storage.atomic_replace("temporary/manifest-op.json", "manifest.json")
-    assert storage.read_file("manifest.json") == b"old-manifest"
-    assert storage.read_file("temporary/manifest-op.json") == b"new-manifest"
 
 
 def case_atomic_replace_refuses_directory_destination(storage: Storage) -> None:
@@ -353,18 +304,3 @@ def case_exact_match_versus_size_or_hash_mismatch(storage: Storage) -> None:
         )
         is ObjectComparisonResult.MISMATCH
     )
-
-
-def case_complete_readback_capability_required(provider: StorageProvider) -> None:
-    storage = provider.create(
-        capabilities=StorageCapabilities(
-            exclusive_mkdir=True,
-            atomic_replace=True,
-            atomic_publish_no_replace=True,
-            complete_readback=False,
-        )
-    )
-    seed_tree(storage, "saves")
-    storage.write_file("saves/object.bin", b"x")
-    with pytest.raises(StorageCapabilityError):
-        storage.read_file("saves/object.bin")

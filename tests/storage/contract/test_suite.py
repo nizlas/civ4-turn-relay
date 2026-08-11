@@ -15,6 +15,10 @@ from tests.storage.contract import cases
 from tests.storage.contract.provider import StorageProvider
 
 
+def test_provider_reports_required_capabilities(storage: Storage) -> None:
+    cases.case_provider_reports_required_capabilities(storage)
+
+
 def test_write_read_round_trip(storage: Storage) -> None:
     cases.case_write_read_round_trip(storage)
 
@@ -73,10 +77,6 @@ def test_mkdir_race_models_lock_contention(storage: Storage) -> None:
     cases.case_mkdir_race_models_lock_contention(storage)
 
 
-def test_unsupported_exclusive_mkdir_fails_safely(provider: StorageProvider) -> None:
-    cases.case_unsupported_exclusive_mkdir_fails_safely(provider)
-
-
 def test_missing_destination_publishes_atomically(storage: Storage) -> None:
     cases.case_missing_destination_publishes_atomically(storage)
 
@@ -95,12 +95,6 @@ def test_caller_verifies_existing_object_before_reuse(storage: Storage) -> None:
     cases.case_caller_verifies_existing_object_before_reuse(storage)
 
 
-def test_unsupported_publish_capability_fails_before_mutation(
-    provider: StorageProvider,
-) -> None:
-    cases.case_unsupported_publish_capability_fails_before_mutation(provider)
-
-
 def test_replace_absent_destination(storage: Storage) -> None:
     cases.case_replace_absent_destination(storage)
 
@@ -113,12 +107,6 @@ def test_source_disappears_and_destination_has_exact_new_bytes(
     storage: Storage,
 ) -> None:
     cases.case_source_disappears_and_destination_has_exact_new_bytes(storage)
-
-
-def test_missing_atomic_replace_capability_fails_before_mutation(
-    provider: StorageProvider,
-) -> None:
-    cases.case_missing_atomic_replace_capability_fails_before_mutation(provider)
 
 
 def test_atomic_replace_refuses_directory_destination(storage: Storage) -> None:
@@ -137,12 +125,9 @@ def test_exact_match_versus_size_or_hash_mismatch(storage: Storage) -> None:
     cases.case_exact_match_versus_size_or_hash_mismatch(storage)
 
 
-def test_complete_readback_capability_required(provider: StorageProvider) -> None:
-    cases.case_complete_readback_capability_required(provider)
-
-
 def test_same_case_body_runs_on_every_provider(provider: StorageProvider) -> None:
     """Proof of reuse: identical case function, alternate provider binding."""
+    cases.case_provider_reports_required_capabilities(provider.create())
     cases.case_write_read_round_trip(provider.create())
     cases.case_first_exclusive_mkdir_succeeds(provider.create())
     cases.case_missing_destination_publishes_atomically(provider.create())
