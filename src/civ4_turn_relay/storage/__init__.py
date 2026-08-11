@@ -16,7 +16,12 @@ from civ4_turn_relay.storage.errors import (
     StorageWrongKindError,
 )
 from civ4_turn_relay.storage.fake import FakeStorage, StorageSnapshot
-from civ4_turn_relay.storage.faults import FaultController, FaultMoment, StorageOp
+from civ4_turn_relay.storage.faults import (
+    FaultController,
+    FaultMoment,
+    FaultScheduleError,
+    StorageOp,
+)
 from civ4_turn_relay.storage.port import (
     Storage,
     StorageCapabilities,
@@ -35,6 +40,7 @@ __all__ = [
     "FakeStorage",
     "FaultController",
     "FaultMoment",
+    "FaultScheduleError",
     "ObjectComparisonResult",
     "ObjectFingerprint",
     "Storage",
