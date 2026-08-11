@@ -92,33 +92,38 @@ Legend: **Relay** = user action in the app · **Civ** = action inside Civilizati
 
 | Step | Actor | Action |
 |------|-------|--------|
-| 1 | Relay / Auto | Before launch from `WAITING_FOR_MY_FIRST_SAVE`, record durable play-session baseline |
+| 1 | Relay / Auto | Before launch from `WAITING_FOR_MY_FIRST_SAVE`, record durable play-session baseline ([§8.1](#81-launching-civilization)) |
 | 2 | Civ | Match creator creates the PBEM game and produces the first outgoing human save |
 | 3 | Auto | Detect post-baseline outgoing candidate → verify → upload/commit per protocol |
-| 4 | Auto | Transition to waiting for the next human in order |
+| 4 | Auto | Transition to waiting for the next human in order; in `fully_managed`, post-commit Civ close follows [§8.5](#85-turn-handling-modes) |
+
+Sequence 0 uses the same turn-handling rules as a received turn, except Civ launches without an incoming save ([§8.5](#85-turn-handling-modes)).
 
 ### 3.5 Receiving and playing a normal turn
 
 | Step | Actor | Action |
 |------|-------|--------|
 | 1 | Auto | Poll/fetch manifest; if local player is current owner and save is new, download and verify |
-| 2 | Relay / Auto | Present `YOUR TURN` / `DIN TUR`; before launch, record durable play-session baseline; primary action launches Civ with mod + save (optional per-match auto-launch MAY run only after verified download) |
+| 2 | Relay / Auto | Present `YOUR TURN` / `DIN TUR`; record durable play-session baseline before launch; launch behavior depends on `turn_handling_mode` ([§4.2](#42-per-match-configuration), [§8.5](#85-turn-handling-modes)) |
 | 3 | Civ | Player completes turn and clicks **Next Turn** |
+
+In `standard`, the user starts Civ via the primary button. In `fully_managed`, Relay issues at most one automatic launch for that accepted sequence/hash after verified download and baseline recording.
 
 ### 3.6 Detecting and sending the outgoing save
 
 | Step | Actor | Action |
 |------|-------|--------|
 | 1 | Auto | Detect stable outgoing candidate whose hash is absent from baseline, incoming save, `accepted_save_hashes`, and locally processed outgoing hashes ([protocol §6](SYNC_PROTOCOL.md#6-outgoing-save-detection)) |
-| 2 | Auto | Upload and commit handoff per protocol (auto-send only when baseline is trustworthy) |
-| 3 | Auto | Show next expected human player |
+| 2 | Auto | Upload and commit handoff per protocol (auto-send only when baseline is trustworthy; required for zero-click `fully_managed` operation) |
+| 3 | Auto | Enter `WAITING_FOR_OTHER_PLAYER` when the authoritative manifest proves commit (or sender reconcile proves idempotent acknowledgement). In `fully_managed`, request Civ close only after that proof ([§8.5](#85-turn-handling-modes)) |
+| 4 | Auto | Show next expected human player |
 
 ### 3.7 Restart after application or Civilization crash
 
 | Step | Actor | Action |
 |------|-------|--------|
-| 1 | Auto | On startup, reconcile using remote manifest, verified remote save, local cache, local files, hashes, operation journal, and whether Civ is running ([§9](#9-crash-recovery-and-repair-ux)) |
-| 2 | Auto | Explain recovered state in the UI; resume polling / upload / wait as evidence requires |
+| 1 | Auto | On startup, reconcile using remote manifest, verified remote save, local cache, local files, hashes, operation journal, play-session baseline, launch-attempt/process-association records, and whether Civ is running ([§9](#9-crash-recovery-and-repair-ux)) |
+| 2 | Auto | Explain recovered state in the UI; resume polling / upload / wait as evidence requires; never double-launch the same accepted sequence/hash or auto-close an unverified process ([§8.5](#85-turn-handling-modes)) |
 | 3 | Relay | Use explicit repair only when automatic reconciliation cannot safely proceed |
 
 ### 3.8 Switching between configured matches
@@ -156,25 +161,39 @@ Server and installation settings MUST NOT be duplicated into every match. Secret
 | Log level | Yes | Yes | Local only |
 | Civ installation / default executable / launch-profile seed | Yes | Optional executable seed | Working directory and named profiles MAY live in local global config files |
 
-`.env` MUST NOT carry per-match identity, mod, PBEM save directory, or automatic-launch settings.
+`.env` MUST NOT carry per-match identity, mod, PBEM save directory, or turn-handling settings.
 
 ### 4.2 Per-match configuration
 
-| Concept | Editable | Notes |
-|---------|----------|-------|
-| Stable match / game ID | Create-time | Format enforced by protocol; immutable after remote init |
-| Display name | Yes | Local and/or mirrored in manifest display field |
-| Ordered human player IDs and display names | Create / admin repair | Defines relay order; excludes AI |
-| Local player ownership (`player_id` for this client) | Yes | MUST be one of the human IDs; **not** a global `.env` value |
-| Launch profile | Yes | References a global profile |
-| Mod name or path | Yes | Default concept: `AdvCiv`; per-match only |
-| PBEM save location and matching rules | Yes | Directory + filename/pattern constraints; per-match only |
-| Optional automatic launch | Yes | Default off; per-match only; MUST NOT create turn transitions |
+| Concept | Setting / field | Editable | Notes |
+|---------|-----------------|----------|-------|
+| Stable match / game ID | — | Create-time | Format enforced by protocol; immutable after remote init |
+| Display name | — | Yes | Local and/or mirrored in manifest display field |
+| Ordered human player IDs and display names | — | Create / admin repair | Defines relay order; excludes AI |
+| Local player ownership (`player_id` for this client) | — | Yes | MUST be one of the human IDs; **not** a global `.env` value |
+| Launch profile | — | Yes | References a global profile |
+| Mod name or path | — | Yes | Default concept: `AdvCiv`; per-match only |
+| PBEM save location and matching rules | — | Yes | Directory + filename/pattern constraints; per-match only |
+| Turn handling | `turn_handling_mode` | Yes | `standard` \| `fully_managed`; **default `standard`**; per-match only; behavior in [§8.5](#85-turn-handling-modes) |
+| Allow force-close after commit | `allow_force_close_after_commit` | Yes | Boolean; **default `false`**; applicable only when `turn_handling_mode` is `fully_managed`; see [§8.5](#85-turn-handling-modes) |
+
+User-facing labels for `turn_handling_mode`:
+
+```text
+Turn handling:
+- Standard
+- Fully managed
+```
+
+These settings are per-match local configuration. They MUST NOT live in `.env`. They MUST NOT create remote protocol states or advance ownership by themselves.
+
+The earlier standalone per-match `auto_launch` concept is replaced by `turn_handling_mode`. The minimal UI MUST NOT expose ambiguous combinations of partial automation toggles for the same lifecycle.
 
 ### 4.3 Storage and validation
 
 - User-editable values are those listed above.
 - The UI SHOULD validate formats before save (game ID, paths, port range, player list non-empty and unique IDs).
+- `allow_force_close_after_commit` MUST be ignored unless `turn_handling_mode` is `fully_managed`.
 - Local persistence MAY use `.env` for global secrets/settings plus per-match config files under the user data directory.
 - Global SFTP settings apply to all matches under the configured server root.
 
@@ -219,7 +238,7 @@ stateDiagram-v2
     DOWNLOADING --> ERROR: validation failure
     DOWNLOADING --> WAITING_FOR_OTHER_PLAYER: no longer owner / superseded
 
-    MY_TURN_DOWNLOADED --> CIV_RUNNING: launch / auto-launch
+    MY_TURN_DOWNLOADED --> CIV_RUNNING: launch / managed launch
     MY_TURN_DOWNLOADED --> OUTGOING_SAVE_DETECTED: stable outgoing save
     CIV_RUNNING --> OUTGOING_SAVE_DETECTED: stable outgoing save
     CIV_RUNNING --> MY_TURN_DOWNLOADED: Civ exit, no new outgoing
@@ -241,7 +260,7 @@ stateDiagram-v2
 |-------|---------|-------------------|--------------------|----------------|---------------------|------------|------------------|
 | `RECONCILING` | Startup or post-error evidence merge | App start or explicit retry | Checking game state… | None / Cancel if long | Any stable state below | Treating reconcile as a handoff | Re-enter reconcile |
 | `WAITING_FOR_MY_FIRST_SAVE` | This client must publish sequence 0→1 | Manifest seq 0 / no accepted save; local player is designated opener | Waiting for your first PBEM save | Start Civ (create game) | → `CIV_RUNNING`, `OUTGOING_SAVE_DETECTED`, `ERROR` | → `MY_TURN_DOWNLOADED` without remote save | Same if still opener and seq 0 |
-| `WAITING_FOR_OTHER_PLAYER` | Another human owns the handoff | Manifest current player ≠ local | Waiting for {player} | None needed | → `DOWNLOADING`, `ERROR` | Upload commit | Same if still not owner |
+| `WAITING_FOR_OTHER_PLAYER` | Another human owns the handoff | Manifest current player ≠ local | Waiting for {player} | None needed (Focus/Close fallbacks MAY appear as secondary when Civ is still closing) | → `DOWNLOADING`, `ERROR` | Upload commit; treating Civ close failure as protocol failure | Same if still not owner; close progress is secondary local status only ([§8.5](#85-turn-handling-modes)) |
 | `DOWNLOADING` | Fetching accepted save for this player | Manifest says local is owner; download in progress | Downloading save… | None | → `MY_TURN_DOWNLOADED`, `WAITING_FOR_OTHER_PLAYER`, `ERROR` | Launch before verify | Resume or restart download |
 | `MY_TURN_DOWNLOADED` | Verified incoming save ready | Local verified hash = manifest accepted hash; local is owner | YOUR TURN / DIN TUR | Start Civ and play | → `CIV_RUNNING`, `OUTGOING_SAVE_DETECTED`, `ERROR` | Upload incoming hash as new handoff | Restore this if evidence still holds |
 | `CIV_RUNNING` | Civ process associated with this match is running | Process handle / PID observation; durable play-session baseline recorded at launch | Civilization is running | Focus / open folder (secondary) | → `OUTGOING_SAVE_DETECTED`, `MY_TURN_DOWNLOADED`, `WAITING_FOR_MY_FIRST_SAVE`, `ERROR` | Manifest rewrite because Civ started | If Civ still running → `CIV_RUNNING` with preserved baseline; else re-derive |
@@ -261,6 +280,7 @@ stateDiagram-v2
 - Last successful event with timestamp
 - One context-sensitive primary button
 - Secondary controls: matches, settings, diagnostics
+- Per-match settings MUST expose `turn_handling_mode` and, when Fully managed is selected, the advanced `allow_force_close_after_commit` consent with warning ([§4.2](#42-per-match-configuration))
 
 ### 7.2 Examples
 
@@ -282,18 +302,27 @@ Save downloaded and verified
 [Start Civ and play]
 ```
 
-Swedish `DIN TUR` and English `YOUR TURN` MAY both be supported; the status meaning MUST be identical.
+```text
+AdvCivTest
+
+STATUS: Waiting for Ljunget
+Turn safely sent, but Civilization did not close.
+
+[Focus Civ]  [Close Civ]
+```
+
+Swedish `DIN TUR` and English `YOUR TURN` MAY both be supported; the status meaning MUST be identical. The waiting example’s close message is secondary local status on `WAITING_FOR_OTHER_PLAYER` after a proven commit ([§8.5](#85-turn-handling-modes)); it is not a remote ownership failure.
 
 ### 7.3 Primary button by state
 
 | State | Primary button | Behavior |
 |-------|----------------|----------|
-| `WAITING_FOR_MY_FIRST_SAVE` | Start Civ and create game | Launch Civ with configured mod (no incoming save required) |
-| `WAITING_FOR_OTHER_PLAYER` | Disabled: Nothing needs to be done | No protocol effect |
+| `WAITING_FOR_MY_FIRST_SAVE` | Start Civ and create game (or Start/Resume after exit without save) | Launch Civ with configured mod (no incoming save required); in `fully_managed`, first launch MAY be automatic once ([§8.5](#85-turn-handling-modes)) |
+| `WAITING_FOR_OTHER_PLAYER` | Disabled: Nothing needs to be done | No protocol effect; if Civ remains open after proven commit, secondary Focus/Close fallbacks MAY appear |
 | `DOWNLOADING` | Disabled: Downloading… | No protocol effect |
-| `MY_TURN_DOWNLOADED` | Start Civ and play | Launch Civ with mod + verified incoming save |
-| `CIV_RUNNING` | Disabled: Civilization is running | Optional secondary: reveal save folder |
-| `OUTGOING_SAVE_DETECTED` | Send save (if not auto) | Start upload/commit; auto-send SHOULD be default when candidate is valid **and** a trustworthy play-session baseline exists |
+| `MY_TURN_DOWNLOADED` | Start Civ and play (or Start/Resume after exit without save) | Launch Civ with mod + verified incoming save; in `fully_managed`, at most one automatic launch per accepted sequence/hash |
+| `CIV_RUNNING` | Disabled: Civilization is running | Optional secondary: Focus / reveal save folder |
+| `OUTGOING_SAVE_DETECTED` | Send save (if not auto) | Start upload/commit; auto-send remains subject to trustworthy baseline/candidate rules in both modes; `fully_managed` requires auto-send for zero-click operation |
 | `UPLOADING` | Disabled: Uploading… | No protocol effect |
 | `ERROR` | Retry | Re-enter `RECONCILING` / resume failed idempotent op |
 | `RECONCILING` | Disabled: Checking… | No protocol effect |
@@ -320,8 +349,11 @@ Avoid generic messages such as “No connection” without host, operation, and 
 - Launch MUST use the selected launch profile, configured mod, and—when playing a received turn—the verified incoming save path.
 - Exact CLI flags are an integration detail; the design requires “mod + save” correctness, not save rewriting ([Open decisions](#13-open-decisions)).
 - Immediately before launching from `WAITING_FOR_MY_FIRST_SAVE` or `MY_TURN_DOWNLOADED`, the client MUST record a durable play-session baseline of stable matching PBEM files and hashes ([`SYNC_PROTOCOL.md` §6.1](SYNC_PROTOCOL.md#61-play-session-baseline)).
-- If Civilization is already running for this match, the client MUST NOT start a second instance by default; it SHOULD inform the user and keep `CIV_RUNNING` (baseline from the original launch MUST remain).
-- If an unrelated Civ process is running, the client SHOULD warn before launch.
+- The client MUST persist launch-attempt and process-association evidence (at least intended sequence/hash, PID, process start time, and executable identity) across Relay restarts.
+- The client MUST NOT launch a second associated Civ instance for the same match. If the associated process is already running, keep `CIV_RUNNING` and retain the original baseline.
+- If an unrelated Civ process is running, the client SHOULD warn before launch and MUST NOT treat that process as Relay-owned.
+- If no interactive/unlocked desktop is available, auto-launch MUST defer without repeated hidden launches.
+- Automatic vs manual launch timing is owned by [§8.5](#85-turn-handling-modes).
 
 ### 8.2 Outgoing save completion
 
@@ -357,11 +389,69 @@ Filesystem events SHOULD trigger checks; polling at the global interval MUST rem
 - If protocol sequence remains `0`, no accepted save exists, and no valid outgoing candidate was produced → transition `CIV_RUNNING` → `WAITING_FOR_MY_FIRST_SAVE`.
 - Otherwise, when a verified incoming turn was in play → transition `CIV_RUNNING` → `MY_TURN_DOWNLOADED`.
 
-Explain that no new outgoing save was detected. Do not change remote ownership.
+Explain that no new outgoing save was detected. Do not change remote ownership. Do **not** auto-relaunch in a loop; the user MUST explicitly Start/Resume ([§8.5](#85-turn-handling-modes)).
 
-### 8.5 Auto-launch boundaries
+### 8.5 Turn handling modes
 
-Optional **per-match** auto-launch MAY start Civ only after a save is fully verified and the state is `MY_TURN_DOWNLOADED`, and only after the play-session baseline is recorded. Auto-launch MUST NOT upload, alter manifests, or advance protocol sequence.
+Per-match `turn_handling_mode` ([§4.2](#42-per-match-configuration)) selects how much of the local lifecycle Relay automates. Neither mode weakens the authority model ([§5](#5-authority-model)): file detection, stability, upload success, process launch, and process exit MUST NEVER advance remote ownership. Only the existing manifest commit algorithm advances a turn ([`SYNC_PROTOCOL.md` §7](SYNC_PROTOCOL.md#7-upload-and-commit-algorithm)). Process closure MUST NOT become a remote protocol state.
+
+Auto-send remains subject to trustworthy baseline and candidate rules ([§8.2](#82-outgoing-save-completion)) in **both** modes. Fully managed requires those rules to succeed for zero-click operation.
+
+#### Standard (`standard`, default)
+
+- Relay downloads and verifies incoming saves.
+- The user launches Civ through Relay’s primary button.
+- A valid outgoing save MAY be auto-sent when a trustworthy baseline exists.
+- Relay MUST NOT close Civ automatically.
+- Manual Send remains available when auto-send is disabled or unsafe.
+
+#### Fully managed (`fully_managed`)
+
+Normal successful lifecycle requires no Relay interaction after the app is opened:
+
+1. Remote manifest shows the local player owns the turn.
+2. Relay downloads and verifies the accepted save.
+3. Relay records the durable play-session baseline.
+4. Relay issues exactly one automatic launch for that accepted sequence/hash.
+5. Civ starts with the configured BTS/AdvCiv profile and verified save.
+6. The player plays and ends the turn inside Civ.
+7. Relay detects a stable outgoing save that passes all baseline/hash rules.
+8. Relay automatically uploads and commits it.
+9. Only after the authoritative manifest proves commit, or sender reconciliation proves an idempotent acknowledgement, Relay requests graceful closure of the exact Civ process it launched.
+10. Relay waits for the next player and repeats when ownership returns.
+
+Sequence 0 follows the same model but launches Civ without an incoming save and waits for the first outgoing save.
+
+Additional Fully managed constraints:
+
+- Auto-launch at most once per accepted sequence/hash unless the user explicitly retries (Start/Resume).
+- Duplicate polling MUST NOT launch again for the same sequence/hash.
+- Partial/unstable saves MUST NEVER upload or trigger closure.
+- Upload/commit failure MUST leave Civ open.
+- Civ MAY be closed automatically only after authoritative commit proof (or proven idempotent acknowledgement).
+- Close only the exact Relay-launched process, verified using PID, process start time, and executable identity.
+- Never close an unrelated or manually launched Civ process merely because the executable name matches.
+- After Relay restart, if process identity cannot be proven, do not close it automatically.
+- If Civ exits without a valid outgoing save: no remote change, no relaunch loop; return to `WAITING_FOR_MY_FIRST_SAVE` (seq 0) or `MY_TURN_DOWNLOADED` (received turn) and require explicit Start/Resume ([§8.4](#84-civilization-closes-without-outgoing-save)).
+
+#### Closing policy after authoritative commit
+
+Applies only in `fully_managed`, and only after commit/idempotent-ack proof:
+
+1. Request normal Windows application close for the verified Relay-owned process.
+2. Wait 15 seconds.
+3. If Civ exits, continue normally.
+4. Otherwise show: `Turn safely sent, but Civilization did not close.`
+5. Provide manual Focus/Close fallback.
+
+Operational state after commit remains `WAITING_FOR_OTHER_PLAYER` even while Civ is closing. Close progress or failure is secondary local status attached to that waiting state; it is not remote ownership and not a protocol failure. The UI MUST distinguish “turn safely committed” from “Civ still open”.
+
+#### Force-close opt-in (`allow_force_close_after_commit`)
+
+- Explicit advanced opt-in with warning; default `false`; only applicable in `fully_managed` ([§4.2](#42-per-match-configuration)).
+- Forced termination is allowed only after authoritative commit proof (or proven idempotent acknowledgement) and exact process verification.
+- Never force-close during save creation, verification, upload, or commit.
+- A close failure MUST NEVER change or roll back an already committed handoff.
 
 ---
 
@@ -374,10 +464,11 @@ Optional **per-match** auto-launch MAY start Civ only after a save is fully veri
 3. Local cache (last sequence/hash, paths)
 4. Local incoming and outgoing files
 5. Recorded hashes, operation journal, and play-session baseline
-6. Whether Civilization is running
-7. Remote upload-lock presence/metadata (never auto-delete foreign locks)
+6. Durable launch-attempt and process-association evidence (sequence/hash, PID, start time, executable identity)
+7. Whether Civilization is running and whether that process still matches Relay-owned association evidence
+8. Remote upload-lock presence/metadata (never auto-delete foreign locks)
 
-The program MUST explain the recovered state rather than guess silently from filenames alone. If the play-session baseline is missing or corrupt while outgoing detection would otherwise run, auto-send MUST stop pending explicit recovery.
+The program MUST explain the recovered state rather than guess silently from filenames alone. If the play-session baseline is missing or corrupt while outgoing detection would otherwise run, auto-send MUST stop pending explicit recovery. Restart MUST NOT double-launch the same accepted sequence/hash or auto-close a process whose identity cannot be proven ([§8.5](#85-turn-handling-modes)).
 
 ### 9.2 Repair rules
 
@@ -438,6 +529,7 @@ Export MAY attach redacted logs and last manifest metadata (no secrets).
 | FR-012 | Secret redaction | Logs, UI errors, and diagnostics export contain no passwords, keys, or secret env values |
 | FR-013 | Play-session baseline | Pre-launch files are not auto-sent; missing baseline disables auto-send |
 | FR-014 | Foreign locks | Never auto-broken; abandoned removal only via confirmed repair |
+| FR-015 | Fully managed turn lifecycle | Verified incoming save causes one automatic launch; duplicate polling does not launch again; commit (or proven idempotent ack) is proven before close request; only the Relay-owned process is targeted; close failure leaves the committed turn safe and clearly reported; force-close is opt-in and post-commit only; restart neither double-launches nor closes an unverified process; Civ exit without outgoing save causes no remote change or relaunch loop ([§8.5](#85-turn-handling-modes)) |
 
 ---
 
@@ -458,8 +550,9 @@ Product-level principles only. Detailed protocol cases: [`SYNC_PROTOCOL.md`](SYN
 | Topic | Recommendation |
 |-------|----------------|
 | Exact Civ IV CLI for mod + save | Confirm empirically on BTS/AdvCiv during launch-integration phase; keep launcher behind an adapter interface now |
-| Default auto-send vs manual Send | Auto-send after valid `OUTGOING_SAVE_DETECTED` when a trustworthy baseline exists |
-| Default per-match auto-launch | Off |
+| Default auto-send vs manual Send | Auto-send after valid `OUTGOING_SAVE_DETECTED` when a trustworthy baseline exists (required for zero-click `fully_managed`) |
+| Default `turn_handling_mode` | `standard` ([§4.2](#42-per-match-configuration), [§8.5](#85-turn-handling-modes)); replaces standalone `auto_launch` |
+| Default `allow_force_close_after_commit` | `false`; Fully managed advanced opt-in only |
 | Stable-file sampling interval | 1.0s between size samples, twice; make configurable later if needed |
 | Host-key policy | Verify against pinned host key / known_hosts; refuse on mismatch (no silent insecure accept) |
 

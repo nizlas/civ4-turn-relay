@@ -75,6 +75,7 @@ A phase moves from ACTIVE → COMPLETE only when:
 | [FR-012](DESIGN_SPEC.md#11-functional-requirements-and-acceptance-criteria) | P1, P8 | Redaction in logs/config load; UI/diagnostics |
 | [FR-013](DESIGN_SPEC.md#11-functional-requirements-and-acceptance-criteria) | P4 | Play-session baseline |
 | [FR-014](DESIGN_SPEC.md#11-functional-requirements-and-acceptance-criteria) | P3, P8 | Lock policy in engine; confirmed repair UX |
+| [FR-015](DESIGN_SPEC.md#11-functional-requirements-and-acceptance-criteria) | P4, P5, P7, P8, P9 | Fully managed lifecycle: P4 durable launch/process records + pure orchestration/intents; P5 headless managed flows; P7 real process verify/close; P8 mode/consent/fallbacks; P9 packaged e2e hardening |
 
 ### Protocol tests → owning phases
 
@@ -420,14 +421,15 @@ P3 complete.
 ### Read
 
 - [`SYNC_PROTOCOL.md` §6](SYNC_PROTOCOL.md#6-outgoing-save-detection), [§9](SYNC_PROTOCOL.md#9-crash-point-analysis) (baseline/Civ rows), [§10](SYNC_PROTOCOL.md#10-local-persistence)
-- [`DESIGN_SPEC.md` §3.4–3.8](DESIGN_SPEC.md#34-creating-the-first-pbem-save), [§6](DESIGN_SPEC.md#6-local-operational-states), [§8](DESIGN_SPEC.md#8-process-and-save-detection-behavior), [§9](DESIGN_SPEC.md#9-crash-recovery-and-repair-ux), [§10](DESIGN_SPEC.md#10-logging-and-diagnostics)
+- [`DESIGN_SPEC.md` §3.4–3.8](DESIGN_SPEC.md#34-creating-the-first-pbem-save), [§4.2](DESIGN_SPEC.md#42-per-match-configuration), [§6](DESIGN_SPEC.md#6-local-operational-states), [§8](DESIGN_SPEC.md#8-process-and-save-detection-behavior) (including [§8.5 turn handling](DESIGN_SPEC.md#85-turn-handling-modes)), [§9](DESIGN_SPEC.md#9-crash-recovery-and-repair-ux), [§10](DESIGN_SPEC.md#10-logging-and-diagnostics), [FR-015](DESIGN_SPEC.md#11-functional-requirements-and-acceptance-criteria)
 - Open decision: stable-file sampling ([DESIGN_SPEC §13](DESIGN_SPEC.md#13-open-decisions))
 
 ### In scope
 
-- Per-match durable store (sequence/hash, incoming path, baseline, journal, processed outgoings)
+- Per-match durable store (sequence/hash, incoming path, baseline, journal, processed outgoings, launch-attempt/process-association records)
 - Reconcile → local operational states ([§6](DESIGN_SPEC.md#6-local-operational-states))
 - Baseline record before “launch” command boundary (launch itself stubbed/fake process handle)
+- Pure managed-mode orchestration/intents for `turn_handling_mode` / `allow_force_close_after_commit` ([DESIGN_SPEC §8.5](DESIGN_SPEC.md#85-turn-handling-modes)): duplicate-launch suppression, auto-send trigger when safe, and close intent only after committed/idempotent evidence — **no real process calls**
 - Outgoing detection rules; multi-candidate error; missing baseline disables auto-send
 - Watchdog adapter behind a port + polling fallback
 - Multi-match local config selection isolation (FR-011 foundation)
@@ -435,23 +437,24 @@ P3 complete.
 
 ### Out of scope
 
-- Real Civ process (P7), UI (P8), Paramiko (P6)
+- Real Civ process launch/close (P7), UI (P8), Paramiko (P6)
 
 ### Expected files/components
 
-- `local/` persistence, reconcile, detect, `fs/` watcher port + watchdog impl + poller
+- `local/` persistence, reconcile, detect, managed-mode orchestration (intents only), `fs/` watcher port + watchdog impl + poller
 - Fake process/launch port for state transitions without Civ
 
 ### Required automated tests
 
 - PT-06, PT-19–PT-24, PT-34
 - Restart with baseline surviving “Civ still running” (fake process) — PT-22 / FR-004
-- Civ exit without outgoing → correct state (FR-010 simulated)
+- Civ exit without outgoing → correct state (FR-010 simulated); no relaunch loop under managed intents (FR-015 foundation)
+- Duplicate-launch suppression and close-intent-only-after-commit/idempotent-ack with fake process evidence (FR-015 foundation)
 - Match switch does not mutate other match remote/local ownership records (FR-011)
 
 ### Applicable PT IDs
 
-**PT-06, PT-19–PT-24, PT-34** (primary). Uses P3 engine for upload after detection.
+**PT-06, PT-19–PT-24, PT-34** (primary). Uses P3 engine for upload after detection. Do **not** invent protocol PT IDs for process behavior.
 
 ### Manual verification
 
@@ -460,6 +463,7 @@ P3 complete.
 ### Exit criteria
 
 - Baseline/detection/reconcile tests green; auto-send cannot run without trustworthy baseline
+- Managed-mode durable records and pure intents green without real process I/O
 - Sampling interval default recorded (1.0s × 2) unless evidence changes it
 
 ### Risks / decisions
@@ -494,12 +498,13 @@ P4 complete.
 
 - Headless orchestration harness for two clients
 - Synthetic “Civ produced save” by writing bytes into watched dirs
-- Scenarios covering FR-001–FR-005, FR-009–FR-010, FR-013–FR-014 at workflow level
+- Managed-mode orchestration with fake/headless clients where useful (FR-015): one launch intent per sequence/hash, auto-send after valid candidate, close intent only after commit/idempotent-ack evidence
+- Scenarios covering FR-001–FR-005, FR-009–FR-010, FR-013–FR-015 at workflow level
 - Re-run critical PT IDs in e2e form
 
 ### Out of scope
 
-- Real SFTP, real Civ, GUI, packaging
+- Real SFTP, real Civ process APIs, GUI, packaging
 
 ### Expected files/components
 
@@ -600,11 +605,11 @@ P5 complete.
 
 ### Goal
 
-Empirically determine and implement launch/process integration for Steam/BTS/AdvCiv: mod + save, already-running detection, exit without save (FR-010).
+Empirically determine and implement launch/process integration for Steam/BTS/AdvCiv: mod + save, already-running detection, exit without save (FR-010), and Fully managed close/verify behavior (FR-015).
 
 ### Why now
 
-Launch flags cannot be assumed; this phase follows a working Paramiko adapter so launch integration builds on proven remote transfer.
+Launch flags cannot be assumed; this phase follows a working Paramiko adapter so launch integration builds on proven remote transfer and P4 managed-mode intents.
 
 ### Prerequisites
 
@@ -612,21 +617,25 @@ P6 complete.
 
 ### Read
 
-- [`DESIGN_SPEC.md` §8.1](DESIGN_SPEC.md#81-launching-civilization), [§8.4–8.5](DESIGN_SPEC.md#84-civilization-closes-without-outgoing-save), [§13](DESIGN_SPEC.md#13-open-decisions)
+- [`DESIGN_SPEC.md` §8.1](DESIGN_SPEC.md#81-launching-civilization), [§8.4–8.5](DESIGN_SPEC.md#84-civilization-closes-without-outgoing-save) (including turn handling / close policy), [§13](DESIGN_SPEC.md#13-open-decisions), [FR-015](DESIGN_SPEC.md#11-functional-requirements-and-acceptance-criteria)
 - [`SYNC_PROTOCOL.md` §6.1](SYNC_PROTOCOL.md#61-play-session-baseline) (baseline still recorded before launch)
 
 ### In scope
 
 - Launch port + Windows implementation
 - Empirical notes (developer-local) for exact CLI / Steam behaviors — **do not commit real install paths as secrets/defaults beyond placeholders**
-- Already-running / unrelated process warnings
-- Wire launch to baseline recording boundary from P4
-- Auto-launch remains per-match and off by default
+- Already-running / unrelated process warnings and protection
+- Wire launch to baseline recording and durable process-association evidence from P4
+- Real Windows launch; PID / start-time / executable verification
+- Graceful close request, 15s wait, and optional post-commit forced termination when `allow_force_close_after_commit` is enabled
+- BTS/AdvCiv verification paths; never close an unrelated/manually launched process by executable name alone
+- Defer auto-launch when no interactive/unlocked desktop is available
 
 ### Out of scope
 
 - Controlling Civ UI / ending turns (NG-8)
 - Packaging, full GUI (stubs/CLI OK)
+- New protocol PT IDs for process behavior
 
 ### Expected files/components
 
@@ -636,6 +645,7 @@ P6 complete.
 
 - Unit tests with fake process supervisor (no real Civ binary required in CI)
 - FR-010 state transitions with fake process exit
+- FR-015 process-identity verification, graceful-close timeout path, and force-close only after commit proof (fake supervisor)
 
 ### Applicable PT IDs
 
@@ -644,12 +654,14 @@ None new; supports PT-22 behavior with real process optional manually.
 ### Manual verification
 
 - On a Windows machine with BTS/AdvCiv: launch mod+save, confirm load; exit without Next Turn → correct relay state
+- Fully managed: one auto-launch, auto-send after Next Turn, graceful close after proven commit; unrelated Civ left alone
 - Record resolved CLI in phase close-out notes / code comments without copying prior PBEM manager
 
 ### Exit criteria
 
 - Exact Steam/BTS/AdvCiv launch behavior empirically verified and implemented behind the port
 - Open decision “exact CLI” closed with evidence
+- FR-015 process close/verify acceptance criteria demonstrable with the Windows adapter (or fake supervisor in CI)
 
 ### Risks / decisions
 
@@ -676,13 +688,15 @@ P7 complete.
 
 ### Read
 
-- [`DESIGN_SPEC.md` §3](DESIGN_SPEC.md#3-end-to-end-workflows), [§4](DESIGN_SPEC.md#4-configuration-model), [§6–7](DESIGN_SPEC.md#6-local-operational-states), [§9–10](DESIGN_SPEC.md#9-crash-recovery-and-repair-ux), [§11](DESIGN_SPEC.md#11-functional-requirements-and-acceptance-criteria) (FR-011, FR-012, FR-014)
+- [`DESIGN_SPEC.md` §3](DESIGN_SPEC.md#3-end-to-end-workflows), [§4](DESIGN_SPEC.md#4-configuration-model), [§6–7](DESIGN_SPEC.md#6-local-operational-states), [§8.5](DESIGN_SPEC.md#85-turn-handling-modes), [§9–10](DESIGN_SPEC.md#9-crash-recovery-and-repair-ux), [§11](DESIGN_SPEC.md#11-functional-requirements-and-acceptance-criteria) (FR-011, FR-012, FR-014, FR-015)
 - [`SYNC_PROTOCOL.md` §7.1](SYNC_PROTOCOL.md#71-lock-primitive) (repair confirmation), [§11](SYNC_PROTOCOL.md#11-history-and-repair)
 
 ### In scope
 
 - Main window per §7; primary button table; DIN TUR / YOUR TURN
 - Global settings + per-match editors (no server settings duplicated per match)
+- Turn handling mode selector (`standard` / `fully_managed`); advanced force-close consent with warning when Fully managed
+- Statuses that distinguish committed turn from Civ-still-open; Start/Resume/Focus/Close fallbacks
 - Diagnostics export redaction
 - Explicit repair previews (abandoned lock, incomplete init)
 - Multi-match switching presentation (FR-011)
@@ -692,6 +706,7 @@ P7 complete.
 - Protocol decisions in widgets
 - Packaging (P9)
 - Fancy dashboards
+- Ambiguous partial-automation toggle combinations that revive standalone `auto_launch`
 
 ### Expected files/components
 
@@ -702,6 +717,7 @@ P7 complete.
 - UI tests: state presentation; buttons invoke commands only; no direct storage/protocol mutation from widgets
 - Redaction tests on diagnostics export (FR-012)
 - Repair confirmation required for foreign lock removal (FR-014)
+- Mode selector / force-close consent presentation; close-failure status does not imply protocol failure (FR-015 UX)
 
 ### Applicable PT IDs
 
@@ -711,15 +727,17 @@ None exclusively; exercises PT-11 / PT-23 paths via UI commands.
 
 - Walk examples in [`DESIGN_SPEC` §7.2](DESIGN_SPEC.md#72-examples)
 - Confirm errors include safety/retry/next-step fields (§7.4)
+- Fully managed: mode + force-close warning; Focus/Close when Civ remains after commit
 
 ### Exit criteria
 
-- UI is presentation/command-only; FR-011/012/014 UX satisfied
-- Default auto-send / auto-launch match design recommendations
+- UI is presentation/command-only; FR-011/012/014/015 UX satisfied
+- Default `turn_handling_mode=standard`; auto-send remains baseline-gated
 
 ### Risks / decisions
 
 - Close default auto-send vs manual if usability evidence appears; keep baseline requirement
+- Keep Fully managed as one coherent mode rather than exposing partial automation toggles
 
 ---
 
@@ -761,7 +779,8 @@ P8 complete.
 - **MSVC x64 runtime:** handle via official `vc_redist.x64.exe`; prefer embedded/offline redistributable when Microsoft redistribution terms permit; if embedding is not legally or technically appropriate, implement an explicit verified prerequisite flow (not silent fail)
 - Applicable third-party notices for PySide6/Paramiko/etc. (and other bundled components)
 - Reproducible build notes; ops docs for install, `.env`, host keys, backup/repair expectations
-- Release checklist: FR-001–FR-014 signed off; PT matrix still green on fake; SFTP subset green
+- Packaged-build end-to-end hardening for Fully managed turns where appropriate (FR-015): one auto-launch, auto-send, post-commit close path on real Windows installs without secrets in-repo
+- Release checklist: FR-001–FR-015 signed off; PT matrix still green on fake; SFTP subset green
 
 ### Out of scope
 
