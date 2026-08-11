@@ -122,3 +122,15 @@ def test_validation_before_io_rejects_bad_game_id() -> None:
     with pytest.raises(DomainValidationError):
         read_authoritative_manifest(storage, "../evil")
     assert storage.calls == []
+
+
+def test_manifest_path_as_directory_is_invalid_not_missing() -> None:
+    storage = FakeStorage()
+    paths = GamePaths("example-match")
+    storage.mkdir(paths.root)
+    storage.mkdir(paths.manifest)
+    before = storage.snapshot()
+    result = read_authoritative_manifest(storage, "example-match")
+    assert result.outcome is ManifestReadOutcome.INVALID
+    assert result.manifest is None
+    assert storage.snapshot() == before

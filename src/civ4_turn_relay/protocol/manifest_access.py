@@ -58,7 +58,9 @@ def read_authoritative_manifest(storage: Storage, game_id: str) -> ManifestReadR
     except StorageNotFoundError:
         return ManifestReadResult(ManifestReadOutcome.MISSING)
     except StorageWrongKindError:
-        return ManifestReadResult(ManifestReadOutcome.MISSING)
+        # A directory (or other wrong kind) at manifest.json is structural
+        # corruption requiring repair — not a missing uninitialized match.
+        return ManifestReadResult(ManifestReadOutcome.INVALID)
     except StorageTransportError:
         return ManifestReadResult(ManifestReadOutcome.TRANSPORT_FAILURE)
     except StorageError:

@@ -273,3 +273,155 @@ def test_all_failure_results_preserve_authoritative_remote_state() -> None:
     result = initialize_match(storage, sample_match_config(), operation_id=OP_ID)
     assert result.outcome is InitializeOutcome.INCOMPLETE_OR_CONFLICTING
     assert storage.snapshot() == before
+
+
+def test_uncertain_replace_exact_intended_manifest_is_created() -> None:
+    from civ4_turn_relay.domain import (
+        MANIFEST_SCHEMA_VERSION,
+        MIN_CLIENT_PROTOCOL,
+        Manifest,
+        ProtocolMetadata,
+    )
+    from tests.protocol.helpers import UncertainReplaceStorage
+
+    config = sample_match_config()
+    intended = Manifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        game_id=config.game_id,
+        display_name=config.display_name,
+        players=config.players,
+        protocol_sequence=0,
+        current_player_id=config.players[0].id,
+        last_sender_id=None,
+        accepted_save=None,
+        accepted_save_hashes=(),
+        previous_manifest_ref=None,
+        protocol=ProtocolMetadata(
+            min_client_protocol=MIN_CLIENT_PROTOCOL, last_operation_id=None
+        ),
+    )
+    inner = FakeStorage()
+    storage = UncertainReplaceStorage(inner, committed_bytes="source")
+    result = initialize_match(storage, config, operation_id=OP_ID)
+    assert result.outcome is InitializeOutcome.CREATED
+    assert result.manifest == intended
+    assert storage.mutations_after_uncertain == 0
+    assert (
+        inner.read_file(GamePaths(config.game_id).manifest) == intended.to_json_bytes()
+    )
+
+
+def test_uncertain_replace_different_valid_manifest_is_joined_not_created() -> None:
+    from civ4_turn_relay.domain import (
+        MANIFEST_SCHEMA_VERSION,
+        MIN_CLIENT_PROTOCOL,
+        Manifest,
+        ProtocolMetadata,
+    )
+    from tests.protocol.helpers import UncertainReplaceStorage
+
+    config = sample_match_config()
+    foreign = Manifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        game_id=config.game_id,
+        display_name="Foreign Existing Match",
+        players=config.players,
+        protocol_sequence=0,
+        current_player_id=config.players[0].id,
+        last_sender_id=None,
+        accepted_save=None,
+        accepted_save_hashes=(),
+        previous_manifest_ref=None,
+        protocol=ProtocolMetadata(
+            min_client_protocol=MIN_CLIENT_PROTOCOL, last_operation_id=None
+        ),
+    )
+    inner = FakeStorage()
+    storage = UncertainReplaceStorage(inner, committed_bytes=foreign.to_json_bytes())
+    result = initialize_match(storage, config, operation_id=OP_ID)
+    assert result.outcome is InitializeOutcome.JOINED_EXISTING
+    assert result.manifest == foreign
+    assert result.manifest is not None
+    assert result.manifest.display_name == "Foreign Existing Match"
+    assert storage.mutations_after_uncertain == 0
+    before = inner.snapshot()
+    retry = initialize_match(inner, config, operation_id=OP_ID_2)
+    assert retry.outcome is InitializeOutcome.JOINED_EXISTING
+    assert inner.snapshot() == before
+
+
+def test_uncertain_replace_invalid_manifest_bytes() -> None:
+    from tests.protocol.helpers import UncertainReplaceStorage
+
+    config = sample_match_config()
+    inner = FakeStorage()
+    storage = UncertainReplaceStorage(inner, committed_bytes=b"{not-json")
+    result = initialize_match(storage, config, operation_id=OP_ID)
+    assert result.outcome is InitializeOutcome.INVALID_MANIFEST
+    assert result.manifest is None
+    assert storage.mutations_after_uncertain == 0
+    assert inner.snapshot().files[GamePaths(config.game_id).manifest] == b"{not-json"
+
+
+def test_uncertain_replace_game_id_mismatched_manifest() -> None:
+    from civ4_turn_relay.domain import (
+        MANIFEST_SCHEMA_VERSION,
+        MIN_CLIENT_PROTOCOL,
+        Manifest,
+        ProtocolMetadata,
+    )
+    from tests.protocol.helpers import UncertainReplaceStorage
+
+    config = sample_match_config()
+    mismatched = Manifest(
+        schema_version=MANIFEST_SCHEMA_VERSION,
+        game_id="other-match",
+        display_name=config.display_name,
+        players=config.players,
+        protocol_sequence=0,
+        current_player_id=config.players[0].id,
+        last_sender_id=None,
+        accepted_save=None,
+        accepted_save_hashes=(),
+        previous_manifest_ref=None,
+        protocol=ProtocolMetadata(
+            min_client_protocol=MIN_CLIENT_PROTOCOL, last_operation_id=None
+        ),
+    )
+    inner = FakeStorage()
+    storage = UncertainReplaceStorage(inner, committed_bytes=mismatched.to_json_bytes())
+    result = initialize_match(storage, config, operation_id=OP_ID)
+    assert result.outcome is InitializeOutcome.GAME_ID_MISMATCH
+    assert result.manifest is None
+    assert storage.mutations_after_uncertain == 0
+    assert (
+        inner.snapshot().files[GamePaths(config.game_id).manifest]
+        == mismatched.to_json_bytes()
+    )
+
+
+def test_game_root_occupied_by_file_is_incomplete_or_conflicting() -> None:
+    storage = FakeStorage()
+    storage.write_file("example-match", b"not-a-directory")
+    before = storage.snapshot()
+    result = initialize_match(storage, sample_match_config(), operation_id=OP_ID)
+    assert result.outcome is InitializeOutcome.INCOMPLETE_OR_CONFLICTING
+    assert result.manifest is None
+    assert storage.snapshot() == before
+    retry = initialize_match(storage, sample_match_config(), operation_id=OP_ID_2)
+    assert retry.outcome is InitializeOutcome.INCOMPLETE_OR_CONFLICTING
+    assert storage.snapshot() == before
+
+
+def test_manifest_path_occupied_by_directory_is_invalid_and_untouched() -> None:
+    storage = FakeStorage()
+    paths = GamePaths("example-match")
+    storage.mkdir(paths.root)
+    storage.mkdir(paths.manifest)
+    before = storage.snapshot()
+    result = initialize_match(storage, sample_match_config(), operation_id=OP_ID)
+    assert result.outcome is InitializeOutcome.INVALID_MANIFEST
+    assert storage.snapshot() == before
+    retry = initialize_match(storage, sample_match_config(), operation_id=OP_ID_2)
+    assert retry.outcome is InitializeOutcome.INVALID_MANIFEST
+    assert storage.snapshot() == before

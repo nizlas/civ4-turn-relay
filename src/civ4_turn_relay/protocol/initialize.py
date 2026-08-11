@@ -29,6 +29,7 @@ from civ4_turn_relay.storage import (
     StorageCapabilityError,
     StorageError,
     StorageTransportError,
+    StorageWrongKindError,
 )
 
 
@@ -83,6 +84,9 @@ def initialize_match(
         storage.mkdir(paths.root)
     except StorageAlreadyExistsError:
         return _classify_existing_game_root(storage, config.game_id)
+    except StorageWrongKindError:
+        # A file (or other wrong kind) occupies the game-root path.
+        return InitializeResult(InitializeOutcome.INCOMPLETE_OR_CONFLICTING)
     except StorageCapabilityError:
         return InitializeResult(InitializeOutcome.CAPABILITY_FAILURE)
     except StorageTransportError:
@@ -118,11 +122,13 @@ def _finish_new_match(
             storage.mkdir(paths.resolve(name))
     except StorageCapabilityError:
         return InitializeResult(InitializeOutcome.CAPABILITY_FAILURE)
+    except StorageWrongKindError:
+        return InitializeResult(InitializeOutcome.INCOMPLETE_OR_CONFLICTING)
     except StorageError:
         return InitializeResult(InitializeOutcome.TRANSPORT_FAILURE)
 
-    manifest = _sequence_zero_manifest(config)
-    payload = manifest.to_json_bytes()
+    intended = _sequence_zero_manifest(config)
+    payload = intended.to_json_bytes()
     temp_path = paths.temporary_manifest(operation_id)
     manifest_path = paths.manifest
 
@@ -132,18 +138,39 @@ def _finish_new_match(
     except StorageCapabilityError:
         return InitializeResult(InitializeOutcome.CAPABILITY_FAILURE)
     except StorageTransportError:
-        # After-fault on atomic_replace may leave a valid committed match.
-        recovered = read_authoritative_manifest(storage, config.game_id)
-        if (
-            recovered.outcome is ManifestReadOutcome.OK
-            and recovered.manifest is not None
-        ):
-            return InitializeResult(InitializeOutcome.CREATED, recovered.manifest)
-        return InitializeResult(InitializeOutcome.TRANSPORT_FAILURE)
+        return _classify_uncertain_commit(
+            storage, config.game_id, intended_payload=payload
+        )
     except StorageError:
         return InitializeResult(InitializeOutcome.TRANSPORT_FAILURE)
 
-    return InitializeResult(InitializeOutcome.CREATED, manifest)
+    return InitializeResult(InitializeOutcome.CREATED, intended)
+
+
+def _classify_uncertain_commit(
+    storage: Storage,
+    game_id: str,
+    *,
+    intended_payload: bytes,
+) -> InitializeResult:
+    """Classify remote state after a transport error during staging/replace.
+
+    Only attribute ``CREATED`` when the recovered authoritative bytes exactly
+    equal the sequence-zero manifest this operation intended to commit.
+    """
+    recovered = read_authoritative_manifest(storage, game_id)
+    if recovered.outcome is ManifestReadOutcome.OK and recovered.manifest is not None:
+        if recovered.manifest.to_json_bytes() == intended_payload:
+            return InitializeResult(InitializeOutcome.CREATED, recovered.manifest)
+        # A different valid authoritative manifest must not be credited to us.
+        return InitializeResult(InitializeOutcome.JOINED_EXISTING, recovered.manifest)
+    if recovered.outcome is ManifestReadOutcome.INVALID:
+        return InitializeResult(InitializeOutcome.INVALID_MANIFEST)
+    if recovered.outcome is ManifestReadOutcome.GAME_ID_MISMATCH:
+        return InitializeResult(InitializeOutcome.GAME_ID_MISMATCH)
+    if recovered.outcome is ManifestReadOutcome.MISSING:
+        return InitializeResult(InitializeOutcome.TRANSPORT_FAILURE)
+    return InitializeResult(InitializeOutcome.TRANSPORT_FAILURE)
 
 
 def _sequence_zero_manifest(config: MatchConfig) -> Manifest:
