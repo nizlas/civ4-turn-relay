@@ -12,6 +12,7 @@ from civ4_turn_relay.protocol import (
     GamePaths,
     HandoffRequest,
     InMemoryOperationJournal,
+    VerifiedDownloadArtifact,
     VerifiedDownloadEvidence,
     commit_handoff,
     download_accepted_save,
@@ -202,7 +203,7 @@ def test_sequence_zero_is_no_downloadable_turn() -> None:
     assert result.artifact is None
 
 
-def test_download_wrong_kind_and_transport_and_oversize() -> None:
+def test_download_wrong_kind_and_transport() -> None:
     storage = FakeStorage()
     _journal, game_id, digest = _commit_owner_turn(storage)
     paths = GamePaths(game_id)
@@ -228,17 +229,134 @@ def test_download_wrong_kind_and_transport_and_oversize() -> None:
     )
     assert transport.outcome is DownloadOutcome.TRANSPORT_FAILURE
 
-    storage3 = FakeStorage()
-    _journal3, game_id3, _d3 = _commit_owner_turn(storage3)
-    oversize = download_accepted_save(
-        storage3,
+
+def test_declared_size_over_limit_is_oversize_before_save_read() -> None:
+    storage = FakeStorage()
+    _journal, game_id, digest = _commit_owner_turn(storage)
+    paths = GamePaths(game_id)
+    save_path = paths.resolve(
+        paths.accepted_save_relative(1, digest, ".CivBeyondSwordSave")
+    )
+
+    class _ReadSpy(CountingStorage):
+        def __init__(self, inner: FakeStorage) -> None:
+            super().__init__(inner)
+            self.save_reads = 0
+
+        def read_file(self, path: str) -> bytes:
+            self._record("read_file")
+            if path == save_path:
+                self.save_reads += 1
+            return self._inner.read_file(path)
+
+    spy = _ReadSpy(storage)
+    result = download_accepted_save(
+        spy,
         DownloadRequest(
-            game_id=game_id3,
+            game_id=game_id,
             local_player_id="player_b",
             max_save_bytes=1,
         ),
     )
-    assert oversize.outcome is DownloadOutcome.OVERSIZE
+    assert result.outcome is DownloadOutcome.OVERSIZE
+    assert result.artifact is None
+    assert spy.save_reads == 0
+
+
+def test_actual_object_over_limit_is_oversize_after_complete_read() -> None:
+    storage = FakeStorage()
+    _journal, game_id, digest = _commit_owner_turn(storage)
+    paths = GamePaths(game_id)
+    save_path = paths.resolve(
+        paths.accepted_save_relative(1, digest, ".CivBeyondSwordSave")
+    )
+    oversized = SAVE_A + b"!"
+    storage.write_file(save_path, oversized, overwrite=True)
+    # Declared size equals original SAVE_A length and is within the configured max.
+    result = download_accepted_save(
+        storage,
+        DownloadRequest(
+            game_id=game_id,
+            local_player_id="player_b",
+            max_save_bytes=len(SAVE_A),
+        ),
+    )
+    assert result.outcome is DownloadOutcome.OVERSIZE
+    assert result.artifact is None
+
+
+def test_invalid_accepted_save_path_is_invalid_manifest_without_save_read() -> None:
+    storage = FakeStorage()
+    _journal, game_id, digest = _commit_owner_turn(storage)
+    paths = GamePaths(game_id)
+    save_path = paths.resolve(
+        paths.accepted_save_relative(1, digest, ".CivBeyondSwordSave")
+    )
+    raw = storage.read_file(paths.manifest).decode("utf-8")
+    needle = f'"remote_path": "saves/000001_{digest[:12]}.CivBeyondSwordSave"'
+    assert needle in raw
+    poisoned = raw.replace(needle, '"remote_path": "../outside.CivBeyondSwordSave"')
+    assert poisoned != raw
+    storage.write_file(paths.manifest, poisoned.encode("utf-8"), overwrite=True)
+
+    class _ReadSpy(CountingStorage):
+        def __init__(self, inner: FakeStorage) -> None:
+            super().__init__(inner)
+            self.save_reads = 0
+
+        def read_file(self, path: str) -> bytes:
+            self._record("read_file")
+            if path == save_path or "/saves/" in path:
+                self.save_reads += 1
+            return self._inner.read_file(path)
+
+    spy = _ReadSpy(storage)
+    result = download_accepted_save(
+        spy,
+        DownloadRequest(game_id=game_id, local_player_id="player_b"),
+    )
+    assert result.outcome is DownloadOutcome.INVALID_MANIFEST
+    assert result.artifact is None
+    assert spy.save_reads == 0
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "../evil.CivBeyondSwordSave",
+        "folder/file.CivBeyondSwordSave",
+        "folder\\file.CivBeyondSwordSave",
+        ".",
+        "..",
+        "bad\x00name.CivBeyondSwordSave",
+    ],
+)
+def test_verified_artifact_rejects_invalid_original_filenames(bad_name: str) -> None:
+    digest = sha256_hex(SAVE_A)
+    with pytest.raises(DomainValidationError):
+        VerifiedDownloadArtifact(
+            game_id="example-match",
+            protocol_sequence=1,
+            sha256=digest,
+            size_bytes=len(SAVE_A),
+            remote_path=f"saves/000001_{digest[:12]}.CivBeyondSwordSave",
+            original_filename=bad_name,
+            verified_bytes=SAVE_A,
+        )
+
+
+def test_verified_artifact_accepts_valid_civ_basename() -> None:
+    digest = sha256_hex(SAVE_A)
+    artifact = VerifiedDownloadArtifact(
+        game_id="example-match",
+        protocol_sequence=1,
+        sha256=digest,
+        size_bytes=len(SAVE_A),
+        remote_path=f"saves/000001_{digest[:12]}.CivBeyondSwordSave",
+        original_filename=SAVE_NAME,
+        verified_bytes=SAVE_A,
+    )
+    assert artifact.original_filename == SAVE_NAME
 
 
 def test_download_result_rejects_impossible_artifact_combinations() -> None:

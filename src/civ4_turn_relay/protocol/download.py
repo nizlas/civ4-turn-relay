@@ -16,6 +16,7 @@ from civ4_turn_relay.domain import (
     sha256_hex,
     validate_accepted_save_path,
     validate_game_id,
+    validate_original_filename,
     validate_player_id,
     validate_sha256_hex,
 )
@@ -44,7 +45,6 @@ class DownloadOutcome(Enum):
     NO_DOWNLOADABLE_TURN = "no_downloadable_turn"
     HASH_MISMATCH = "hash_mismatch"
     SIZE_MISMATCH = "size_mismatch"
-    PATH_VIOLATION = "path_violation"
     WRONG_KIND = "wrong_kind"
     OVERSIZE = "oversize"
     MISSING_SAVE = "missing_save"
@@ -144,11 +144,13 @@ class VerifiedDownloadArtifact:
             "remote_path",
             validate_accepted_save_path(self.remote_path, field_path="remote_path"),
         )
-        if not isinstance(self.original_filename, str) or not self.original_filename:
-            raise DomainValidationError(
-                "expected a non-empty original_filename",
-                field_path="original_filename",
-            )
+        object.__setattr__(
+            self,
+            "original_filename",
+            validate_original_filename(
+                self.original_filename, field_path="original_filename"
+            ),
+        )
         if type(self.verified_bytes) is not bytes:
             raise DomainValidationError(
                 "verified_bytes must be exact bytes",
@@ -292,18 +294,16 @@ def download_accepted_save(
     ):
         return DownloadResult(DownloadOutcome.ALREADY_VERIFIED)
 
+    # accepted_save.remote_path validity is part of manifest schema validity.
+    # Defensive resolve remains so no save I/O occurs on a containment failure.
+    paths = GamePaths(request.game_id)
     try:
         remote_relative = validate_accepted_save_path(
             accepted.remote_path, field_path="accepted_save.remote_path"
         )
-    except DomainValidationError:
-        return DownloadResult(DownloadOutcome.PATH_VIOLATION)
-
-    paths = GamePaths(request.game_id)
-    try:
         storage_path = paths.resolve(remote_relative)
     except DomainValidationError:
-        return DownloadResult(DownloadOutcome.PATH_VIOLATION)
+        return DownloadResult(DownloadOutcome.INVALID_MANIFEST)
 
     try:
         data = storage.read_file(storage_path)

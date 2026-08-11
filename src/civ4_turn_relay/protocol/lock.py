@@ -34,6 +34,7 @@ from civ4_turn_relay.storage import (
     Storage,
     StorageAlreadyExistsError,
     StorageCapabilityError,
+    StorageEntry,
     StorageError,
     StorageNotEmptyError,
     StorageNotFoundError,
@@ -238,6 +239,7 @@ class LockInspection:
     document: LockDocument | None = None
     raw_bytes: bytes | None = None
     wrong_kind_target: LockWrongKindTarget | None = None
+    wrong_kind_dir_listing: tuple[tuple[str, str], ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, LockInspectionKind):
@@ -262,6 +264,8 @@ class LockInspection:
                 "expected a LockWrongKindTarget",
                 field_path="wrong_kind_target",
             )
+        if self.wrong_kind_dir_listing is not None:
+            _validate_wrong_kind_dir_listing(self.wrong_kind_dir_listing)
         if self.kind is LockInspectionKind.READABLE:
             if self.document is None or self.raw_bytes is None:
                 raise DomainValidationError(
@@ -272,6 +276,11 @@ class LockInspection:
                 raise DomainValidationError(
                     "READABLE must not set wrong_kind_target",
                     field_path="wrong_kind_target",
+                )
+            if self.wrong_kind_dir_listing is not None:
+                raise DomainValidationError(
+                    "READABLE must not set wrong_kind_dir_listing",
+                    field_path="wrong_kind_dir_listing",
                 )
         elif self.kind is LockInspectionKind.MALFORMED:
             if self.document is not None:
@@ -284,17 +293,44 @@ class LockInspection:
                     "MALFORMED must not set wrong_kind_target",
                     field_path="wrong_kind_target",
                 )
-        elif self.kind is LockInspectionKind.WRONG_KIND:
-            if self.document is not None or self.raw_bytes is not None:
+            if self.wrong_kind_dir_listing is not None:
                 raise DomainValidationError(
-                    "WRONG_KIND must not carry lock payload",
-                    field_path="kind",
+                    "MALFORMED must not set wrong_kind_dir_listing",
+                    field_path="wrong_kind_dir_listing",
+                )
+        elif self.kind is LockInspectionKind.WRONG_KIND:
+            if self.document is not None:
+                raise DomainValidationError(
+                    "WRONG_KIND must not carry a document",
+                    field_path="document",
                 )
             if self.wrong_kind_target is None:
                 raise DomainValidationError(
                     "WRONG_KIND requires wrong_kind_target",
                     field_path="wrong_kind_target",
                 )
+            if self.wrong_kind_target is LockWrongKindTarget.UPLOAD_LOCK:
+                if self.raw_bytes is None:
+                    raise DomainValidationError(
+                        "WRONG_KIND upload.lock file requires exact raw_bytes",
+                        field_path="raw_bytes",
+                    )
+                if self.wrong_kind_dir_listing is not None:
+                    raise DomainValidationError(
+                        "WRONG_KIND upload.lock file must not set dir listing",
+                        field_path="wrong_kind_dir_listing",
+                    )
+            else:
+                if self.raw_bytes is not None:
+                    raise DomainValidationError(
+                        "WRONG_KIND lock.json directory must not set raw_bytes",
+                        field_path="raw_bytes",
+                    )
+                if self.wrong_kind_dir_listing is None:
+                    raise DomainValidationError(
+                        "WRONG_KIND lock.json directory requires dir listing",
+                        field_path="wrong_kind_dir_listing",
+                    )
         elif self.document is not None:
             raise DomainValidationError(
                 "this inspection kind must not carry a document",
@@ -317,6 +353,11 @@ class LockInspection:
             raise DomainValidationError(
                 "wrong_kind_target is only valid for WRONG_KIND",
                 field_path="wrong_kind_target",
+            )
+        elif self.wrong_kind_dir_listing is not None:
+            raise DomainValidationError(
+                "wrong_kind_dir_listing is only valid for WRONG_KIND",
+                field_path="wrong_kind_dir_listing",
             )
 
 
@@ -415,6 +456,7 @@ class LockRepairPreview:
     document: LockDocument | None = None
     raw_bytes: bytes | None = None
     wrong_kind_target: LockWrongKindTarget | None = None
+    wrong_kind_dir_listing: tuple[tuple[str, str], ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -442,11 +484,14 @@ class LockRepairPreview:
                 "expected a LockWrongKindTarget",
                 field_path="wrong_kind_target",
             )
+        if self.wrong_kind_dir_listing is not None:
+            _validate_wrong_kind_dir_listing(self.wrong_kind_dir_listing)
         if self.kind is LockInspectionKind.TRANSPORT_FAILURE:
             if (
                 self.document is not None
                 or self.raw_bytes is not None
                 or self.wrong_kind_target is not None
+                or self.wrong_kind_dir_listing is not None
             ):
                 raise DomainValidationError(
                     "TRANSPORT_FAILURE preview carries no lock payload",
@@ -463,6 +508,11 @@ class LockRepairPreview:
                     "READABLE preview must not set wrong_kind_target",
                     field_path="wrong_kind_target",
                 )
+            if self.wrong_kind_dir_listing is not None:
+                raise DomainValidationError(
+                    "READABLE preview must not set dir listing",
+                    field_path="wrong_kind_dir_listing",
+                )
         elif self.kind is LockInspectionKind.MALFORMED:
             if self.document is not None:
                 raise DomainValidationError(
@@ -474,17 +524,44 @@ class LockRepairPreview:
                     "MALFORMED preview must not set wrong_kind_target",
                     field_path="wrong_kind_target",
                 )
-        elif self.kind is LockInspectionKind.WRONG_KIND:
-            if self.document is not None or self.raw_bytes is not None:
+            if self.wrong_kind_dir_listing is not None:
                 raise DomainValidationError(
-                    "WRONG_KIND preview must not carry lock payload",
-                    field_path="kind",
+                    "MALFORMED preview must not set dir listing",
+                    field_path="wrong_kind_dir_listing",
+                )
+        elif self.kind is LockInspectionKind.WRONG_KIND:
+            if self.document is not None:
+                raise DomainValidationError(
+                    "WRONG_KIND preview must not carry a document",
+                    field_path="document",
                 )
             if self.wrong_kind_target is None:
                 raise DomainValidationError(
                     "WRONG_KIND preview requires wrong_kind_target",
                     field_path="wrong_kind_target",
                 )
+            if self.wrong_kind_target is LockWrongKindTarget.UPLOAD_LOCK:
+                if self.raw_bytes is None:
+                    raise DomainValidationError(
+                        "WRONG_KIND upload.lock preview requires exact raw_bytes",
+                        field_path="raw_bytes",
+                    )
+                if self.wrong_kind_dir_listing is not None:
+                    raise DomainValidationError(
+                        "WRONG_KIND upload.lock preview must not set dir listing",
+                        field_path="wrong_kind_dir_listing",
+                    )
+            else:
+                if self.raw_bytes is not None:
+                    raise DomainValidationError(
+                        "WRONG_KIND lock.json preview must not set raw_bytes",
+                        field_path="raw_bytes",
+                    )
+                if self.wrong_kind_dir_listing is None:
+                    raise DomainValidationError(
+                        "WRONG_KIND lock.json preview requires dir listing",
+                        field_path="wrong_kind_dir_listing",
+                    )
         elif self.kind in {
             LockInspectionKind.ABSENT,
             LockInspectionKind.MISSING_LOCK_JSON,
@@ -493,6 +570,7 @@ class LockRepairPreview:
                 self.document is not None
                 or self.raw_bytes is not None
                 or self.wrong_kind_target is not None
+                or self.wrong_kind_dir_listing is not None
             ):
                 raise DomainValidationError(
                     "this preview kind must not carry lock payload",
@@ -584,10 +662,7 @@ def inspect_upload_lock(storage: Storage, game_id: str) -> LockInspection:
     except StorageNotFoundError:
         return LockInspection(LockInspectionKind.ABSENT)
     except StorageWrongKindError:
-        return LockInspection(
-            LockInspectionKind.WRONG_KIND,
-            wrong_kind_target=LockWrongKindTarget.UPLOAD_LOCK,
-        )
+        return _inspect_upload_lock_as_file(storage, paths)
     except StorageError:
         return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
 
@@ -596,10 +671,7 @@ def inspect_upload_lock(storage: Storage, game_id: str) -> LockInspection:
     except StorageNotFoundError:
         return LockInspection(LockInspectionKind.MISSING_LOCK_JSON)
     except StorageWrongKindError:
-        return LockInspection(
-            LockInspectionKind.WRONG_KIND,
-            wrong_kind_target=LockWrongKindTarget.LOCK_JSON,
-        )
+        return _inspect_lock_json_as_directory(storage, paths)
     except StorageError:
         return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
 
@@ -621,7 +693,79 @@ def preview_lock_repair(storage: Storage, game_id: str) -> LockRepairPreview:
         document=inspection.document,
         raw_bytes=inspection.raw_bytes,
         wrong_kind_target=inspection.wrong_kind_target,
+        wrong_kind_dir_listing=inspection.wrong_kind_dir_listing,
     )
+
+
+def _inspect_upload_lock_as_file(storage: Storage, paths: GamePaths) -> LockInspection:
+    """Capture exact bytes when ``upload.lock`` exists as a file."""
+    try:
+        raw = storage.read_file(paths.upload_lock_dir)
+    except StorageNotFoundError:
+        return LockInspection(LockInspectionKind.ABSENT)
+    except StorageWrongKindError:
+        # Kind flipped between list and read — not safely classifiable here.
+        return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
+    except StorageError:
+        return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
+    if type(raw) is not bytes:
+        return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
+    return LockInspection(
+        LockInspectionKind.WRONG_KIND,
+        raw_bytes=raw,
+        wrong_kind_target=LockWrongKindTarget.UPLOAD_LOCK,
+    )
+
+
+def _inspect_lock_json_as_directory(
+    storage: Storage, paths: GamePaths
+) -> LockInspection:
+    """Capture a deterministic child listing when ``lock.json`` is a directory."""
+    try:
+        children = storage.list_dir(paths.upload_lock_json)
+    except StorageNotFoundError:
+        return LockInspection(LockInspectionKind.MISSING_LOCK_JSON)
+    except StorageWrongKindError:
+        return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
+    except StorageError:
+        return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
+    return LockInspection(
+        LockInspectionKind.WRONG_KIND,
+        wrong_kind_target=LockWrongKindTarget.LOCK_JSON,
+        wrong_kind_dir_listing=_directory_listing_evidence(children),
+    )
+
+
+def _directory_listing_evidence(
+    children: tuple[StorageEntry, ...],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(sorted((child.name, child.kind.value) for child in children))
+
+
+def _validate_wrong_kind_dir_listing(listing: object) -> None:
+    if not isinstance(listing, tuple):
+        raise DomainValidationError(
+            "wrong_kind_dir_listing must be a tuple",
+            field_path="wrong_kind_dir_listing",
+        )
+    for index, item in enumerate(listing):
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not item[0]
+            or not isinstance(item[1], str)
+            or item[1] not in {"file", "directory"}
+        ):
+            raise DomainValidationError(
+                "expected (name, kind) pairs with kind file|directory",
+                field_path=f"wrong_kind_dir_listing[{index}]",
+            )
+    if listing != tuple(sorted(listing)):
+        raise DomainValidationError(
+            "wrong_kind_dir_listing must be deterministically sorted",
+            field_path="wrong_kind_dir_listing",
+        )
 
 
 def acquire_or_resume_upload_lock(
@@ -976,7 +1120,7 @@ def _repair_wrong_kind_structure(
 
     try:
         if current.wrong_kind_target is LockWrongKindTarget.UPLOAD_LOCK:
-            # ``upload.lock`` is a file — remove that file object only.
+            # Exact file bytes already matched the preview; remove that file only.
             storage.remove_file(paths.upload_lock_dir)
             return LockRepairResult(
                 LockRepairOutcome.REMOVED,
@@ -988,9 +1132,17 @@ def _repair_wrong_kind_structure(
             )
 
         if current.wrong_kind_target is LockWrongKindTarget.LOCK_JSON:
-            # ``lock.json`` is a directory — remove only when empty, then lock dir.
-            children = storage.list_dir(paths.upload_lock_json)
-            if children:
+            listing = current.wrong_kind_dir_listing
+            if listing is None:
+                return LockRepairResult(
+                    LockRepairOutcome.MANUAL_REPAIR_REQUIRED,
+                    _audit(
+                        removed=False,
+                        reason="wrong_kind_listing_missing",
+                        observation=current,
+                    ),
+                )
+            if listing:
                 return LockRepairResult(
                     LockRepairOutcome.MANUAL_REPAIR_REQUIRED,
                     _audit(
@@ -999,6 +1151,7 @@ def _repair_wrong_kind_structure(
                         observation=current,
                     ),
                 )
+            # Empty directory matched the preview; remove dir then lock dir.
             storage.remove_dir(paths.upload_lock_json)
             storage.remove_dir(paths.upload_lock_dir)
             return LockRepairResult(
@@ -1058,5 +1211,9 @@ def _preview_matches_inspection(
     if preview.kind is LockInspectionKind.MISSING_LOCK_JSON:
         return True
     if preview.kind is LockInspectionKind.WRONG_KIND:
-        return preview.wrong_kind_target is current.wrong_kind_target
+        if preview.wrong_kind_target is not current.wrong_kind_target:
+            return False
+        if preview.wrong_kind_target is LockWrongKindTarget.UPLOAD_LOCK:
+            return preview.raw_bytes == current.raw_bytes
+        return preview.wrong_kind_dir_listing == current.wrong_kind_dir_listing
     return False
