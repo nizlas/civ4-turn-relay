@@ -2,8 +2,9 @@
 
 Acquire only via exclusive ``mkdir``. TTL/age is informational and never
 authorizes automatic foreign-lock deletion. Own-lock resume requires journal
-agreement on ``operation_id`` and ``client_id``. Abandoned-lock repair is a
-separate confirmed API with structured audit events.
+agreement on ``operation_id``, ``client_id``, ``player_id``, and outgoing hash
+(via journal). Abandoned-lock repair uses an immutable preview token and never
+removes transport-failure observations.
 """
 
 from __future__ import annotations
@@ -125,10 +126,15 @@ class LockDocument:
             )
         return cls.from_mapping(parse_json_object_bytes(data))
 
-    def matches_owner(self, *, operation_id: str, client_id: str) -> bool:
-        return self.operation_id == validate_operation_id(
-            operation_id, field_path="operation_id"
-        ) and self.client_id == validate_client_id(client_id, field_path="client_id")
+    def matches_owner(
+        self, *, operation_id: str, client_id: str, player_id: str
+    ) -> bool:
+        return (
+            self.operation_id
+            == validate_operation_id(operation_id, field_path="operation_id")
+            and self.client_id == validate_client_id(client_id, field_path="client_id")
+            and self.player_id == validate_player_id(player_id, field_path="player_id")
+        )
 
 
 def build_lock_document(
@@ -186,13 +192,19 @@ class LockAcquireResult:
                 "expected an exact boolean",
                 field_path="owned",
             )
-        if self.owned and (
-            self.outcome
-            not in {LockAcquireOutcome.ACQUIRED, LockAcquireOutcome.RESUMED}
-            or self.document is None
-        ):
+        owned_outcomes = {
+            LockAcquireOutcome.ACQUIRED,
+            LockAcquireOutcome.RESUMED,
+        }
+        if self.outcome in owned_outcomes:
+            if not self.owned or self.document is None:
+                raise DomainValidationError(
+                    "ACQUIRED/RESUMED require owned=True and a document",
+                    field_path="owned",
+                )
+        elif self.owned:
             raise DomainValidationError(
-                "owned locks require ACQUIRED/RESUMED with a document",
+                "owned=True is only valid for ACQUIRED/RESUMED",
                 field_path="owned",
             )
 
@@ -203,7 +215,8 @@ class LockInspectionKind(Enum):
 
     ABSENT = "absent"
     READABLE = "readable"
-    UNREADABLE = "unreadable"
+    MISSING_LOCK_JSON = "missing_lock_json"
+    MALFORMED = "malformed"
     TRANSPORT_FAILURE = "transport_failure"
 
 
@@ -237,26 +250,205 @@ class LockInspection:
                     "READABLE requires document and raw_bytes",
                     field_path="kind",
                 )
+        elif self.kind is LockInspectionKind.MALFORMED:
+            if self.document is not None:
+                raise DomainValidationError(
+                    "MALFORMED must not carry a document",
+                    field_path="document",
+                )
         elif self.document is not None:
             raise DomainValidationError(
-                "non-READABLE inspections must not carry a document",
+                "this inspection kind must not carry a document",
+                field_path="document",
+            )
+        elif (
+            self.kind
+            in {
+                LockInspectionKind.ABSENT,
+                LockInspectionKind.MISSING_LOCK_JSON,
+                LockInspectionKind.TRANSPORT_FAILURE,
+            }
+            and self.raw_bytes is not None
+        ):
+            raise DomainValidationError(
+                "this inspection kind must not carry raw_bytes",
+                field_path="raw_bytes",
+            )
+
+
+@unique
+class LockOwnershipStatus(Enum):
+    """Typed result of re-reading lock ownership."""
+
+    OWNED = "owned"
+    FOREIGN = "foreign"
+    ABSENT = "absent"
+    UNREADABLE = "unreadable"
+    TRANSPORT_FAILURE = "transport_failure"
+
+
+@dataclass(frozen=True, slots=True)
+class LockOwnershipCheck:
+    """Immutable ownership confirmation result."""
+
+    status: LockOwnershipStatus
+    document: LockDocument | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, LockOwnershipStatus):
+            raise DomainValidationError(
+                "expected a LockOwnershipStatus",
+                field_path="status",
+            )
+        if self.document is not None and not isinstance(self.document, LockDocument):
+            raise DomainValidationError(
+                "expected a LockDocument",
+                field_path="document",
+            )
+        if self.status is LockOwnershipStatus.OWNED and self.document is None:
+            raise DomainValidationError(
+                "OWNED requires a document",
                 field_path="document",
             )
 
 
+@unique
+class LockReleaseOutcome(Enum):
+    """Outcome of attempting to release an owned upload lock."""
+
+    RELEASED = "released"
+    ABSENT = "absent"
+    NOT_OWNED = "not_owned"
+    UNREADABLE = "unreadable"
+    TRANSPORT_FAILURE = "transport_failure"
+
+
+@dataclass(frozen=True, slots=True)
+class LockReleaseResult:
+    """Immutable release attempt result."""
+
+    outcome: LockReleaseOutcome
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, LockReleaseOutcome):
+            raise DomainValidationError(
+                "expected a LockReleaseOutcome",
+                field_path="outcome",
+            )
+
+    @property
+    def cleanup_complete(self) -> bool:
+        """True when the lock is confirmed gone or released."""
+        return self.outcome in {
+            LockReleaseOutcome.RELEASED,
+            LockReleaseOutcome.ABSENT,
+        }
+
+    @property
+    def ambiguous(self) -> bool:
+        return self.outcome is LockReleaseOutcome.TRANSPORT_FAILURE
+
+
+@dataclass(frozen=True, slots=True)
+class LockRepairPreview:
+    """Immutable repair-preview token from a prior inspection.
+
+    Transport-failure previews are never removable. Confirmed repair must
+    re-inspect and match this observation exactly before any mutation.
+    """
+
+    game_id: str
+    kind: LockInspectionKind
+    document: LockDocument | None = None
+    raw_bytes: bytes | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "game_id", validate_game_id(self.game_id, field_path="game_id")
+        )
+        if not isinstance(self.kind, LockInspectionKind):
+            raise DomainValidationError(
+                "expected a LockInspectionKind",
+                field_path="kind",
+            )
+        if self.document is not None and not isinstance(self.document, LockDocument):
+            raise DomainValidationError(
+                "expected a LockDocument",
+                field_path="document",
+            )
+        if self.raw_bytes is not None and type(self.raw_bytes) is not bytes:
+            raise DomainValidationError(
+                "raw_bytes must be exact bytes",
+                field_path="raw_bytes",
+            )
+        if self.kind is LockInspectionKind.TRANSPORT_FAILURE:
+            if self.document is not None or self.raw_bytes is not None:
+                raise DomainValidationError(
+                    "TRANSPORT_FAILURE preview carries no lock payload",
+                    field_path="kind",
+                )
+        elif self.kind is LockInspectionKind.READABLE:
+            if self.document is None or self.raw_bytes is None:
+                raise DomainValidationError(
+                    "READABLE preview requires document and raw_bytes",
+                    field_path="kind",
+                )
+        elif self.kind is LockInspectionKind.MALFORMED:
+            if self.document is not None:
+                raise DomainValidationError(
+                    "MALFORMED preview must not carry a document",
+                    field_path="document",
+                )
+        elif self.kind in {
+            LockInspectionKind.ABSENT,
+            LockInspectionKind.MISSING_LOCK_JSON,
+        }:
+            if self.document is not None or self.raw_bytes is not None:
+                raise DomainValidationError(
+                    "this preview kind must not carry lock payload",
+                    field_path="kind",
+                )
+
+
 @dataclass(frozen=True, slots=True)
 class LockRepairAuditEvent:
-    """Structured audit record for confirmed abandoned-lock repair."""
+    """Structured audit record for abandoned-lock repair."""
 
     game_id: str
     confirmed: bool
     removed: bool
+    observation_kind: str
     observed_operation_id: str | None
     observed_client_id: str | None
     observed_player_id: str | None
     observed_created_at: str | None
     observed_expires_at: str | None
     reason: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "game_id", validate_game_id(self.game_id, field_path="game_id")
+        )
+        if type(self.confirmed) is not bool:
+            raise DomainValidationError(
+                "expected an exact boolean",
+                field_path="confirmed",
+            )
+        if type(self.removed) is not bool:
+            raise DomainValidationError(
+                "expected an exact boolean",
+                field_path="removed",
+            )
+        if not isinstance(self.observation_kind, str) or not self.observation_kind:
+            raise DomainValidationError(
+                "expected a non-empty observation_kind",
+                field_path="observation_kind",
+            )
+        if not isinstance(self.reason, str) or not self.reason:
+            raise DomainValidationError(
+                "expected a non-empty reason",
+                field_path="reason",
+            )
 
 
 @unique
@@ -269,6 +461,7 @@ class LockRepairOutcome(Enum):
     CHANGED = "changed"
     UNREADABLE = "unreadable"
     TRANSPORT_FAILURE = "transport_failure"
+    NOT_REPAIRABLE = "not_repairable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +470,18 @@ class LockRepairResult:
 
     outcome: LockRepairOutcome
     audit: LockRepairAuditEvent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, LockRepairOutcome):
+            raise DomainValidationError(
+                "expected a LockRepairOutcome",
+                field_path="outcome",
+            )
+        if not isinstance(self.audit, LockRepairAuditEvent):
+            raise DomainValidationError(
+                "expected a LockRepairAuditEvent",
+                field_path="audit",
+            )
 
 
 def inspect_upload_lock(storage: Storage, game_id: str) -> LockInspection:
@@ -288,26 +493,37 @@ def inspect_upload_lock(storage: Storage, game_id: str) -> LockInspection:
     except StorageNotFoundError:
         return LockInspection(LockInspectionKind.ABSENT)
     except StorageWrongKindError:
-        return LockInspection(LockInspectionKind.UNREADABLE)
+        return LockInspection(LockInspectionKind.MALFORMED)
     except StorageError:
         return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
 
     try:
         raw = storage.read_file(paths.upload_lock_json)
     except StorageNotFoundError:
-        return LockInspection(LockInspectionKind.UNREADABLE)
+        return LockInspection(LockInspectionKind.MISSING_LOCK_JSON)
     except StorageWrongKindError:
-        return LockInspection(LockInspectionKind.UNREADABLE)
+        return LockInspection(LockInspectionKind.MALFORMED)
     except StorageError:
         return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
 
     if type(raw) is not bytes:
-        return LockInspection(LockInspectionKind.UNREADABLE)
+        return LockInspection(LockInspectionKind.MALFORMED)
     try:
         document = LockDocument.from_json_bytes(raw)
     except DomainValidationError:
-        return LockInspection(LockInspectionKind.UNREADABLE, raw_bytes=raw)
+        return LockInspection(LockInspectionKind.MALFORMED, raw_bytes=raw)
     return LockInspection(LockInspectionKind.READABLE, document=document, raw_bytes=raw)
+
+
+def preview_lock_repair(storage: Storage, game_id: str) -> LockRepairPreview:
+    """Capture an immutable repair preview from the current lock observation."""
+    inspection = inspect_upload_lock(storage, game_id)
+    return LockRepairPreview(
+        game_id=game_id,
+        kind=inspection.kind,
+        document=inspection.document,
+        raw_bytes=inspection.raw_bytes,
+    )
 
 
 def acquire_or_resume_upload_lock(
@@ -349,7 +565,6 @@ def acquire_or_resume_upload_lock(
     except StorageAlreadyExistsError:
         return _resume_existing_lock(
             storage,
-            paths=paths,
             operation_id=operation_id,
             client_id=client_id,
             journal=journal,
@@ -367,8 +582,6 @@ def acquire_or_resume_upload_lock(
             paths.upload_lock_json, document.to_json_bytes(), overwrite=False
         )
     except StorageTransportError:
-        # Ambiguous: directory may exist without readable ownership — retain
-        # journal evidence for safe retry; do not guess ownership.
         journal.begin_handoff(
             InProgressHandoff(
                 game_id=game_id,
@@ -406,7 +619,6 @@ def acquire_or_resume_upload_lock(
 def _resume_existing_lock(
     storage: Storage,
     *,
-    paths: GamePaths,
     operation_id: str,
     client_id: str,
     journal: HandoffJournal,
@@ -427,11 +639,15 @@ def _resume_existing_lock(
     progress = journal.in_progress_handoff(game_id=game_id)
     if (
         progress is not None
-        and document.matches_owner(operation_id=operation_id, client_id=client_id)
+        and document.matches_owner(
+            operation_id=operation_id,
+            client_id=client_id,
+            player_id=player_id,
+        )
         and progress.operation_id == operation_id
         and progress.client_id == client_id
-        and progress.sha256 == sha256
         and progress.player_id == player_id
+        and progress.sha256 == sha256
     ):
         return LockAcquireResult(
             LockAcquireOutcome.RESUMED, document=document, owned=True
@@ -441,23 +657,34 @@ def _resume_existing_lock(
     )
 
 
-def confirm_lock_ownership(
+def check_lock_ownership(
     storage: Storage,
     *,
     game_id: str,
     operation_id: str,
     client_id: str,
-) -> bool:
-    """Re-read ``lock.json`` and verify ownership (pre-commit check)."""
+    player_id: str,
+) -> LockOwnershipCheck:
+    """Re-read ``lock.json`` and classify ownership (pre-commit / release)."""
     inspection = inspect_upload_lock(storage, game_id)
+    if inspection.kind is LockInspectionKind.TRANSPORT_FAILURE:
+        return LockOwnershipCheck(LockOwnershipStatus.TRANSPORT_FAILURE)
+    if inspection.kind is LockInspectionKind.ABSENT:
+        return LockOwnershipCheck(LockOwnershipStatus.ABSENT)
     if (
         inspection.kind is not LockInspectionKind.READABLE
         or inspection.document is None
     ):
-        return False
-    return inspection.document.matches_owner(
-        operation_id=operation_id, client_id=client_id
-    )
+        return LockOwnershipCheck(LockOwnershipStatus.UNREADABLE)
+    if inspection.document.matches_owner(
+        operation_id=operation_id,
+        client_id=client_id,
+        player_id=player_id,
+    ):
+        return LockOwnershipCheck(
+            LockOwnershipStatus.OWNED, document=inspection.document
+        )
+    return LockOwnershipCheck(LockOwnershipStatus.FOREIGN, document=inspection.document)
 
 
 def release_owned_upload_lock(
@@ -466,170 +693,165 @@ def release_owned_upload_lock(
     game_id: str,
     operation_id: str,
     client_id: str,
-) -> None:
-    """Best-effort release only when the lock is still owned by this operation."""
-    if not confirm_lock_ownership(
+    player_id: str,
+) -> LockReleaseResult:
+    """Release only after ownership is positively verified."""
+    ownership = check_lock_ownership(
         storage,
         game_id=game_id,
         operation_id=operation_id,
         client_id=client_id,
-    ):
-        return
+        player_id=player_id,
+    )
+    if ownership.status is LockOwnershipStatus.TRANSPORT_FAILURE:
+        return LockReleaseResult(LockReleaseOutcome.TRANSPORT_FAILURE)
+    if ownership.status is LockOwnershipStatus.ABSENT:
+        return LockReleaseResult(LockReleaseOutcome.ABSENT)
+    if ownership.status is LockOwnershipStatus.UNREADABLE:
+        return LockReleaseResult(LockReleaseOutcome.UNREADABLE)
+    if ownership.status is not LockOwnershipStatus.OWNED:
+        return LockReleaseResult(LockReleaseOutcome.NOT_OWNED)
+
     paths = GamePaths(game_id)
     try:
         storage.remove_file(paths.upload_lock_json)
     except StorageNotFoundError:
         pass
     except StorageError:
-        return
+        return LockReleaseResult(LockReleaseOutcome.TRANSPORT_FAILURE)
     try:
         storage.remove_dir(paths.upload_lock_dir)
+    except StorageNotFoundError:
+        return LockReleaseResult(LockReleaseOutcome.ABSENT)
     except StorageError:
-        return
+        return LockReleaseResult(LockReleaseOutcome.TRANSPORT_FAILURE)
+    return LockReleaseResult(LockReleaseOutcome.RELEASED)
 
 
 def repair_abandoned_upload_lock(
     storage: Storage,
     *,
-    game_id: str,
-    expected: LockDocument,
+    preview: LockRepairPreview,
     confirmed: bool,
 ) -> LockRepairResult:
-    """Remove a foreign/abandoned lock only with explicit confirmation.
-
-    Re-reads and verifies the observed lock still matches ``expected`` before
-    removal. No confirmation means no mutation.
-    """
-    validate_game_id(game_id, field_path="game_id")
-    if not isinstance(expected, LockDocument):
-        raise TypeError("expected must be a LockDocument")
+    """Remove a foreign/abandoned/malformed lock only with explicit confirmation."""
+    if not isinstance(preview, LockRepairPreview):
+        raise TypeError("preview must be a LockRepairPreview")
     if type(confirmed) is not bool:
         raise DomainValidationError(
             "expected an exact boolean",
             field_path="confirmed",
         )
 
+    def _audit(
+        *,
+        removed: bool,
+        reason: str,
+        observation: LockInspection | LockRepairPreview,
+    ) -> LockRepairAuditEvent:
+        document = observation.document
+        return LockRepairAuditEvent(
+            game_id=preview.game_id,
+            confirmed=confirmed,
+            removed=removed,
+            observation_kind=observation.kind.value,
+            observed_operation_id=(None if document is None else document.operation_id),
+            observed_client_id=None if document is None else document.client_id,
+            observed_player_id=None if document is None else document.player_id,
+            observed_created_at=None if document is None else document.created_at,
+            observed_expires_at=None if document is None else document.expires_at,
+            reason=reason,
+        )
+
     if not confirmed:
         return LockRepairResult(
             LockRepairOutcome.NOT_CONFIRMED,
-            LockRepairAuditEvent(
-                game_id=game_id,
-                confirmed=False,
+            _audit(removed=False, reason="confirmation_required", observation=preview),
+        )
+
+    if preview.kind is LockInspectionKind.TRANSPORT_FAILURE:
+        return LockRepairResult(
+            LockRepairOutcome.NOT_REPAIRABLE,
+            _audit(
                 removed=False,
-                observed_operation_id=expected.operation_id,
-                observed_client_id=expected.client_id,
-                observed_player_id=expected.player_id,
-                observed_created_at=expected.created_at,
-                observed_expires_at=expected.expires_at,
-                reason="confirmation_required",
+                reason="transport_failure_not_repairable",
+                observation=preview,
             ),
         )
 
-    inspection = inspect_upload_lock(storage, game_id)
-    if inspection.kind is LockInspectionKind.ABSENT:
-        return LockRepairResult(
-            LockRepairOutcome.ABSENT,
-            LockRepairAuditEvent(
-                game_id=game_id,
-                confirmed=True,
-                removed=False,
-                observed_operation_id=None,
-                observed_client_id=None,
-                observed_player_id=None,
-                observed_created_at=None,
-                observed_expires_at=None,
-                reason="lock_absent",
-            ),
-        )
-    if inspection.kind is LockInspectionKind.TRANSPORT_FAILURE:
-        return LockRepairResult(
-            LockRepairOutcome.TRANSPORT_FAILURE,
-            LockRepairAuditEvent(
-                game_id=game_id,
-                confirmed=True,
-                removed=False,
-                observed_operation_id=expected.operation_id,
-                observed_client_id=expected.client_id,
-                observed_player_id=expected.player_id,
-                observed_created_at=expected.created_at,
-                observed_expires_at=expected.expires_at,
-                reason="transport_failure",
-            ),
-        )
-    if (
-        inspection.kind is not LockInspectionKind.READABLE
-        or inspection.document is None
-    ):
-        return LockRepairResult(
-            LockRepairOutcome.UNREADABLE,
-            LockRepairAuditEvent(
-                game_id=game_id,
-                confirmed=True,
-                removed=False,
-                observed_operation_id=None,
-                observed_client_id=None,
-                observed_player_id=None,
-                observed_created_at=None,
-                observed_expires_at=None,
-                reason="lock_unreadable",
-            ),
-        )
-
-    observed = inspection.document
-    if (
-        observed.operation_id != expected.operation_id
-        or observed.client_id != expected.client_id
-        or observed.player_id != expected.player_id
-        or observed.created_at != expected.created_at
-        or observed.expires_at != expected.expires_at
-        or inspection.raw_bytes != expected.to_json_bytes()
-    ):
+    if preview.kind is LockInspectionKind.ABSENT:
+        current = inspect_upload_lock(storage, preview.game_id)
+        if current.kind is LockInspectionKind.ABSENT:
+            return LockRepairResult(
+                LockRepairOutcome.ABSENT,
+                _audit(removed=False, reason="lock_absent", observation=current),
+            )
         return LockRepairResult(
             LockRepairOutcome.CHANGED,
-            LockRepairAuditEvent(
-                game_id=game_id,
-                confirmed=True,
+            _audit(removed=False, reason="lock_appeared", observation=current),
+        )
+
+    current = inspect_upload_lock(storage, preview.game_id)
+    if current.kind is LockInspectionKind.TRANSPORT_FAILURE:
+        return LockRepairResult(
+            LockRepairOutcome.TRANSPORT_FAILURE,
+            _audit(
                 removed=False,
-                observed_operation_id=observed.operation_id,
-                observed_client_id=observed.client_id,
-                observed_player_id=observed.player_id,
-                observed_created_at=observed.created_at,
-                observed_expires_at=observed.expires_at,
-                reason="lock_metadata_changed",
+                reason="transport_failure",
+                observation=current,
+            ),
+        )
+    if not _preview_matches_inspection(preview, current):
+        return LockRepairResult(
+            LockRepairOutcome.CHANGED,
+            _audit(
+                removed=False,
+                reason="lock_observation_changed",
+                observation=current,
             ),
         )
 
-    paths = GamePaths(game_id)
+    paths = GamePaths(preview.game_id)
     try:
-        storage.remove_file(paths.upload_lock_json)
+        if current.kind is not LockInspectionKind.MISSING_LOCK_JSON:
+            try:
+                storage.remove_file(paths.upload_lock_json)
+            except StorageNotFoundError:
+                # Race to missing json — treat as change unless preview was missing.
+                if preview.kind is not LockInspectionKind.MISSING_LOCK_JSON:
+                    return LockRepairResult(
+                        LockRepairOutcome.CHANGED,
+                        _audit(
+                            removed=False,
+                            reason="lock_json_disappeared",
+                            observation=inspect_upload_lock(storage, preview.game_id),
+                        ),
+                    )
         storage.remove_dir(paths.upload_lock_dir)
     except StorageError:
         return LockRepairResult(
             LockRepairOutcome.TRANSPORT_FAILURE,
-            LockRepairAuditEvent(
-                game_id=game_id,
-                confirmed=True,
-                removed=False,
-                observed_operation_id=observed.operation_id,
-                observed_client_id=observed.client_id,
-                observed_player_id=observed.player_id,
-                observed_created_at=observed.created_at,
-                observed_expires_at=observed.expires_at,
-                reason="removal_failed",
-            ),
+            _audit(removed=False, reason="removal_failed", observation=current),
         )
 
     return LockRepairResult(
         LockRepairOutcome.REMOVED,
-        LockRepairAuditEvent(
-            game_id=game_id,
-            confirmed=True,
-            removed=True,
-            observed_operation_id=observed.operation_id,
-            observed_client_id=observed.client_id,
-            observed_player_id=observed.player_id,
-            observed_created_at=observed.created_at,
-            observed_expires_at=observed.expires_at,
-            reason="removed",
-        ),
+        _audit(removed=True, reason="removed", observation=current),
     )
+
+
+def _preview_matches_inspection(
+    preview: LockRepairPreview, current: LockInspection
+) -> bool:
+    if preview.kind is not current.kind:
+        return False
+    if preview.kind is LockInspectionKind.READABLE:
+        return (
+            preview.document == current.document
+            and preview.raw_bytes == current.raw_bytes
+        )
+    if preview.kind is LockInspectionKind.MALFORMED:
+        return preview.raw_bytes == current.raw_bytes
+    if preview.kind is LockInspectionKind.MISSING_LOCK_JSON:
+        return True
+    return False

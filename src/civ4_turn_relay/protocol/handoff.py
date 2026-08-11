@@ -3,6 +3,9 @@
 Accepts synthetic outgoing save bytes from the current human owner and
 atomically commits a handoff against the P2 ``Storage`` port. Manifest
 replacement is the sole remote commit point.
+
+Lock/journal cleanup distinguishes ambiguous transport failures (retain) from
+terminal rejections and successful commits (release when ownership verified).
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from civ4_turn_relay.domain import (
     validate_operation_id,
     validate_original_filename,
     validate_player_id,
+    validate_sha256_hex,
     validate_utc_timestamp,
 )
 from civ4_turn_relay.protocol.hash_classify import (
@@ -31,8 +35,10 @@ from civ4_turn_relay.protocol.hash_classify import (
 from civ4_turn_relay.protocol.journal import HandoffJournal
 from civ4_turn_relay.protocol.lock import (
     LockAcquireOutcome,
+    LockOwnershipStatus,
+    LockReleaseOutcome,
     acquire_or_resume_upload_lock,
-    confirm_lock_ownership,
+    check_lock_ownership,
     release_owned_upload_lock,
 )
 from civ4_turn_relay.protocol.manifest_access import (
@@ -52,12 +58,26 @@ from civ4_turn_relay.storage import (
     StorageError,
     StorageNotFoundError,
     StorageTransportError,
+    StorageWrongKindError,
     compare_stored_object,
     read_fingerprint,
 )
 
 # Protocol recommendation: 256 MiB (§12). Keep default no larger.
 DEFAULT_MAX_SAVE_BYTES = 256 * 1024 * 1024
+
+_TERMINAL_REJECTS = frozenset(
+    {
+        "not_current_owner",
+        "reject_incoming",
+        "stale_replay",
+        "journal_only_ack",
+        "invalid_manifest",
+        "missing_manifest",
+        "hard_integrity_failure",
+        "capability_failure",
+    }
+)
 
 
 @unique
@@ -73,11 +93,26 @@ class HandoffOutcome(Enum):
     LOCK_HELD = "lock_held"
     LOCK_UNREADABLE = "lock_unreadable"
     LOCK_OWNERSHIP_LOST = "lock_ownership_lost"
+    LOCK_CLEANUP_AMBIGUOUS = "lock_cleanup_ambiguous"
     HARD_INTEGRITY_FAILURE = "hard_integrity_failure"
     CAPABILITY_FAILURE = "capability_failure"
     TRANSPORT_FAILURE = "transport_failure"
     INVALID_MANIFEST = "invalid_manifest"
     MISSING_MANIFEST = "missing_manifest"
+
+
+@unique
+class _CleanupAction(Enum):
+    """Internal policy for lock/journal cleanup after a handoff attempt."""
+
+    RETAIN = "retain"
+    """Ambiguous remote state: keep owned lock and in_progress journal."""
+
+    TERMINAL_RELEASE = "terminal_release"
+    """Known terminal result: release when owned, then clear journal."""
+
+    SUCCESS_RELEASE = "success_release"
+    """Commit/idempotent ack: release when owned, then clear journal."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,16 +213,51 @@ class HandoffResult:
                 "expected a Manifest",
                 field_path="manifest",
             )
-        if self.manifest_changed and self.outcome is not HandoffOutcome.COMMITTED:
+        if self.sha256 is not None:
+            validate_sha256_hex(self.sha256, field_path="sha256")
+
+        changed_ok = {
+            HandoffOutcome.COMMITTED,
+            HandoffOutcome.LOCK_CLEANUP_AMBIGUOUS,
+        }
+        if self.manifest_changed and self.outcome not in changed_ok:
             raise DomainValidationError(
-                "only COMMITTED may report manifest_changed=True",
+                "manifest_changed=True only for COMMITTED/"
+                "LOCK_CLEANUP_AMBIGUOUS after a commit",
                 field_path="manifest_changed",
             )
-        if self.outcome is HandoffOutcome.COMMITTED and not self.manifest_changed:
-            raise DomainValidationError(
-                "COMMITTED requires manifest_changed=True",
-                field_path="manifest_changed",
-            )
+        if self.outcome is HandoffOutcome.COMMITTED:
+            if not self.manifest_changed:
+                raise DomainValidationError(
+                    "COMMITTED requires manifest_changed=True",
+                    field_path="manifest_changed",
+                )
+            if self.manifest is None:
+                raise DomainValidationError(
+                    "COMMITTED requires a resulting Manifest",
+                    field_path="manifest",
+                )
+            if self.sha256 is None:
+                raise DomainValidationError(
+                    "COMMITTED requires outgoing sha256",
+                    field_path="sha256",
+                )
+        if self.outcome is HandoffOutcome.IDEMPOTENT_ACK:
+            if self.manifest_changed:
+                raise DomainValidationError(
+                    "IDEMPOTENT_ACK must not report a new change",
+                    field_path="manifest_changed",
+                )
+            if self.manifest is None:
+                raise DomainValidationError(
+                    "IDEMPOTENT_ACK requires an authoritative Manifest",
+                    field_path="manifest",
+                )
+            if self.sha256 is None:
+                raise DomainValidationError(
+                    "IDEMPOTENT_ACK requires outgoing sha256",
+                    field_path="sha256",
+                )
 
 
 def commit_handoff(
@@ -235,176 +305,340 @@ def commit_handoff(
     if lock.outcome is LockAcquireOutcome.TRANSPORT_FAILURE or not lock.owned:
         return HandoffResult(HandoffOutcome.TRANSPORT_FAILURE, False, sha256=digest)
 
-    owned = True
-    try:
-        read = read_authoritative_manifest(storage, request.game_id)
-        if read.outcome is ManifestReadOutcome.MISSING:
-            return _fail(HandoffOutcome.MISSING_MANIFEST, digest)
-        if read.outcome is ManifestReadOutcome.INVALID:
-            return _fail(HandoffOutcome.INVALID_MANIFEST, digest)
-        if read.outcome is ManifestReadOutcome.GAME_ID_MISMATCH:
-            return _fail(HandoffOutcome.INVALID_MANIFEST, digest)
-        if (
-            read.outcome is ManifestReadOutcome.TRANSPORT_FAILURE
-            or read.manifest is None
-            or read.raw_bytes is None
-        ):
-            return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
+    result, cleanup = _run_owned_handoff(
+        storage,
+        request=request,
+        journal=journal,
+        digest=digest,
+        size_bytes=size_bytes,
+        extension=extension,
+        paths=paths,
+    )
+    return _apply_cleanup(
+        storage,
+        request=request,
+        journal=journal,
+        result=result,
+        cleanup=cleanup,
+        digest=digest,
+    )
 
-        manifest = read.manifest
-        raw_manifest = read.raw_bytes
-        evidence = journal.evidence_for_hash(game_id=request.game_id, sha256=digest)
-        classification = classify_candidate_hash(
-            candidate_sha256=digest,
-            accepted_save_hashes=manifest.accepted_save_hashes,
-            local_player_id=request.local_player_id,
-            current_player_id=manifest.current_player_id,
-            last_sender_id=manifest.last_sender_id,
-            evidence=evidence,
+
+def _run_owned_handoff(
+    storage: Storage,
+    *,
+    request: HandoffRequest,
+    journal: HandoffJournal,
+    digest: str,
+    size_bytes: int,
+    extension: str,
+    paths: GamePaths,
+) -> tuple[HandoffResult, _CleanupAction]:
+    read = read_authoritative_manifest(storage, request.game_id)
+    if read.outcome is ManifestReadOutcome.MISSING:
+        return _fail(
+            HandoffOutcome.MISSING_MANIFEST, digest
+        ), _CleanupAction.TERMINAL_RELEASE
+    if read.outcome is ManifestReadOutcome.INVALID:
+        return _fail(
+            HandoffOutcome.INVALID_MANIFEST, digest
+        ), _CleanupAction.TERMINAL_RELEASE
+    if read.outcome is ManifestReadOutcome.GAME_ID_MISMATCH:
+        return _fail(
+            HandoffOutcome.INVALID_MANIFEST, digest
+        ), _CleanupAction.TERMINAL_RELEASE
+    if (
+        read.outcome is ManifestReadOutcome.TRANSPORT_FAILURE
+        or read.manifest is None
+        or read.raw_bytes is None
+    ):
+        return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest), _CleanupAction.RETAIN
+
+    manifest = read.manifest
+    raw_manifest = read.raw_bytes
+    evidence = journal.evidence_for_hash(game_id=request.game_id, sha256=digest)
+    classification = classify_candidate_hash(
+        candidate_sha256=digest,
+        accepted_save_hashes=manifest.accepted_save_hashes,
+        local_player_id=request.local_player_id,
+        current_player_id=manifest.current_player_id,
+        last_sender_id=manifest.last_sender_id,
+        evidence=evidence,
+    )
+
+    if classification is HashClassification.REJECT_INCOMING:
+        return (
+            _fail(HandoffOutcome.REJECT_INCOMING, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
         )
-
-        if classification is HashClassification.REJECT_INCOMING:
-            return _fail(HandoffOutcome.REJECT_INCOMING, digest, manifest)
-        if classification is HashClassification.IDEMPOTENT_ACK:
-            journal.record_historical_acceptance(game_id=request.game_id, sha256=digest)
-            journal.clear_in_progress(game_id=request.game_id)
-            return HandoffResult(
+    if classification is HashClassification.IDEMPOTENT_ACK:
+        journal.record_historical_acceptance(game_id=request.game_id, sha256=digest)
+        return (
+            HandoffResult(
                 HandoffOutcome.IDEMPOTENT_ACK,
                 False,
                 manifest=manifest,
                 sha256=digest,
-            )
-        if classification is HashClassification.JOURNAL_ONLY_ACK:
-            return _fail(HandoffOutcome.JOURNAL_ONLY_ACK, digest, manifest)
-        if classification is HashClassification.STALE_REPLAY:
-            return _fail(HandoffOutcome.STALE_REPLAY, digest, manifest)
-        if classification is not HashClassification.NEW_HANDOFF_CANDIDATE:
-            return _fail(HandoffOutcome.STALE_REPLAY, digest, manifest)
-        if manifest.current_player_id != request.local_player_id:
-            return _fail(HandoffOutcome.NOT_CURRENT_OWNER, digest, manifest)
-
-        next_seq = manifest.protocol_sequence + 1
-        next_player = next_human_player_id(
-            manifest, after_player_id=request.local_player_id
+            ),
+            _CleanupAction.SUCCESS_RELEASE,
         )
-        save_relative = paths.accepted_save_relative(next_seq, digest, extension)
-        save_storage = paths.resolve(save_relative)
-        temp_upload = paths.temporary_upload(request.operation_id, extension)
-
-        staged = _stage_and_verify_upload(
-            storage,
-            temp_path=temp_upload,
-            data=request.outgoing_bytes,
-            digest=digest,
-            size_bytes=size_bytes,
+    if classification is HashClassification.JOURNAL_ONLY_ACK:
+        return (
+            _fail(HandoffOutcome.JOURNAL_ONLY_ACK, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
         )
-        if staged is not None:
-            return staged
-
-        published = _publish_or_reuse_final(
-            storage,
-            temp_path=temp_upload,
-            final_path=save_storage,
-            digest=digest,
-            size_bytes=size_bytes,
+    if classification is HashClassification.STALE_REPLAY:
+        return (
+            _fail(HandoffOutcome.STALE_REPLAY, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
         )
-        if published is not None:
-            return published
+    if classification is not HashClassification.NEW_HANDOFF_CANDIDATE:
+        return (
+            _fail(HandoffOutcome.STALE_REPLAY, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
+        )
+    if manifest.current_player_id != request.local_player_id:
+        return (
+            _fail(HandoffOutcome.NOT_CURRENT_OWNER, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
+        )
 
-        # Final object must be fully verified before any manifest reference.
+    next_seq = manifest.protocol_sequence + 1
+    next_player = next_human_player_id(
+        manifest, after_player_id=request.local_player_id
+    )
+    save_relative = paths.accepted_save_relative(next_seq, digest, extension)
+    save_storage = paths.resolve(save_relative)
+    temp_upload = paths.temporary_upload(request.operation_id, extension)
+
+    staged = _stage_and_verify_upload(
+        storage,
+        temp_path=temp_upload,
+        data=request.outgoing_bytes,
+        digest=digest,
+        size_bytes=size_bytes,
+    )
+    if staged is not None:
+        return staged, _cleanup_for_result(staged.outcome)
+
+    published = _publish_or_reuse_final(
+        storage,
+        temp_path=temp_upload,
+        final_path=save_storage,
+        digest=digest,
+        size_bytes=size_bytes,
+    )
+    if published is not None:
+        return published, _cleanup_for_result(published.outcome)
+
+    try:
         final_check = compare_stored_object(
             storage,
             save_storage,
             expected_size=size_bytes,
             expected_sha256=digest,
         )
-        if final_check is not ObjectComparisonResult.EXACT_MATCH:
-            return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest, manifest)
-
-        history_relative = paths.history_manifest_relative(
-            manifest.protocol_sequence, sha256_hex(raw_manifest)
+    except StorageWrongKindError:
+        return (
+            _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
         )
-        history_storage = paths.resolve(history_relative)
-        archived = _archive_or_reuse_history(
+    except StorageTransportError:
+        return _fail(
+            HandoffOutcome.TRANSPORT_FAILURE, digest, manifest
+        ), _CleanupAction.RETAIN
+    except StorageError:
+        return _fail(
+            HandoffOutcome.TRANSPORT_FAILURE, digest, manifest
+        ), _CleanupAction.RETAIN
+    if final_check is not ObjectComparisonResult.EXACT_MATCH:
+        return (
+            _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
+        )
+
+    history_relative = paths.history_manifest_relative(
+        manifest.protocol_sequence, sha256_hex(raw_manifest)
+    )
+    history_storage = paths.resolve(history_relative)
+    archived = _archive_or_reuse_history(
+        storage,
+        paths=paths,
+        operation_id=request.operation_id,
+        history_path=history_storage,
+        exact_bytes=raw_manifest,
+        outgoing_digest=digest,
+        manifest=manifest,
+    )
+    if archived is not None:
+        return archived, _cleanup_for_result(archived.outcome)
+
+    new_manifest = Manifest(
+        schema_version=manifest.schema_version,
+        game_id=manifest.game_id,
+        display_name=manifest.display_name,
+        players=manifest.players,
+        protocol_sequence=next_seq,
+        current_player_id=next_player,
+        last_sender_id=request.local_player_id,
+        accepted_save=AcceptedSave(
+            sha256=digest,
+            size_bytes=size_bytes,
+            remote_path=save_relative,
+            original_filename=request.original_filename,
+            accepted_at=request.now_utc,
+        ),
+        accepted_save_hashes=(*manifest.accepted_save_hashes, digest),
+        previous_manifest_ref=history_relative,
+        protocol=ProtocolMetadata(
+            min_client_protocol=MIN_CLIENT_PROTOCOL,
+            last_operation_id=request.operation_id,
+        ),
+    )
+    new_payload = new_manifest.to_json_bytes()
+    temp_manifest = paths.temporary_manifest(request.operation_id)
+    try:
+        storage.write_file(temp_manifest, new_payload, overwrite=True)
+    except StorageWrongKindError:
+        return (
+            _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
+        )
+    except StorageCapabilityError:
+        return (
+            _fail(HandoffOutcome.CAPABILITY_FAILURE, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
+        )
+    except StorageTransportError:
+        return _fail(
+            HandoffOutcome.TRANSPORT_FAILURE, digest, manifest
+        ), _CleanupAction.RETAIN
+    except StorageError:
+        return _fail(
+            HandoffOutcome.TRANSPORT_FAILURE, digest, manifest
+        ), _CleanupAction.RETAIN
+
+    ownership = check_lock_ownership(
+        storage,
+        game_id=request.game_id,
+        operation_id=request.operation_id,
+        client_id=request.client_id,
+        player_id=request.local_player_id,
+    )
+    if ownership.status is LockOwnershipStatus.TRANSPORT_FAILURE:
+        return _fail(
+            HandoffOutcome.TRANSPORT_FAILURE, digest, manifest
+        ), _CleanupAction.RETAIN
+    if ownership.status is not LockOwnershipStatus.OWNED:
+        return (
+            _fail(HandoffOutcome.LOCK_OWNERSHIP_LOST, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
+        )
+
+    try:
+        storage.atomic_replace(temp_manifest, paths.manifest)
+    except StorageCapabilityError:
+        return (
+            _fail(HandoffOutcome.CAPABILITY_FAILURE, digest, manifest),
+            _CleanupAction.TERMINAL_RELEASE,
+        )
+    except StorageTransportError:
+        return _reconcile_uncertain_commit(
             storage,
-            history_path=history_storage,
-            exact_bytes=raw_manifest,
+            request=request,
+            digest=digest,
+            intended_new_payload=new_payload,
+            journal=journal,
         )
-        if archived is not None:
-            return archived
+    except StorageError:
+        return _fail(
+            HandoffOutcome.TRANSPORT_FAILURE, digest, manifest
+        ), _CleanupAction.RETAIN
 
-        new_manifest = Manifest(
-            schema_version=manifest.schema_version,
-            game_id=manifest.game_id,
-            display_name=manifest.display_name,
-            players=manifest.players,
-            protocol_sequence=next_seq,
-            current_player_id=next_player,
-            last_sender_id=request.local_player_id,
-            accepted_save=AcceptedSave(
-                sha256=digest,
-                size_bytes=size_bytes,
-                remote_path=save_relative,
-                original_filename=request.original_filename,
-                accepted_at=request.now_utc,
-            ),
-            accepted_save_hashes=(*manifest.accepted_save_hashes, digest),
-            previous_manifest_ref=history_relative,
-            protocol=ProtocolMetadata(
-                min_client_protocol=MIN_CLIENT_PROTOCOL,
-                last_operation_id=request.operation_id,
-            ),
-        )
-        new_payload = new_manifest.to_json_bytes()
-        temp_manifest = paths.temporary_manifest(request.operation_id)
-        try:
-            storage.write_file(temp_manifest, new_payload, overwrite=True)
-        except StorageCapabilityError:
-            return _fail(HandoffOutcome.CAPABILITY_FAILURE, digest, manifest)
-        except StorageTransportError:
-            return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest, manifest)
-        except StorageError:
-            return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest, manifest)
-
-        if not confirm_lock_ownership(
-            storage,
-            game_id=request.game_id,
-            operation_id=request.operation_id,
-            client_id=request.client_id,
-        ):
-            return _fail(HandoffOutcome.LOCK_OWNERSHIP_LOST, digest, manifest)
-
-        try:
-            storage.atomic_replace(temp_manifest, paths.manifest)
-        except StorageCapabilityError:
-            return _fail(HandoffOutcome.CAPABILITY_FAILURE, digest, manifest)
-        except StorageTransportError:
-            return _reconcile_uncertain_commit(
-                storage,
-                request=request,
-                digest=digest,
-                expected_sequence=next_seq,
-                journal=journal,
-            )
-        except StorageError:
-            return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest, manifest)
-
-        journal.record_historical_acceptance(game_id=request.game_id, sha256=digest)
-        journal.clear_in_progress(game_id=request.game_id)
-        return HandoffResult(
+    journal.record_historical_acceptance(game_id=request.game_id, sha256=digest)
+    return (
+        HandoffResult(
             HandoffOutcome.COMMITTED,
             True,
             manifest=new_manifest,
             sha256=digest,
-        )
-    finally:
-        if owned:
-            release_owned_upload_lock(
-                storage,
-                game_id=request.game_id,
-                operation_id=request.operation_id,
-                client_id=request.client_id,
+        ),
+        _CleanupAction.SUCCESS_RELEASE,
+    )
+
+
+def _cleanup_for_result(outcome: HandoffOutcome) -> _CleanupAction:
+    if outcome is HandoffOutcome.TRANSPORT_FAILURE:
+        return _CleanupAction.RETAIN
+    if outcome.value in _TERMINAL_REJECTS:
+        return _CleanupAction.TERMINAL_RELEASE
+    if outcome in {
+        HandoffOutcome.COMMITTED,
+        HandoffOutcome.IDEMPOTENT_ACK,
+    }:
+        return _CleanupAction.SUCCESS_RELEASE
+    if outcome is HandoffOutcome.LOCK_OWNERSHIP_LOST:
+        return _CleanupAction.TERMINAL_RELEASE
+    return _CleanupAction.RETAIN
+
+
+def _apply_cleanup(
+    storage: Storage,
+    *,
+    request: HandoffRequest,
+    journal: HandoffJournal,
+    result: HandoffResult,
+    cleanup: _CleanupAction,
+    digest: str,
+) -> HandoffResult:
+    if cleanup is _CleanupAction.RETAIN:
+        return result
+
+    release = release_owned_upload_lock(
+        storage,
+        game_id=request.game_id,
+        operation_id=request.operation_id,
+        client_id=request.client_id,
+        player_id=request.local_player_id,
+    )
+    if release.ambiguous:
+        # Do not pretend cleanup succeeded; keep journal for recovery.
+        if result.outcome is HandoffOutcome.COMMITTED:
+            return HandoffResult(
+                HandoffOutcome.LOCK_CLEANUP_AMBIGUOUS,
+                True,
+                manifest=result.manifest,
+                sha256=digest,
             )
+        if result.outcome is HandoffOutcome.IDEMPOTENT_ACK:
+            return HandoffResult(
+                HandoffOutcome.LOCK_CLEANUP_AMBIGUOUS,
+                False,
+                manifest=result.manifest,
+                sha256=digest,
+            )
+        return HandoffResult(
+            HandoffOutcome.LOCK_CLEANUP_AMBIGUOUS,
+            False,
+            manifest=result.manifest,
+            sha256=digest,
+        )
+
+    if release.outcome in {
+        LockReleaseOutcome.RELEASED,
+        LockReleaseOutcome.ABSENT,
+        LockReleaseOutcome.NOT_OWNED,
+    }:
+        journal.clear_in_progress(game_id=request.game_id)
+        return result
+
+    # UNREADABLE after terminal — treat as unresolved cleanup.
+    return HandoffResult(
+        HandoffOutcome.LOCK_CLEANUP_AMBIGUOUS,
+        result.manifest_changed,
+        manifest=result.manifest,
+        sha256=digest,
+    )
 
 
 def _fail(
@@ -432,17 +666,20 @@ def _stage_and_verify_upload(
         )
         if existing is ObjectComparisonResult.EXACT_MATCH:
             return None
-        # Wrong bytes at temp path for this op — rewrite.
         storage.write_file(temp_path, data, overwrite=True)
     except StorageNotFoundError:
         try:
             storage.write_file(temp_path, data, overwrite=False)
+        except StorageWrongKindError:
+            return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest)
         except StorageCapabilityError:
             return _fail(HandoffOutcome.CAPABILITY_FAILURE, digest)
         except StorageTransportError:
             return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
         except StorageError:
             return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
+    except StorageWrongKindError:
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest)
     except StorageCapabilityError:
         return _fail(HandoffOutcome.CAPABILITY_FAILURE, digest)
     except StorageTransportError:
@@ -457,6 +694,8 @@ def _stage_and_verify_upload(
             expected_size=size_bytes,
             expected_sha256=digest,
         )
+    except StorageWrongKindError:
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest)
     except StorageTransportError:
         return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
     except StorageError:
@@ -484,13 +723,16 @@ def _publish_or_reuse_final(
                 expected_size=size_bytes,
                 expected_sha256=digest,
             )
+        except StorageWrongKindError:
+            return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest)
         except StorageTransportError:
             return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
         except StorageError:
             return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
         if check is ObjectComparisonResult.EXACT_MATCH:
-            # Reuse exact orphan; never overwrite.
             return None
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest)
+    except StorageWrongKindError:
         return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest)
     except StorageCapabilityError:
         return _fail(HandoffOutcome.CAPABILITY_FAILURE, digest)
@@ -499,9 +741,10 @@ def _publish_or_reuse_final(
     except StorageError:
         return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
 
-    # Ensure publish result is fully readable/matching before continuing.
     try:
         fingerprint = read_fingerprint(storage, final_path)
+    except StorageWrongKindError:
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest)
     except StorageTransportError:
         return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
     except StorageError:
@@ -514,34 +757,129 @@ def _publish_or_reuse_final(
 def _archive_or_reuse_history(
     storage: Storage,
     *,
+    paths: GamePaths,
+    operation_id: str,
     history_path: str,
     exact_bytes: bytes,
+    outgoing_digest: str,
+    manifest: Manifest,
 ) -> HandoffResult | None:
-    digest = sha256_hex(exact_bytes)
+    """Stage → verify → publish_no_replace history; keep outgoing digest on errors."""
+    history_digest = sha256_hex(exact_bytes)
+    temp_history = paths.temporary_history(operation_id)
+
     try:
-        storage.write_file(history_path, exact_bytes, overwrite=False)
-        # Prefer publish_no_replace semantics: write_file(overwrite=False) is
-        # exclusive create for new history objects.
-        return None
+        existing_temp = compare_stored_object(
+            storage,
+            temp_history,
+            expected_size=len(exact_bytes),
+            expected_sha256=history_digest,
+        )
+        if existing_temp is not ObjectComparisonResult.EXACT_MATCH:
+            # Same operation path with different bytes is never silently overwritten.
+            return _fail(
+                HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest
+            )
+    except StorageNotFoundError:
+        try:
+            storage.write_file(temp_history, exact_bytes, overwrite=False)
+        except StorageAlreadyExistsError:
+            try:
+                check = compare_stored_object(
+                    storage,
+                    temp_history,
+                    expected_size=len(exact_bytes),
+                    expected_sha256=history_digest,
+                )
+            except StorageWrongKindError:
+                return _fail(
+                    HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest
+                )
+            except StorageError:
+                return _fail(
+                    HandoffOutcome.TRANSPORT_FAILURE, outgoing_digest, manifest
+                )
+            if check is ObjectComparisonResult.EXACT_MATCH:
+                pass
+            else:
+                return _fail(
+                    HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest
+                )
+        except StorageWrongKindError:
+            return _fail(
+                HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest
+            )
+        except StorageCapabilityError:
+            return _fail(HandoffOutcome.CAPABILITY_FAILURE, outgoing_digest, manifest)
+        except StorageTransportError:
+            return _fail(HandoffOutcome.TRANSPORT_FAILURE, outgoing_digest, manifest)
+        except StorageError:
+            return _fail(HandoffOutcome.TRANSPORT_FAILURE, outgoing_digest, manifest)
+    except StorageWrongKindError:
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest)
+    except StorageCapabilityError:
+        return _fail(HandoffOutcome.CAPABILITY_FAILURE, outgoing_digest, manifest)
+    except StorageTransportError:
+        return _fail(HandoffOutcome.TRANSPORT_FAILURE, outgoing_digest, manifest)
+    except StorageError:
+        return _fail(HandoffOutcome.TRANSPORT_FAILURE, outgoing_digest, manifest)
+
+    try:
+        staged = compare_stored_object(
+            storage,
+            temp_history,
+            expected_size=len(exact_bytes),
+            expected_sha256=history_digest,
+        )
+    except StorageWrongKindError:
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest)
+    except StorageError:
+        return _fail(HandoffOutcome.TRANSPORT_FAILURE, outgoing_digest, manifest)
+    if staged is not ObjectComparisonResult.EXACT_MATCH:
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest)
+
+    try:
+        storage.publish_no_replace(temp_history, history_path)
     except StorageAlreadyExistsError:
         try:
             check = compare_stored_object(
                 storage,
                 history_path,
                 expected_size=len(exact_bytes),
-                expected_sha256=digest,
+                expected_sha256=history_digest,
+            )
+        except StorageWrongKindError:
+            return _fail(
+                HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest
             )
         except StorageError:
-            return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
+            return _fail(HandoffOutcome.TRANSPORT_FAILURE, outgoing_digest, manifest)
         if check is ObjectComparisonResult.EXACT_MATCH:
             return None
-        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, digest)
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest)
+    except StorageWrongKindError:
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest)
     except StorageCapabilityError:
-        return _fail(HandoffOutcome.CAPABILITY_FAILURE, digest)
+        return _fail(HandoffOutcome.CAPABILITY_FAILURE, outgoing_digest, manifest)
     except StorageTransportError:
-        return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
+        return _fail(HandoffOutcome.TRANSPORT_FAILURE, outgoing_digest, manifest)
     except StorageError:
-        return _fail(HandoffOutcome.TRANSPORT_FAILURE, digest)
+        return _fail(HandoffOutcome.TRANSPORT_FAILURE, outgoing_digest, manifest)
+
+    try:
+        final = compare_stored_object(
+            storage,
+            history_path,
+            expected_size=len(exact_bytes),
+            expected_sha256=history_digest,
+        )
+    except StorageWrongKindError:
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest)
+    except StorageError:
+        return _fail(HandoffOutcome.TRANSPORT_FAILURE, outgoing_digest, manifest)
+    if final is not ObjectComparisonResult.EXACT_MATCH:
+        return _fail(HandoffOutcome.HARD_INTEGRITY_FAILURE, outgoing_digest, manifest)
+    return None
 
 
 def _reconcile_uncertain_commit(
@@ -549,35 +887,40 @@ def _reconcile_uncertain_commit(
     *,
     request: HandoffRequest,
     digest: str,
-    expected_sequence: int,
+    intended_new_payload: bytes,
     journal: HandoffJournal,
-) -> HandoffResult:
-    """Classify after uncertain atomic_replace using verified remote evidence."""
+) -> tuple[HandoffResult, _CleanupAction]:
+    """Attribute success only when remote bytes exactly equal this operation."""
     recovered = read_authoritative_manifest(storage, request.game_id)
     if (
         recovered.outcome is ManifestReadOutcome.OK
         and recovered.manifest is not None
-        and recovered.manifest.protocol.last_operation_id == request.operation_id
-        and recovered.manifest.protocol_sequence == expected_sequence
-        and recovered.manifest.last_sender_id == request.local_player_id
-        and recovered.manifest.accepted_save is not None
-        and recovered.manifest.accepted_save.sha256 == digest
-        and digest in recovered.manifest.accepted_save_hashes
+        and recovered.raw_bytes is not None
+        and recovered.raw_bytes == intended_new_payload
+        and recovered.manifest.game_id == request.game_id
     ):
         journal.record_historical_acceptance(game_id=request.game_id, sha256=digest)
-        journal.clear_in_progress(game_id=request.game_id)
-        return HandoffResult(
-            HandoffOutcome.IDEMPOTENT_ACK,
-            False,
-            manifest=recovered.manifest,
-            sha256=digest,
+        return (
+            HandoffResult(
+                HandoffOutcome.IDEMPOTENT_ACK,
+                False,
+                manifest=recovered.manifest,
+                sha256=digest,
+            ),
+            _CleanupAction.SUCCESS_RELEASE,
         )
+    # Valid but non-matching bytes / failed recovery: do not attribute or clear.
     if recovered.outcome is ManifestReadOutcome.OK and recovered.manifest is not None:
-        # Unrelated valid remote state — do not attribute to this attempt.
-        return HandoffResult(
-            HandoffOutcome.TRANSPORT_FAILURE,
-            False,
-            manifest=recovered.manifest,
-            sha256=digest,
+        return (
+            HandoffResult(
+                HandoffOutcome.TRANSPORT_FAILURE,
+                False,
+                manifest=recovered.manifest,
+                sha256=digest,
+            ),
+            _CleanupAction.RETAIN,
         )
-    return HandoffResult(HandoffOutcome.TRANSPORT_FAILURE, False, sha256=digest)
+    return (
+        HandoffResult(HandoffOutcome.TRANSPORT_FAILURE, False, sha256=digest),
+        _CleanupAction.RETAIN,
+    )

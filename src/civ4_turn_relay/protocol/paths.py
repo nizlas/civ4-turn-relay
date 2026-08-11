@@ -106,6 +106,11 @@ class GamePaths:
         _validate_save_extension(extension)
         return self.resolve(f"{TEMPORARY_DIR}/{operation_id}.upload{extension}")
 
+    def temporary_history(self, operation_id: str) -> str:
+        """Storage path for staged previous-manifest history bytes."""
+        validate_operation_id(operation_id, field_path="operation_id")
+        return self.resolve(f"{TEMPORARY_DIR}/history-{operation_id}.json")
+
     def accepted_save_relative(self, sequence: int, sha256: str, extension: str) -> str:
         """Game-relative immutable save path ``saves/{seq}_{hash12}{ext}``."""
         _require_nonneg_int(sequence, field_path="sequence")

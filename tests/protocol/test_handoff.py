@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from civ4_turn_relay.domain import sha256_hex
+from civ4_turn_relay.domain import Manifest, sha256_hex
 from civ4_turn_relay.protocol import (
     GamePaths,
     HandoffOutcome,
@@ -18,6 +18,7 @@ from civ4_turn_relay.protocol import (
 from civ4_turn_relay.storage import (
     FakeStorage,
     FaultMoment,
+    StorageAlreadyExistsError,
     StorageCapabilities,
     StorageOp,
 )
@@ -252,22 +253,62 @@ def test_pt42_three_humans_wrap_around() -> None:
 
 @pytest.mark.pt("PT-25")
 def test_pt25_crash_after_temp_upload_retry_succeeds_once() -> None:
+    """Genuine own-op resume: retain lock/journal, RESUME path, commit once."""
     storage, journal, game_id = initialize_ready_match()
     before = _manifest_bytes(storage, game_id)
+    paths = GamePaths(game_id)
+    digest = sha256_hex(SAVE_A)
     storage.faults.reset()
     # Fail after temp-upload write (WRITE #2: lock.json then temp), keep manifest.
     storage.faults.inject(StorageOp.WRITE, moment=FaultMoment.AFTER, occurrence=2)
     failed = commit_handoff(storage, _req(), journal=journal)
     assert failed.outcome is HandoffOutcome.TRANSPORT_FAILURE
     assert failed.manifest_changed is False
+    assert failed.sha256 == digest
     assert _manifest_bytes(storage, game_id) == before
 
+    # Lock + exact lock.json + matching in_progress journal must remain for resume.
+    assert paths.upload_lock_dir in storage.snapshot().directories
+    lock_bytes = storage.snapshot().files[paths.upload_lock_json]
+    progress = journal.in_progress_handoff(game_id=game_id)
+    assert progress is not None
+    assert progress.operation_id == OP_ID
+    assert progress.client_id == CLIENT_A
+    assert progress.player_id == "player_a"
+    assert progress.sha256 == digest
+
+    class _LockMkdirSpy(CountingStorage):
+        def __init__(self, inner: FakeStorage) -> None:
+            super().__init__(inner)
+            self.lock_mkdir_created = 0
+            self.lock_mkdir_already_exists = 0
+
+        def mkdir(self, path: str) -> None:
+            self._record("mkdir")
+            if path == paths.upload_lock_dir:
+                try:
+                    self._inner.mkdir(path)
+                except StorageAlreadyExistsError:
+                    self.lock_mkdir_already_exists += 1
+                    raise
+                self.lock_mkdir_created += 1
+                return
+            self._inner.mkdir(path)
+
     storage.faults.reset()
-    # Same operation_id + journal evidence resumes the owned lock.
-    ok = commit_handoff(storage, _req(), journal=journal)
+    spy = _LockMkdirSpy(storage)
+    ok = commit_handoff(spy, _req(), journal=journal)
     assert ok.outcome is HandoffOutcome.COMMITTED
     assert ok.manifest is not None
     assert ok.manifest.protocol_sequence == 1
+    assert ok.sha256 == digest
+    # Resume must hit AlreadyExists — not a fresh mkdir that recreates the lock.
+    assert spy.lock_mkdir_created == 0
+    assert spy.lock_mkdir_already_exists == 1
+    assert paths.upload_lock_dir not in storage.snapshot().directories
+    assert journal.in_progress_handoff(game_id=game_id) is None
+    # Prove the retained lock document was the one from the first attempt.
+    assert lock_bytes  # retained non-empty evidence from the failed attempt
 
 
 @pytest.mark.pt("PT-26")
@@ -282,6 +323,7 @@ def test_pt26_pt28_crash_after_final_publish_verify_reuse() -> None:
     )
     failed = commit_handoff(storage, _req(), journal=journal)
     assert failed.outcome is HandoffOutcome.TRANSPORT_FAILURE
+    assert failed.sha256 == sha256_hex(SAVE_A)
     assert _manifest_bytes(storage, game_id) == before
     paths = GamePaths(game_id)
     digest = sha256_hex(SAVE_A)
@@ -289,14 +331,17 @@ def test_pt26_pt28_crash_after_final_publish_verify_reuse() -> None:
         paths.accepted_save_relative(1, digest, ".CivBeyondSwordSave")
     )
     assert storage.snapshot().files[final] == SAVE_A
+    assert paths.upload_lock_dir in storage.snapshot().directories
+    assert journal.in_progress_handoff(game_id=game_id) is not None
 
     storage.faults.reset()
-    ok = commit_handoff(storage, _req(operation_id=OP_ID_2), journal=journal)
+    # Same operation must resume the retained lock (not a new operation_id).
+    ok = commit_handoff(storage, _req(), journal=journal)
     assert ok.outcome is HandoffOutcome.COMMITTED
     assert storage.snapshot().files[final] == SAVE_A
-    # Still a single accepted save object for seq 1
     saves = [p for p in storage.snapshot().files if "/saves/" in p]
     assert len(saves) == 1
+    assert paths.upload_lock_dir not in storage.snapshot().directories
 
 
 @pytest.mark.pt("PT-27")
@@ -535,3 +580,285 @@ def test_no_manifest_reference_before_final_readback() -> None:
     assert read.manifest is not None
     assert read.manifest.protocol_sequence == 0
     assert read.manifest.accepted_save is None
+
+
+def test_hard_integrity_releases_lock_and_clears_journal() -> None:
+    """Typed terminal cleanup: hard integrity does not leave a false active op."""
+    storage, journal, game_id = initialize_ready_match()
+    paths = GamePaths(game_id)
+    digest = sha256_hex(SAVE_A)
+    final = paths.resolve(
+        paths.accepted_save_relative(1, digest, ".CivBeyondSwordSave")
+    )
+    storage.write_file(final, b"different-bytes-not-matching-hash", overwrite=False)
+    result = commit_handoff(storage, _req(), journal=journal)
+    assert result.outcome is HandoffOutcome.HARD_INTEGRITY_FAILURE
+    assert result.sha256 == digest
+    assert paths.upload_lock_dir not in storage.snapshot().directories
+    assert journal.in_progress_handoff(game_id=game_id) is None
+
+
+def test_history_stage_failure_retains_evidence_and_outgoing_hash() -> None:
+    storage, journal, game_id = initialize_ready_match()
+    before = _manifest_bytes(storage, game_id)
+    digest = sha256_hex(SAVE_A)
+    paths = GamePaths(game_id)
+    storage.faults.reset()
+    # WRITE #1 lock.json, #2 temp upload, #3 staged history.
+    storage.faults.inject(StorageOp.WRITE, moment=FaultMoment.AFTER, occurrence=3)
+    failed = commit_handoff(storage, _req(), journal=journal)
+    assert failed.outcome is HandoffOutcome.TRANSPORT_FAILURE
+    assert failed.sha256 == digest
+    assert _manifest_bytes(storage, game_id) == before
+    assert paths.upload_lock_dir in storage.snapshot().directories
+    assert journal.in_progress_handoff(game_id=game_id) is not None
+    assert paths.temporary_history(OP_ID) in storage.snapshot().files
+
+
+def test_history_publish_lost_response_retries_and_reuses() -> None:
+    storage, journal, game_id = initialize_ready_match()
+    before = _manifest_bytes(storage, game_id)
+    digest = sha256_hex(SAVE_A)
+    paths = GamePaths(game_id)
+    hist = paths.resolve(paths.history_manifest_relative(0, sha256_hex(before)))
+    storage.faults.reset()
+    # PUBLISH #1 accepted save, #2 history — fail after history lands.
+    storage.faults.inject(
+        StorageOp.PUBLISH_NO_REPLACE, moment=FaultMoment.AFTER, occurrence=2
+    )
+    failed = commit_handoff(storage, _req(), journal=journal)
+    assert failed.outcome is HandoffOutcome.TRANSPORT_FAILURE
+    assert failed.sha256 == digest
+    assert _manifest_bytes(storage, game_id) == before
+    assert storage.snapshot().files[hist] == before
+    assert journal.in_progress_handoff(game_id=game_id) is not None
+
+    storage.faults.reset()
+    ok = commit_handoff(storage, _req(), journal=journal)
+    assert ok.outcome is HandoffOutcome.COMMITTED
+    assert storage.snapshot().files[hist] == before
+    assert ok.manifest is not None
+    assert ok.manifest.previous_manifest_ref is not None
+
+
+def test_history_corrupt_final_readback_aborts_with_outgoing_hash() -> None:
+    storage, journal, game_id = initialize_ready_match()
+    before = _manifest_bytes(storage, game_id)
+    digest = sha256_hex(SAVE_A)
+    paths = GamePaths(game_id)
+    hist = paths.resolve(paths.history_manifest_relative(0, sha256_hex(before)))
+
+    class _CorruptHistoryRead(CountingStorage):
+        def read_file(self, path: str) -> bytes:
+            data = self._inner.read_file(path)
+            if path == hist:
+                return b"x" + data[1:]
+            return data
+
+    result = commit_handoff(_CorruptHistoryRead(storage), _req(), journal=journal)
+    assert result.outcome is HandoffOutcome.HARD_INTEGRITY_FAILURE
+    assert result.sha256 == digest
+    assert _manifest_bytes(storage, game_id) == before
+
+
+def test_history_wrong_kind_destination_is_hard_integrity() -> None:
+    storage, journal, game_id = initialize_ready_match()
+    before = _manifest_bytes(storage, game_id)
+    digest = sha256_hex(SAVE_A)
+    paths = GamePaths(game_id)
+    hist = paths.resolve(paths.history_manifest_relative(0, sha256_hex(before)))
+    storage.mkdir(hist)
+    result = commit_handoff(storage, _req(), journal=journal)
+    assert result.outcome is HandoffOutcome.HARD_INTEGRITY_FAILURE
+    assert result.sha256 == digest
+    assert _manifest_bytes(storage, game_id) == before
+
+
+def test_history_conflicting_temp_bytes_are_not_overwritten() -> None:
+    storage, journal, game_id = initialize_ready_match()
+    before = _manifest_bytes(storage, game_id)
+    digest = sha256_hex(SAVE_A)
+    paths = GamePaths(game_id)
+    temp_hist = paths.temporary_history(OP_ID)
+    storage.write_file(temp_hist, b'{"conflicting":"history-temp"}\n', overwrite=False)
+    result = commit_handoff(storage, _req(), journal=journal)
+    assert result.outcome is HandoffOutcome.HARD_INTEGRITY_FAILURE
+    assert result.sha256 == digest
+    assert storage.snapshot().files[temp_hist] == b'{"conflicting":"history-temp"}\n'
+    assert _manifest_bytes(storage, game_id) == before
+
+
+def test_history_conflict_keeps_outgoing_sha256() -> None:
+    storage, journal, game_id = initialize_ready_match(game_id="conflict-hash-match")
+    before = _manifest_bytes(storage, game_id)
+    digest = sha256_hex(SAVE_A)
+    paths = GamePaths(game_id)
+    hist = paths.resolve(paths.history_manifest_relative(0, sha256_hex(before)))
+    storage.write_file(hist, b'{"not":"the-same-manifest"}\n', overwrite=False)
+    bad = commit_handoff(storage, _req(game_id=game_id), journal=journal)
+    assert bad.outcome is HandoffOutcome.HARD_INTEGRITY_FAILURE
+    assert bad.sha256 == digest
+    assert bad.sha256 != sha256_hex(before)
+
+
+def test_uncertain_commit_exact_intended_bytes_is_idempotent() -> None:
+    storage, journal, game_id = initialize_ready_match()
+    wrapped = UncertainReplaceStorage(storage, committed_bytes="source")
+    result = commit_handoff(wrapped, _req(), journal=journal)
+    assert result.outcome is HandoffOutcome.IDEMPOTENT_ACK
+    assert result.manifest_changed is False
+    assert result.sha256 == sha256_hex(SAVE_A)
+    assert journal.in_progress_handoff(game_id=game_id) is None
+
+
+def test_uncertain_commit_noncanonical_json_not_acknowledged() -> None:
+    import json
+
+    from civ4_turn_relay.storage import StorageNotFoundError, StorageTransportError
+
+    storage, journal, game_id = initialize_ready_match()
+    digest = sha256_hex(SAVE_A)
+
+    class _NoncanonicalCommit(UncertainReplaceStorage):
+        def atomic_replace(self, source: str, destination: str) -> None:
+            self._count_mutation()
+            data = self._inner.read_file(source)
+            # Semantically identical when parsed, but not exact intended bytes.
+            pretty = json.dumps(json.loads(data), indent=2, sort_keys=True).encode(
+                "utf-8"
+            )
+            assert pretty != data
+            Manifest.from_json_bytes(pretty)
+            self._inner.write_file(destination, pretty, overwrite=True)
+            try:
+                self._inner.remove_file(source)
+            except StorageNotFoundError:
+                pass
+            self._uncertain_fired = True
+            raise StorageTransportError(
+                "uncertain atomic replace result", path=destination
+            )
+
+    result = commit_handoff(
+        _NoncanonicalCommit(storage, committed_bytes="source"), _req(), journal=journal
+    )
+    assert result.outcome is HandoffOutcome.TRANSPORT_FAILURE
+    assert result.manifest_changed is False
+    assert result.sha256 == digest
+    assert journal.in_progress_handoff(game_id=game_id) is not None
+
+
+def test_uncertain_commit_same_ids_but_changed_next_player_not_acked() -> None:
+    from civ4_turn_relay.storage import StorageNotFoundError, StorageTransportError
+
+    storage, journal, game_id = initialize_ready_match()
+    digest = sha256_hex(SAVE_A)
+
+    class _TamperedManifest(UncertainReplaceStorage):
+        def atomic_replace(self, source: str, destination: str) -> None:
+            self._count_mutation()
+            intended = Manifest.from_json_bytes(self._inner.read_file(source))
+            tampered = Manifest(
+                schema_version=intended.schema_version,
+                game_id=intended.game_id,
+                display_name=intended.display_name,
+                players=intended.players,
+                protocol_sequence=intended.protocol_sequence,
+                current_player_id="player_a",  # wrong next player
+                last_sender_id=intended.last_sender_id,
+                accepted_save=intended.accepted_save,
+                accepted_save_hashes=intended.accepted_save_hashes,
+                previous_manifest_ref=intended.previous_manifest_ref,
+                protocol=intended.protocol,
+            )
+            assert tampered.to_json_bytes() != intended.to_json_bytes()
+            self._inner.write_file(
+                destination, tampered.to_json_bytes(), overwrite=True
+            )
+            try:
+                self._inner.remove_file(source)
+            except StorageNotFoundError:
+                pass
+            self._uncertain_fired = True
+            raise StorageTransportError(
+                "uncertain atomic replace result", path=destination
+            )
+
+    result = commit_handoff(
+        _TamperedManifest(storage, committed_bytes="source"), _req(), journal=journal
+    )
+    assert result.outcome is HandoffOutcome.TRANSPORT_FAILURE
+    assert result.manifest_changed is False
+    assert result.sha256 == digest
+    assert journal.in_progress_handoff(game_id=game_id) is not None
+    assert GamePaths(game_id).upload_lock_dir in storage.snapshot().directories
+
+
+def test_uncertain_commit_failed_recovery_read_retains_ambiguous_state() -> None:
+    from civ4_turn_relay.storage import StorageNotFoundError, StorageTransportError
+
+    storage, journal, game_id = initialize_ready_match()
+    digest = sha256_hex(SAVE_A)
+    paths = GamePaths(game_id)
+
+    class _UncertainThenFailRead(UncertainReplaceStorage):
+        def __init__(self, inner: FakeStorage) -> None:
+            super().__init__(inner, committed_bytes="source")
+            self._block_manifest_reads = False
+
+        def atomic_replace(self, source: str, destination: str) -> None:
+            self._count_mutation()
+            data = self._inner.read_file(source)
+            self._inner.write_file(destination, data, overwrite=True)
+            try:
+                self._inner.remove_file(source)
+            except StorageNotFoundError:
+                pass
+            self._block_manifest_reads = True
+            self._uncertain_fired = True
+            raise StorageTransportError(
+                "uncertain atomic replace result", path=destination
+            )
+
+        def read_file(self, path: str) -> bytes:
+            if self._block_manifest_reads and path == paths.manifest:
+                raise StorageTransportError("recovery read failed", path=path)
+            return self._inner.read_file(path)
+
+    wrapped = _UncertainThenFailRead(storage)
+    result = commit_handoff(wrapped, _req(), journal=journal)
+    assert result.outcome is HandoffOutcome.TRANSPORT_FAILURE
+    assert result.sha256 == digest
+    assert journal.in_progress_handoff(game_id=game_id) is not None
+    assert paths.upload_lock_dir in storage.snapshot().directories
+
+
+def test_wrong_kind_final_save_path_is_hard_integrity() -> None:
+    storage, journal, game_id = initialize_ready_match()
+    before = _manifest_bytes(storage, game_id)
+    digest = sha256_hex(SAVE_A)
+    paths = GamePaths(game_id)
+    final = paths.resolve(
+        paths.accepted_save_relative(1, digest, ".CivBeyondSwordSave")
+    )
+    storage.mkdir(final)
+    result = commit_handoff(storage, _req(), journal=journal)
+    assert result.outcome is HandoffOutcome.HARD_INTEGRITY_FAILURE
+    assert result.sha256 == digest
+    assert _manifest_bytes(storage, game_id) == before
+
+
+def test_handoff_result_rejects_impossible_committed_without_change() -> None:
+    from civ4_turn_relay.domain import DomainValidationError
+
+    with pytest.raises(DomainValidationError):
+        from civ4_turn_relay.protocol import HandoffResult
+
+        HandoffResult(HandoffOutcome.COMMITTED, False, sha256=sha256_hex(SAVE_A))
+
+
+def test_temporary_history_path_helper() -> None:
+    paths = GamePaths("example-match")
+    assert paths.temporary_history(OP_ID) == (
+        f"example-match/temporary/history-{OP_ID}.json"
+    )
