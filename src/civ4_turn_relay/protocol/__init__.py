@@ -4,6 +4,21 @@ Depends only on the stdlib, P1 domain models, and the P2 ``Storage`` port.
 Concrete fakes, UI, Paramiko, Watchdog, and Civ integration stay outside.
 """
 
+from civ4_turn_relay.protocol.cleanup import (
+    TemporaryCandidateAction,
+    TemporaryCandidateResult,
+    TemporaryCleanupOutcome,
+    TemporaryCleanupResult,
+    cleanup_temporary_orphans,
+)
+from civ4_turn_relay.protocol.download import (
+    DownloadOutcome,
+    DownloadRequest,
+    DownloadResult,
+    VerifiedDownloadArtifact,
+    VerifiedDownloadEvidence,
+    download_accepted_save,
+)
 from civ4_turn_relay.protocol.handoff import (
     DEFAULT_MAX_SAVE_BYTES,
     HandoffOutcome,
@@ -42,6 +57,7 @@ from civ4_turn_relay.protocol.lock import (
     LockRepairOutcome,
     LockRepairPreview,
     LockRepairResult,
+    LockWrongKindTarget,
     acquire_or_resume_upload_lock,
     build_lock_document,
     check_lock_ownership,
@@ -60,6 +76,9 @@ from civ4_turn_relay.protocol.players import next_human_player_id
 
 __all__ = [
     "DEFAULT_MAX_SAVE_BYTES",
+    "DownloadOutcome",
+    "DownloadRequest",
+    "DownloadResult",
     "GamePaths",
     "HandoffJournal",
     "HandoffOutcome",
@@ -84,15 +103,24 @@ __all__ = [
     "LockRepairOutcome",
     "LockRepairPreview",
     "LockRepairResult",
+    "LockWrongKindTarget",
     "ManifestReadOutcome",
     "ManifestReadResult",
     "OperationJournal",
     "PriorAttemptEvidence",
+    "TemporaryCandidateAction",
+    "TemporaryCandidateResult",
+    "TemporaryCleanupOutcome",
+    "TemporaryCleanupResult",
+    "VerifiedDownloadArtifact",
+    "VerifiedDownloadEvidence",
     "acquire_or_resume_upload_lock",
     "build_lock_document",
     "check_lock_ownership",
     "classify_candidate_hash",
+    "cleanup_temporary_orphans",
     "commit_handoff",
+    "download_accepted_save",
     "extension_from_original_filename",
     "initialize_match",
     "inspect_upload_lock",

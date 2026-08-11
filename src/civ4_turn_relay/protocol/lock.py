@@ -35,6 +35,7 @@ from civ4_turn_relay.storage import (
     StorageAlreadyExistsError,
     StorageCapabilityError,
     StorageError,
+    StorageNotEmptyError,
     StorageNotFoundError,
     StorageTransportError,
     StorageWrongKindError,
@@ -217,7 +218,16 @@ class LockInspectionKind(Enum):
     READABLE = "readable"
     MISSING_LOCK_JSON = "missing_lock_json"
     MALFORMED = "malformed"
+    WRONG_KIND = "wrong_kind"
     TRANSPORT_FAILURE = "transport_failure"
+
+
+@unique
+class LockWrongKindTarget(Enum):
+    """Which lock path has the wrong storage object kind."""
+
+    UPLOAD_LOCK = "upload_lock"
+    LOCK_JSON = "lock_json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +237,7 @@ class LockInspection:
     kind: LockInspectionKind
     document: LockDocument | None = None
     raw_bytes: bytes | None = None
+    wrong_kind_target: LockWrongKindTarget | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, LockInspectionKind):
@@ -244,17 +255,45 @@ class LockInspection:
                 "raw_bytes must be exact bytes",
                 field_path="raw_bytes",
             )
+        if self.wrong_kind_target is not None and not isinstance(
+            self.wrong_kind_target, LockWrongKindTarget
+        ):
+            raise DomainValidationError(
+                "expected a LockWrongKindTarget",
+                field_path="wrong_kind_target",
+            )
         if self.kind is LockInspectionKind.READABLE:
             if self.document is None or self.raw_bytes is None:
                 raise DomainValidationError(
                     "READABLE requires document and raw_bytes",
                     field_path="kind",
                 )
+            if self.wrong_kind_target is not None:
+                raise DomainValidationError(
+                    "READABLE must not set wrong_kind_target",
+                    field_path="wrong_kind_target",
+                )
         elif self.kind is LockInspectionKind.MALFORMED:
             if self.document is not None:
                 raise DomainValidationError(
                     "MALFORMED must not carry a document",
                     field_path="document",
+                )
+            if self.wrong_kind_target is not None:
+                raise DomainValidationError(
+                    "MALFORMED must not set wrong_kind_target",
+                    field_path="wrong_kind_target",
+                )
+        elif self.kind is LockInspectionKind.WRONG_KIND:
+            if self.document is not None or self.raw_bytes is not None:
+                raise DomainValidationError(
+                    "WRONG_KIND must not carry lock payload",
+                    field_path="kind",
+                )
+            if self.wrong_kind_target is None:
+                raise DomainValidationError(
+                    "WRONG_KIND requires wrong_kind_target",
+                    field_path="wrong_kind_target",
                 )
         elif self.document is not None:
             raise DomainValidationError(
@@ -273,6 +312,11 @@ class LockInspection:
             raise DomainValidationError(
                 "this inspection kind must not carry raw_bytes",
                 field_path="raw_bytes",
+            )
+        elif self.wrong_kind_target is not None:
+            raise DomainValidationError(
+                "wrong_kind_target is only valid for WRONG_KIND",
+                field_path="wrong_kind_target",
             )
 
 
@@ -305,9 +349,18 @@ class LockOwnershipCheck:
                 "expected a LockDocument",
                 field_path="document",
             )
-        if self.status is LockOwnershipStatus.OWNED and self.document is None:
+        if self.status in {
+            LockOwnershipStatus.OWNED,
+            LockOwnershipStatus.FOREIGN,
+        }:
+            if self.document is None:
+                raise DomainValidationError(
+                    "OWNED/FOREIGN require a document",
+                    field_path="document",
+                )
+        elif self.document is not None:
             raise DomainValidationError(
-                "OWNED requires a document",
+                "this ownership status must not carry a document",
                 field_path="document",
             )
 
@@ -361,6 +414,7 @@ class LockRepairPreview:
     kind: LockInspectionKind
     document: LockDocument | None = None
     raw_bytes: bytes | None = None
+    wrong_kind_target: LockWrongKindTarget | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -381,8 +435,19 @@ class LockRepairPreview:
                 "raw_bytes must be exact bytes",
                 field_path="raw_bytes",
             )
+        if self.wrong_kind_target is not None and not isinstance(
+            self.wrong_kind_target, LockWrongKindTarget
+        ):
+            raise DomainValidationError(
+                "expected a LockWrongKindTarget",
+                field_path="wrong_kind_target",
+            )
         if self.kind is LockInspectionKind.TRANSPORT_FAILURE:
-            if self.document is not None or self.raw_bytes is not None:
+            if (
+                self.document is not None
+                or self.raw_bytes is not None
+                or self.wrong_kind_target is not None
+            ):
                 raise DomainValidationError(
                     "TRANSPORT_FAILURE preview carries no lock payload",
                     field_path="kind",
@@ -393,17 +458,42 @@ class LockRepairPreview:
                     "READABLE preview requires document and raw_bytes",
                     field_path="kind",
                 )
+            if self.wrong_kind_target is not None:
+                raise DomainValidationError(
+                    "READABLE preview must not set wrong_kind_target",
+                    field_path="wrong_kind_target",
+                )
         elif self.kind is LockInspectionKind.MALFORMED:
             if self.document is not None:
                 raise DomainValidationError(
                     "MALFORMED preview must not carry a document",
                     field_path="document",
                 )
+            if self.wrong_kind_target is not None:
+                raise DomainValidationError(
+                    "MALFORMED preview must not set wrong_kind_target",
+                    field_path="wrong_kind_target",
+                )
+        elif self.kind is LockInspectionKind.WRONG_KIND:
+            if self.document is not None or self.raw_bytes is not None:
+                raise DomainValidationError(
+                    "WRONG_KIND preview must not carry lock payload",
+                    field_path="kind",
+                )
+            if self.wrong_kind_target is None:
+                raise DomainValidationError(
+                    "WRONG_KIND preview requires wrong_kind_target",
+                    field_path="wrong_kind_target",
+                )
         elif self.kind in {
             LockInspectionKind.ABSENT,
             LockInspectionKind.MISSING_LOCK_JSON,
         }:
-            if self.document is not None or self.raw_bytes is not None:
+            if (
+                self.document is not None
+                or self.raw_bytes is not None
+                or self.wrong_kind_target is not None
+            ):
                 raise DomainValidationError(
                     "this preview kind must not carry lock payload",
                     field_path="kind",
@@ -462,6 +552,7 @@ class LockRepairOutcome(Enum):
     UNREADABLE = "unreadable"
     TRANSPORT_FAILURE = "transport_failure"
     NOT_REPAIRABLE = "not_repairable"
+    MANUAL_REPAIR_REQUIRED = "manual_repair_required"
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,7 +584,10 @@ def inspect_upload_lock(storage: Storage, game_id: str) -> LockInspection:
     except StorageNotFoundError:
         return LockInspection(LockInspectionKind.ABSENT)
     except StorageWrongKindError:
-        return LockInspection(LockInspectionKind.MALFORMED)
+        return LockInspection(
+            LockInspectionKind.WRONG_KIND,
+            wrong_kind_target=LockWrongKindTarget.UPLOAD_LOCK,
+        )
     except StorageError:
         return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
 
@@ -502,7 +596,10 @@ def inspect_upload_lock(storage: Storage, game_id: str) -> LockInspection:
     except StorageNotFoundError:
         return LockInspection(LockInspectionKind.MISSING_LOCK_JSON)
     except StorageWrongKindError:
-        return LockInspection(LockInspectionKind.MALFORMED)
+        return LockInspection(
+            LockInspectionKind.WRONG_KIND,
+            wrong_kind_target=LockWrongKindTarget.LOCK_JSON,
+        )
     except StorageError:
         return LockInspection(LockInspectionKind.TRANSPORT_FAILURE)
 
@@ -523,6 +620,7 @@ def preview_lock_repair(storage: Storage, game_id: str) -> LockRepairPreview:
         kind=inspection.kind,
         document=inspection.document,
         raw_bytes=inspection.raw_bytes,
+        wrong_kind_target=inspection.wrong_kind_target,
     )
 
 
@@ -572,6 +670,9 @@ def acquire_or_resume_upload_lock(
             sha256=sha256,
             player_id=player_id,
         )
+    except StorageWrongKindError:
+        # ``upload.lock`` exists as a non-directory object — never owned.
+        return LockAcquireResult(LockAcquireOutcome.UNREADABLE)
     except StorageTransportError:
         return LockAcquireResult(LockAcquireOutcome.TRANSPORT_FAILURE)
     except StorageError:
@@ -812,6 +913,14 @@ def repair_abandoned_upload_lock(
         )
 
     paths = GamePaths(preview.game_id)
+    if current.kind is LockInspectionKind.WRONG_KIND:
+        return _repair_wrong_kind_structure(
+            storage,
+            paths=paths,
+            current=current,
+            confirmed=confirmed,
+        )
+
     try:
         if current.kind is not LockInspectionKind.MISSING_LOCK_JSON:
             try:
@@ -840,6 +949,100 @@ def repair_abandoned_upload_lock(
     )
 
 
+def _repair_wrong_kind_structure(
+    storage: Storage,
+    *,
+    paths: GamePaths,
+    current: LockInspection,
+    confirmed: bool,
+) -> LockRepairResult:
+    """Remove a wrong-kind lock only when the exact structural observation is safe."""
+
+    def _audit(
+        *, removed: bool, reason: str, observation: LockInspection
+    ) -> LockRepairAuditEvent:
+        return LockRepairAuditEvent(
+            game_id=paths.game_id,
+            confirmed=confirmed,
+            removed=removed,
+            observation_kind=observation.kind.value,
+            observed_operation_id=None,
+            observed_client_id=None,
+            observed_player_id=None,
+            observed_created_at=None,
+            observed_expires_at=None,
+            reason=reason,
+        )
+
+    try:
+        if current.wrong_kind_target is LockWrongKindTarget.UPLOAD_LOCK:
+            # ``upload.lock`` is a file — remove that file object only.
+            storage.remove_file(paths.upload_lock_dir)
+            return LockRepairResult(
+                LockRepairOutcome.REMOVED,
+                _audit(
+                    removed=True,
+                    reason="removed_wrong_kind_upload_lock_file",
+                    observation=current,
+                ),
+            )
+
+        if current.wrong_kind_target is LockWrongKindTarget.LOCK_JSON:
+            # ``lock.json`` is a directory — remove only when empty, then lock dir.
+            children = storage.list_dir(paths.upload_lock_json)
+            if children:
+                return LockRepairResult(
+                    LockRepairOutcome.MANUAL_REPAIR_REQUIRED,
+                    _audit(
+                        removed=False,
+                        reason="lock_json_directory_not_empty",
+                        observation=current,
+                    ),
+                )
+            storage.remove_dir(paths.upload_lock_json)
+            storage.remove_dir(paths.upload_lock_dir)
+            return LockRepairResult(
+                LockRepairOutcome.REMOVED,
+                _audit(
+                    removed=True,
+                    reason="removed_wrong_kind_lock_json_directory",
+                    observation=current,
+                ),
+            )
+    except StorageNotEmptyError:
+        return LockRepairResult(
+            LockRepairOutcome.MANUAL_REPAIR_REQUIRED,
+            _audit(
+                removed=False,
+                reason="wrong_kind_not_empty",
+                observation=current,
+            ),
+        )
+    except StorageWrongKindError:
+        return LockRepairResult(
+            LockRepairOutcome.CHANGED,
+            _audit(
+                removed=False,
+                reason="wrong_kind_structure_changed",
+                observation=inspect_upload_lock(storage, paths.game_id),
+            ),
+        )
+    except StorageError:
+        return LockRepairResult(
+            LockRepairOutcome.TRANSPORT_FAILURE,
+            _audit(removed=False, reason="removal_failed", observation=current),
+        )
+
+    return LockRepairResult(
+        LockRepairOutcome.MANUAL_REPAIR_REQUIRED,
+        _audit(
+            removed=False,
+            reason="wrong_kind_not_safely_repairable",
+            observation=current,
+        ),
+    )
+
+
 def _preview_matches_inspection(
     preview: LockRepairPreview, current: LockInspection
 ) -> bool:
@@ -854,4 +1057,6 @@ def _preview_matches_inspection(
         return preview.raw_bytes == current.raw_bytes
     if preview.kind is LockInspectionKind.MISSING_LOCK_JSON:
         return True
+    if preview.kind is LockInspectionKind.WRONG_KIND:
+        return preview.wrong_kind_target is current.wrong_kind_target
     return False

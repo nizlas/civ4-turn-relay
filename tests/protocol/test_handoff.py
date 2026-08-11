@@ -848,13 +848,29 @@ def test_wrong_kind_final_save_path_is_hard_integrity() -> None:
     assert _manifest_bytes(storage, game_id) == before
 
 
-def test_handoff_result_rejects_impossible_committed_without_change() -> None:
+def test_handoff_result_rejects_impossible_public_combinations() -> None:
     from civ4_turn_relay.domain import DomainValidationError
+    from civ4_turn_relay.protocol import HandoffResult
 
+    digest = sha256_hex(SAVE_A)
     with pytest.raises(DomainValidationError):
-        from civ4_turn_relay.protocol import HandoffResult
-
-        HandoffResult(HandoffOutcome.COMMITTED, False, sha256=sha256_hex(SAVE_A))
+        HandoffResult(HandoffOutcome.COMMITTED, False, sha256=digest)
+    with pytest.raises(DomainValidationError):
+        HandoffResult(
+            HandoffOutcome.LOCK_CLEANUP_AMBIGUOUS,
+            True,
+            sha256=digest,
+            manifest=None,
+        )
+    with pytest.raises(DomainValidationError):
+        HandoffResult(
+            HandoffOutcome.NOT_CURRENT_OWNER,
+            True,
+            sha256=digest,
+        )
+    # sha256 is required for every public outcome.
+    with pytest.raises(TypeError):
+        HandoffResult(HandoffOutcome.TRANSPORT_FAILURE, False)  # type: ignore[call-arg]
 
 
 def test_temporary_history_path_helper() -> None:

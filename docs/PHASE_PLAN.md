@@ -30,8 +30,8 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 | P0 | Python project skeleton and quality gates | **COMPLETE** |
 | P1 | Domain types, configuration models, validation, deterministic serialization | **COMPLETE** |
 | P2 | Storage abstraction and failure-injectable fake storage | **COMPLETE** |
-| P3 | Core sync protocol engine | **ACTIVE** |
-| P4 | Local persistence, reconciliation, baseline, save detection, watching | NOT STARTED |
+| P3 | Core sync protocol engine | **COMPLETE** |
+| P4 | Local persistence, reconciliation, baseline, save detection, watching | **ACTIVE** |
 | P5 | Headless two-client end-to-end (fake storage) | NOT STARTED |
 | P6 | Paramiko SFTP adapter and disposable-server integration tests | NOT STARTED |
 | P7 | Windows Civ IV / BTS / AdvCiv launch and process integration | NOT STARTED |
@@ -40,7 +40,7 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 
 ## 4. Active implementation phase
 
-**P3 — Core sync protocol engine** is the only ACTIVE phase.
+**P4 — Local persistence, reconciliation, baseline, save detection, watching** is the only ACTIVE phase.
 
 ## 5. Phase-gate process
 
@@ -328,7 +328,7 @@ None.
 
 ## P3 — Core sync protocol engine
 
-**Status:** ACTIVE
+**Status:** COMPLETE
 
 ### Goal
 
@@ -395,11 +395,15 @@ None beyond reviewing failing injection traces if useful.
 - In-memory journal vs forcing P4 persistence first — keep journal interface abstract; durable backend in P4
 - History retention pruning — defer; keep all history ([protocol §14](SYNC_PROTOCOL.md#14-open-decisions))
 
+### Completion note
+
+P3 closed with fake-storage protocol coverage for all P3-primary PT IDs: match init/join, verified download (evidence-only; no local promotion), handoff/commit with lock resume and atomic history publish, hash classification, confirmed lock repair (including wrong-kind structures), and temporary-orphan cleanup that never mutates the authoritative manifest. Durable journals, local FS promotion/watching, baselines, Paramiko, Civ, and UI remain later phases.
+
 ---
 
 ## P4 — Local persistence, reconciliation, baseline, save detection, watching
 
-**Status:** NOT STARTED
+**Status:** ACTIVE
 
 ### Goal
 

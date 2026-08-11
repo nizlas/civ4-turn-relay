@@ -194,8 +194,8 @@ class HandoffResult:
 
     outcome: HandoffOutcome
     manifest_changed: bool
+    sha256: str
     manifest: Manifest | None = None
-    sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.outcome, HandoffOutcome):
@@ -208,13 +208,14 @@ class HandoffResult:
                 "expected an exact boolean",
                 field_path="manifest_changed",
             )
+        object.__setattr__(
+            self, "sha256", validate_sha256_hex(self.sha256, field_path="sha256")
+        )
         if self.manifest is not None and not isinstance(self.manifest, Manifest):
             raise DomainValidationError(
                 "expected a Manifest",
                 field_path="manifest",
             )
-        if self.sha256 is not None:
-            validate_sha256_hex(self.sha256, field_path="sha256")
 
         changed_ok = {
             HandoffOutcome.COMMITTED,
@@ -225,6 +226,11 @@ class HandoffResult:
                 "manifest_changed=True only for COMMITTED/"
                 "LOCK_CLEANUP_AMBIGUOUS after a commit",
                 field_path="manifest_changed",
+            )
+        if self.manifest_changed and self.manifest is None:
+            raise DomainValidationError(
+                "manifest_changed=True requires the resulting Manifest",
+                field_path="manifest",
             )
         if self.outcome is HandoffOutcome.COMMITTED:
             if not self.manifest_changed:
@@ -237,11 +243,6 @@ class HandoffResult:
                     "COMMITTED requires a resulting Manifest",
                     field_path="manifest",
                 )
-            if self.sha256 is None:
-                raise DomainValidationError(
-                    "COMMITTED requires outgoing sha256",
-                    field_path="sha256",
-                )
         if self.outcome is HandoffOutcome.IDEMPOTENT_ACK:
             if self.manifest_changed:
                 raise DomainValidationError(
@@ -253,11 +254,15 @@ class HandoffResult:
                     "IDEMPOTENT_ACK requires an authoritative Manifest",
                     field_path="manifest",
                 )
-            if self.sha256 is None:
-                raise DomainValidationError(
-                    "IDEMPOTENT_ACK requires outgoing sha256",
-                    field_path="sha256",
-                )
+        if (
+            self.outcome is not HandoffOutcome.COMMITTED
+            and self.outcome is not HandoffOutcome.LOCK_CLEANUP_AMBIGUOUS
+            and self.manifest_changed
+        ):
+            raise DomainValidationError(
+                "failure/rejection outcomes must not claim a changed manifest",
+                field_path="manifest_changed",
+            )
 
 
 def commit_handoff(

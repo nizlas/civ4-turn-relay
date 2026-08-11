@@ -15,6 +15,7 @@ from civ4_turn_relay.protocol import (
     LockInspectionKind,
     LockRepairOutcome,
     LockRepairPreview,
+    LockWrongKindTarget,
     acquire_or_resume_upload_lock,
     build_lock_document,
     inspect_upload_lock,
@@ -451,6 +452,85 @@ def test_transport_failure_preview_never_repairable(
     result = repair_abandoned_upload_lock(storage, preview=preview, confirmed=True)
     assert result.outcome is LockRepairOutcome.NOT_REPAIRABLE
     assert result.audit.removed is False
+
+
+def test_upload_lock_as_file_never_auto_deleted_but_confirmed_repair_works(
+    ready: tuple[FakeStorage, InMemoryOperationJournal, str],
+) -> None:
+    storage, journal, game_id = ready
+    paths = GamePaths(game_id)
+    storage.write_file(paths.upload_lock_dir, b"not-a-directory", overwrite=False)
+    inspection = inspect_upload_lock(storage, game_id)
+    assert inspection.kind is LockInspectionKind.WRONG_KIND
+    assert inspection.wrong_kind_target is LockWrongKindTarget.UPLOAD_LOCK
+
+    denied = acquire_or_resume_upload_lock(
+        storage,
+        game_id=game_id,
+        operation_id=OP_ID,
+        client_id=CLIENT_A,
+        player_id="player_a",
+        now_utc=NOW,
+        journal=journal,
+        sha256=_digest(),
+    )
+    assert denied.outcome is LockAcquireOutcome.UNREADABLE
+    assert paths.upload_lock_dir in storage.snapshot().files
+
+    preview = preview_lock_repair(storage, game_id)
+    assert preview.kind is LockInspectionKind.WRONG_KIND
+    unconfirmed = repair_abandoned_upload_lock(
+        storage, preview=preview, confirmed=False
+    )
+    assert unconfirmed.outcome is LockRepairOutcome.NOT_CONFIRMED
+    assert paths.upload_lock_dir in storage.snapshot().files
+
+    removed = repair_abandoned_upload_lock(storage, preview=preview, confirmed=True)
+    assert removed.outcome is LockRepairOutcome.REMOVED
+    assert removed.audit.removed is True
+    assert paths.upload_lock_dir not in storage.snapshot().files
+    assert paths.upload_lock_dir not in storage.snapshot().directories
+
+
+def test_lock_json_as_directory_empty_repair_and_nonempty_manual(
+    ready: tuple[FakeStorage, InMemoryOperationJournal, str],
+) -> None:
+    storage, journal, game_id = ready
+    paths = GamePaths(game_id)
+    storage.mkdir(paths.upload_lock_dir)
+    storage.mkdir(paths.upload_lock_json)
+    inspection = inspect_upload_lock(storage, game_id)
+    assert inspection.kind is LockInspectionKind.WRONG_KIND
+    assert inspection.wrong_kind_target is LockWrongKindTarget.LOCK_JSON
+
+    denied = acquire_or_resume_upload_lock(
+        storage,
+        game_id=game_id,
+        operation_id=OP_ID,
+        client_id=CLIENT_A,
+        player_id="player_a",
+        now_utc=NOW,
+        journal=journal,
+        sha256=_digest(),
+    )
+    assert denied.outcome is LockAcquireOutcome.UNREADABLE
+
+    preview = preview_lock_repair(storage, game_id)
+    removed = repair_abandoned_upload_lock(storage, preview=preview, confirmed=True)
+    assert removed.outcome is LockRepairOutcome.REMOVED
+    assert paths.upload_lock_dir not in storage.snapshot().directories
+
+    # Non-empty lock.json directory requires manual repair.
+    storage.mkdir(paths.upload_lock_dir)
+    storage.mkdir(paths.upload_lock_json)
+    storage.write_file(
+        f"{paths.upload_lock_json}/nested.bin", b"stuck", overwrite=False
+    )
+    preview2 = preview_lock_repair(storage, game_id)
+    manual = repair_abandoned_upload_lock(storage, preview=preview2, confirmed=True)
+    assert manual.outcome is LockRepairOutcome.MANUAL_REPAIR_REQUIRED
+    assert manual.audit.removed is False
+    assert paths.upload_lock_json in storage.snapshot().directories
 
 
 def test_capability_failure_without_exclusive_mkdir(
