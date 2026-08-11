@@ -9,8 +9,3 @@ def seed_tree(storage: Storage, *directories: str) -> None:
     """Create directories in order (parents before children)."""
     for path in directories:
         storage.mkdir(path)
-
-
-def write_temp(storage: Storage, path: str, data: bytes) -> None:
-    """Ensure parents exist as needed for simple single-segment temps."""
-    storage.write_file(path, data, overwrite=False)

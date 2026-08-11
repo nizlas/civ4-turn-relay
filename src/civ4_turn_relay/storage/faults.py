@@ -1,9 +1,28 @@
 """Fake-only deterministic failure injection.
 
 Faults are keyed by generic storage operation names (not protocol business
-logic), addressable by occurrence, and may fire before or after the
-underlying mutation. Read-back corruption returns altered bytes without
-changing stored content.
+logic). Occurrence is the 1-based **complete operation-call number** for that
+operation (each ``begin`` starts a call).
+
+Lifecycle for call N of an operation:
+
+1. ``begin`` increments the call counter to N and may fire a BEFORE fault.
+2. If BEFORE fires, any AFTER / read-corruption scheduled for N is retired
+   immediately (the call never reaches those moments).
+3. If the operation later fails with an ordinary storage error, the fake MUST
+   call ``abort``, which retires any AFTER / read-corruption still pending for N.
+4. If the operation succeeds, ``finish`` may fire an AFTER fault for N.
+
+Scheduling rules:
+
+- Reject ``occurrence < 1``.
+- Reject an occurrence that has already completed (``occurrence <= count``).
+- Reject duplicate ``(operation, moment, occurrence)`` schedules.
+- BEFORE and AFTER for the same occurrence are allowed; at most one of them
+  fires for that call (BEFORE wins and retires AFTER).
+
+Injection remains one-shot and fully resettable. Read-back corruption returns
+altered bytes without mutating stored content.
 """
 
 from __future__ import annotations
@@ -37,6 +56,10 @@ class FaultMoment(Enum):
     """Complete the mutation, then raise (lost response / network interrupt)."""
 
 
+class FaultScheduleError(ValueError):
+    """Raised when a fault schedule is duplicate or can never fire."""
+
+
 @dataclass(frozen=True, slots=True)
 class FaultSpec:
     """One selectable, occurrence-addressable fault."""
@@ -48,7 +71,7 @@ class FaultSpec:
 
     def __post_init__(self) -> None:
         if self.occurrence < 1:
-            raise ValueError("fault occurrence must be >= 1")
+            raise FaultScheduleError("fault occurrence must be >= 1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +82,7 @@ class ReadCorruptionSpec:
 
     def __post_init__(self) -> None:
         if self.occurrence < 1:
-            raise ValueError("read-corruption occurrence must be >= 1")
+            raise FaultScheduleError("read-corruption occurrence must be >= 1")
 
 
 class FaultController:
@@ -78,13 +101,29 @@ class FaultController:
         occurrence: int = 1,
     ) -> None:
         """Schedule a one-shot fault for the given operation occurrence."""
-        self._faults.append(
-            FaultSpec(operation=operation, moment=moment, occurrence=occurrence)
-        )
+        spec = FaultSpec(operation=operation, moment=moment, occurrence=occurrence)
+        self._reject_if_already_passed(operation, occurrence)
+        for existing in self._faults:
+            if (
+                existing.operation is operation
+                and existing.moment is moment
+                and existing.occurrence == occurrence
+            ):
+                raise FaultScheduleError(
+                    "duplicate fault schedule for operation/moment/occurrence"
+                )
+        self._faults.append(spec)
 
     def inject_read_corruption(self, *, occurrence: int = 1) -> None:
         """Schedule a one-shot corrupted read at the given READ occurrence."""
-        self._read_corruptions.append(ReadCorruptionSpec(occurrence=occurrence))
+        spec = ReadCorruptionSpec(occurrence=occurrence)
+        self._reject_if_already_passed(StorageOp.READ, occurrence)
+        for existing in self._read_corruptions:
+            if existing.occurrence == occurrence:
+                raise FaultScheduleError(
+                    "duplicate read-corruption schedule for occurrence"
+                )
+        self._read_corruptions.append(spec)
 
     def reset(self) -> None:
         """Remove all configured faults and reset occurrence counters."""
@@ -100,20 +139,38 @@ class FaultController:
         """Return currently scheduled read-corruption faults (copy)."""
         return tuple(self._read_corruptions)
 
-    def begin(self, operation: StorageOp) -> FaultMoment | None:
-        """Count a call and return a BEFORE fault moment if one fires now.
+    def call_count(self, operation: StorageOp) -> int:
+        """Return how many calls to ``operation`` have begun."""
+        return self._counts[operation]
 
-        AFTER faults are reported by :meth:`finish` after the mutation.
+    def begin(self, operation: StorageOp) -> FaultMoment | None:
+        """Start call N and return BEFORE if that fault fires now.
+
+        When BEFORE fires, AFTER/read-corruption for N are retired because the
+        call cannot reach those moments. AFTER faults are otherwise reported by
+        :meth:`finish` after a successful mutation, or retired by :meth:`abort`.
         """
         count = self._counts[operation] + 1
         self._counts[operation] = count
         fault = self._take_fault(operation, count, FaultMoment.BEFORE)
-        return FaultMoment.BEFORE if fault is not None else None
+        if fault is not None:
+            self._retire_unreachable_for_call(operation, count)
+            return FaultMoment.BEFORE
+        return None
 
     def finish(self, operation: StorageOp) -> bool:
         """Return True if an AFTER fault should raise for the current call."""
         count = self._counts[operation]
         return self._take_fault(operation, count, FaultMoment.AFTER) is not None
+
+    def abort(self, operation: StorageOp) -> None:
+        """Retire AFTER/read-corruption for the current call after a normal error.
+
+        Call this when an operation began (``begin`` returned without BEFORE)
+        but failed before a successful ``finish``.
+        """
+        count = self._counts[operation]
+        self._retire_unreachable_for_call(operation, count)
 
     def corrupt_read_payload(self, data: bytes) -> bytes | None:
         """If a read-corruption fires for the current READ, return bad bytes."""
@@ -123,6 +180,29 @@ class FaultController:
                 del self._read_corruptions[index]
                 return _corrupt_bytes(data)
         return None
+
+    def _reject_if_already_passed(self, operation: StorageOp, occurrence: int) -> None:
+        if occurrence <= self._counts[operation]:
+            raise FaultScheduleError(
+                "fault occurrence already passed for this operation"
+            )
+
+    def _retire_unreachable_for_call(
+        self, operation: StorageOp, occurrence: int
+    ) -> None:
+        self._faults = [
+            spec
+            for spec in self._faults
+            if not (
+                spec.operation is operation
+                and spec.occurrence == occurrence
+                and spec.moment is FaultMoment.AFTER
+            )
+        ]
+        if operation is StorageOp.READ:
+            self._read_corruptions = [
+                spec for spec in self._read_corruptions if spec.occurrence != occurrence
+            ]
 
     def _take_fault(
         self,

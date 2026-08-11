@@ -7,6 +7,8 @@ no-replace publication, and posix-rename-equivalent atomic replace.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from types import MappingProxyType
@@ -16,6 +18,7 @@ from civ4_turn_relay.domain.paths import validate_remote_relative_path
 from civ4_turn_relay.storage.errors import (
     StorageAlreadyExistsError,
     StorageCapabilityError,
+    StorageError,
     StorageInvalidPathError,
     StorageNotEmptyError,
     StorageNotFoundError,
@@ -79,92 +82,75 @@ class FakeStorage:
     def mkdir(self, path: str) -> None:
         path = _require_path(path)
         self._require_capability("exclusive_mkdir", self._capabilities.exclusive_mkdir)
-        if self._faults.begin(StorageOp.MKDIR) is FaultMoment.BEFORE:
-            raise StorageTransportError("injected failure before mkdir", path=path)
-        self._ensure_parent(path)
-        if path in self._files:
-            raise StorageWrongKindError("path is a file", path=path)
-        if path in self._directories:
-            raise StorageAlreadyExistsError("path already exists", path=path)
-        self._directories.add(path)
-        if self._faults.finish(StorageOp.MKDIR):
-            raise StorageTransportError("injected failure after mkdir", path=path)
+        with self._fault_scope(StorageOp.MKDIR, path=path):
+            self._ensure_parent(path)
+            if path in self._files:
+                raise StorageWrongKindError("path is a file", path=path)
+            if path in self._directories:
+                raise StorageAlreadyExistsError("path already exists", path=path)
+            self._directories.add(path)
 
     def write_file(self, path: str, data: bytes, *, overwrite: bool = False) -> None:
         path = _require_path(path)
         if not isinstance(data, bytes):
             raise TypeError("data must be bytes")
-        if self._faults.begin(StorageOp.WRITE) is FaultMoment.BEFORE:
-            raise StorageTransportError("injected failure before write", path=path)
-        self._ensure_parent(path)
-        if path in self._directories:
-            raise StorageWrongKindError("path is a directory", path=path)
-        if path in self._files and not overwrite:
-            raise StorageAlreadyExistsError("file already exists", path=path)
-        self._files[path] = bytes(data)
-        if self._faults.finish(StorageOp.WRITE):
-            raise StorageTransportError("injected failure after write", path=path)
+        with self._fault_scope(StorageOp.WRITE, path=path):
+            self._ensure_parent(path)
+            if path in self._directories:
+                raise StorageWrongKindError("path is a directory", path=path)
+            if path in self._files and not overwrite:
+                raise StorageAlreadyExistsError("file already exists", path=path)
+            self._files[path] = bytes(data)
 
     def read_file(self, path: str) -> bytes:
         path = _require_path(path)
-        if self._faults.begin(StorageOp.READ) is FaultMoment.BEFORE:
-            raise StorageTransportError("injected failure before read", path=path)
-        if path in self._directories:
-            raise StorageWrongKindError("path is a directory", path=path)
-        if path not in self._files:
-            raise StorageNotFoundError("file not found", path=path)
-        if not self._capabilities.complete_readback:
-            raise StorageCapabilityError(
-                "complete object read-back is unavailable", path=path
-            )
-        data = bytes(self._files[path])
-        corrupted = self._faults.corrupt_read_payload(data)
-        if corrupted is not None:
-            data = corrupted
-        if self._faults.finish(StorageOp.READ):
-            raise StorageTransportError("injected failure after read", path=path)
-        return data
+        result: bytes | None = None
+        with self._fault_scope(StorageOp.READ, path=path):
+            if path in self._directories:
+                raise StorageWrongKindError("path is a directory", path=path)
+            if path not in self._files:
+                raise StorageNotFoundError("file not found", path=path)
+            if not self._capabilities.complete_readback:
+                raise StorageCapabilityError(
+                    "complete object read-back is unavailable", path=path
+                )
+            data = bytes(self._files[path])
+            corrupted = self._faults.corrupt_read_payload(data)
+            result = data if corrupted is None else corrupted
+        assert result is not None
+        return result
 
     def list_dir(self, path: str) -> tuple[StorageEntry, ...]:
         path = _require_path(path)
-        if self._faults.begin(StorageOp.LIST) is FaultMoment.BEFORE:
-            raise StorageTransportError("injected failure before list", path=path)
-        if path in self._files:
-            raise StorageWrongKindError("path is a file", path=path)
-        if path not in self._directories:
-            raise StorageNotFoundError("directory not found", path=path)
-        entries = self._list_children(path)
-        if self._faults.finish(StorageOp.LIST):
-            raise StorageTransportError("injected failure after list", path=path)
-        return entries
+        result: tuple[StorageEntry, ...] | None = None
+        with self._fault_scope(StorageOp.LIST, path=path):
+            if path in self._files:
+                raise StorageWrongKindError("path is a file", path=path)
+            if path not in self._directories:
+                raise StorageNotFoundError("directory not found", path=path)
+            result = self._list_children(path)
+        assert result is not None
+        return result
 
     def remove_file(self, path: str) -> None:
         path = _require_path(path)
-        if self._faults.begin(StorageOp.REMOVE_FILE) is FaultMoment.BEFORE:
-            raise StorageTransportError(
-                "injected failure before remove_file", path=path
-            )
-        if path in self._directories:
-            raise StorageWrongKindError("path is a directory", path=path)
-        if path not in self._files:
-            raise StorageNotFoundError("file not found", path=path)
-        del self._files[path]
-        if self._faults.finish(StorageOp.REMOVE_FILE):
-            raise StorageTransportError("injected failure after remove_file", path=path)
+        with self._fault_scope(StorageOp.REMOVE_FILE, path=path):
+            if path in self._directories:
+                raise StorageWrongKindError("path is a directory", path=path)
+            if path not in self._files:
+                raise StorageNotFoundError("file not found", path=path)
+            del self._files[path]
 
     def remove_dir(self, path: str) -> None:
         path = _require_path(path)
-        if self._faults.begin(StorageOp.REMOVE_DIR) is FaultMoment.BEFORE:
-            raise StorageTransportError("injected failure before remove_dir", path=path)
-        if path in self._files:
-            raise StorageWrongKindError("path is a file", path=path)
-        if path not in self._directories:
-            raise StorageNotFoundError("directory not found", path=path)
-        if self._list_children(path):
-            raise StorageNotEmptyError("directory is not empty", path=path)
-        self._directories.remove(path)
-        if self._faults.finish(StorageOp.REMOVE_DIR):
-            raise StorageTransportError("injected failure after remove_dir", path=path)
+        with self._fault_scope(StorageOp.REMOVE_DIR, path=path):
+            if path in self._files:
+                raise StorageWrongKindError("path is a file", path=path)
+            if path not in self._directories:
+                raise StorageNotFoundError("directory not found", path=path)
+            if self._list_children(path):
+                raise StorageNotEmptyError("directory is not empty", path=path)
+            self._directories.remove(path)
 
     def publish_no_replace(self, source: str, destination: str) -> None:
         source = _require_path(source)
@@ -173,50 +159,52 @@ class FakeStorage:
             "atomic_publish_no_replace",
             self._capabilities.atomic_publish_no_replace,
         )
-        if self._faults.begin(StorageOp.PUBLISH_NO_REPLACE) is FaultMoment.BEFORE:
-            raise StorageTransportError(
-                "injected failure before publish_no_replace", path=destination
-            )
-        self._require_file(source)
-        self._ensure_parent(destination)
-        if destination in self._directories:
-            raise StorageWrongKindError("destination is a directory", path=destination)
-        if destination in self._files:
-            raise StorageAlreadyExistsError(
-                "destination already exists", path=destination
-            )
-        if source == destination:
-            raise StorageAlreadyExistsError(
-                "destination already exists", path=destination
-            )
-        self._files[destination] = self._files.pop(source)
-        if self._faults.finish(StorageOp.PUBLISH_NO_REPLACE):
-            raise StorageTransportError(
-                "injected failure after publish_no_replace", path=destination
-            )
+        with self._fault_scope(StorageOp.PUBLISH_NO_REPLACE, path=destination):
+            self._require_file(source)
+            self._ensure_parent(destination)
+            if destination in self._directories:
+                raise StorageWrongKindError(
+                    "destination is a directory", path=destination
+                )
+            if destination in self._files:
+                raise StorageAlreadyExistsError(
+                    "destination already exists", path=destination
+                )
+            if source == destination:
+                raise StorageAlreadyExistsError(
+                    "destination already exists", path=destination
+                )
+            self._files[destination] = self._files.pop(source)
 
     def atomic_replace(self, source: str, destination: str) -> None:
         source = _require_path(source)
         destination = _require_path(destination)
         self._require_capability("atomic_replace", self._capabilities.atomic_replace)
-        if self._faults.begin(StorageOp.ATOMIC_REPLACE) is FaultMoment.BEFORE:
+        with self._fault_scope(StorageOp.ATOMIC_REPLACE, path=destination):
+            self._require_file(source)
+            self._ensure_parent(destination)
+            if destination in self._directories:
+                raise StorageWrongKindError(
+                    "destination is a directory", path=destination
+                )
+            if source != destination:
+                content = self._files.pop(source)
+                self._files[destination] = content
+
+    @contextmanager
+    def _fault_scope(self, operation: StorageOp, *, path: str | None) -> Iterator[None]:
+        if self._faults.begin(operation) is FaultMoment.BEFORE:
             raise StorageTransportError(
-                "injected failure before atomic_replace", path=destination
+                f"injected failure before {operation.value}", path=path
             )
-        self._require_file(source)
-        self._ensure_parent(destination)
-        if destination in self._directories:
-            raise StorageWrongKindError("destination is a directory", path=destination)
-        if source == destination:
-            # posix-rename of a file onto itself is a no-op success; treat as
-            # already-finalized by leaving bytes in place and dropping nothing.
-            pass
-        else:
-            content = self._files.pop(source)
-            self._files[destination] = content
-        if self._faults.finish(StorageOp.ATOMIC_REPLACE):
+        try:
+            yield
+        except StorageError:
+            self._faults.abort(operation)
+            raise
+        if self._faults.finish(operation):
             raise StorageTransportError(
-                "injected failure after atomic_replace", path=destination
+                f"injected failure after {operation.value}", path=path
             )
 
     def _require_capability(self, name: str, available: bool) -> None:
