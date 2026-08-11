@@ -4,6 +4,9 @@ Providers construct :class:`~civ4_turn_relay.storage.port.Storage` instances.
 Contract cases must not inspect provider internals or concrete adapter types.
 A second delegating provider wraps :class:`FakeStorage` so the same cases are
 proven against a non-fake public type without adding Paramiko in P2.
+
+``create()`` takes no fake-specific construction controls (capability overrides
+included). Capability-negation coverage lives in fake-only tests.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ class StorageProvider(Protocol):
     def name(self) -> str:
         """Stable id used in pytest parametrization."""
 
-    def create(self, *, capabilities: StorageCapabilities | None = None) -> Storage:
+    def create(self) -> Storage:
         """Return a new storage rooted at an empty tree."""
 
 
@@ -35,8 +38,8 @@ class FakeStorageProvider:
     def name(self) -> str:
         return "fake"
 
-    def create(self, *, capabilities: StorageCapabilities | None = None) -> Storage:
-        return FakeStorage(capabilities=capabilities)
+    def create(self) -> Storage:
+        return FakeStorage()
 
 
 class DelegatingStorage:
@@ -84,8 +87,8 @@ class DelegatingStorageProvider:
     def name(self) -> str:
         return "delegating-wrapper"
 
-    def create(self, *, capabilities: StorageCapabilities | None = None) -> Storage:
-        return DelegatingStorage(FakeStorage(capabilities=capabilities))
+    def create(self) -> Storage:
+        return DelegatingStorage(FakeStorage())
 
 
 CONTRACT_PROVIDERS: tuple[StorageProvider, ...] = (
