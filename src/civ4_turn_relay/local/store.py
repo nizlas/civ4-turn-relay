@@ -23,8 +23,8 @@ from civ4_turn_relay.domain import (
     MatchConfig,
     parse_json_object_bytes,
     to_canonical_json_bytes,
-    validate_client_id,
     validate_game_id,
+    validate_installation_client_id,
 )
 from civ4_turn_relay.domain.serialization import (
     check_exact_keys,
@@ -39,10 +39,12 @@ from civ4_turn_relay.local.errors import (
 )
 from civ4_turn_relay.local.json_store import (
     FsyncFn,
+    PublishNoReplaceFn,
     ReplaceFn,
     UuidFactory,
+    atomic_publish_no_replace_bytes,
     atomic_write_bytes,
-    exclusive_create_bytes,
+    publish_no_replace,
 )
 from civ4_turn_relay.local.records import MatchLocalRecords
 
@@ -61,7 +63,7 @@ class InstallationIdentity:
         object.__setattr__(
             self,
             "client_id",
-            validate_client_id(self.client_id, field_path="client_id"),
+            validate_installation_client_id(self.client_id, field_path="client_id"),
         )
         if isinstance(self.schema_version, bool) or not isinstance(
             self.schema_version, int
@@ -109,11 +111,13 @@ class LocalStore:
         replace_fn: ReplaceFn = os.replace,
         fsync_fn: FsyncFn = os.fsync,
         uuid_factory: UuidFactory = uuid.uuid4,
+        publish_no_replace_fn: PublishNoReplaceFn = publish_no_replace,
     ) -> None:
         self._root = Path(root)
         self._replace_fn = replace_fn
         self._fsync_fn = fsync_fn
         self._uuid_factory = uuid_factory
+        self._publish_no_replace_fn = publish_no_replace_fn
 
     @property
     def root(self) -> Path:
@@ -139,9 +143,12 @@ class LocalStore:
     ) -> str:
         """Return the durable ``client_id``, creating it once if absent.
 
-        First-time initialization uses exclusive file creation so concurrent
-        LocalStore/process attempts converge on one persisted UUID. Corrupt or
-        unsupported installation documents are never treated as valid identity.
+        First-time initialization writes complete canonical bytes to an owned
+        temporary file, fsyncs, then publishes with atomic no-replace semantics
+        so ``installation.json`` is never exposed partially written. Concurrent
+        initializers converge on one persisted UUID. Corrupt or unsupported
+        installation documents are never treated as valid identity and are
+        never silently replaced.
         """
         path = self.installation_path()
         existing = self._try_read_installation(path)
@@ -150,11 +157,16 @@ class LocalStore:
 
         factory = uuid_factory or self._uuid_factory
         candidate = str(factory())
-        # validate_client_id accepts canonical UUID form.
         identity = InstallationIdentity(client_id=candidate)
         payload = identity.to_json_bytes()
         try:
-            created = exclusive_create_bytes(path, payload, fsync_fn=self._fsync_fn)
+            published = atomic_publish_no_replace_bytes(
+                path,
+                payload,
+                fsync_fn=self._fsync_fn,
+                uuid_factory=self._uuid_factory,
+                publish_fn=self._publish_no_replace_fn,
+            )
         except LocalStoreIOError:
             raise
         except OSError as error:
@@ -163,12 +175,11 @@ class LocalStore:
                 path=str(path),
             ) from error
 
-        if created:
+        if published:
             return identity.client_id
 
         winner = self._try_read_installation(path)
         if winner is None:
-            # Destination exists but is unreadable/invalid: never invent a new ID.
             raise LocalStoreCorruptError(
                 "installation identity exists but is not valid",
                 path=str(path),

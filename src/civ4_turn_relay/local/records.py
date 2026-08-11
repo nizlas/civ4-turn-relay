@@ -37,7 +37,13 @@ from civ4_turn_relay.protocol.journal import InProgressHandoff
 LOCAL_RECORDS_SCHEMA_VERSION = 1
 
 _BASELINE_ENTRY_KEYS = ("path", "sha256", "size_bytes")
-_PLAY_SESSION_BASELINE_KEYS = ("entries", "recorded_at")
+_PLAY_SESSION_BASELINE_KEYS = (
+    "accepted_sha256",
+    "entries",
+    "protocol_sequence",
+    "recorded_at",
+)
+_STABILITY_OBSERVATION_KEYS = ("observed_at_seconds", "path", "size_bytes")
 _VERIFIED_REMOTE_KEYS = ("accepted_sha256", "protocol_sequence")
 _DOWNLOADED_SAVE_KEYS = ("local_path", "protocol_sequence", "sha256", "size_bytes")
 _OUTGOING_CANDIDATE_KEYS = ("path", "sha256", "size_bytes")
@@ -65,6 +71,7 @@ _MATCH_LOCAL_OPTIONAL_KEYS = (
     "process_association",
     "processed_outgoing_hashes",
     "retry_count",
+    "stability_observations",
     "verified_remote",
 )
 
@@ -153,6 +160,8 @@ class PlaySessionBaseline:
     """Durable pre-launch snapshot of matching PBEM files (protocol §6.1)."""
 
     recorded_at: str
+    protocol_sequence: int
+    accepted_sha256: str | None
     entries: tuple[BaselineEntry, ...]
 
     def __post_init__(self) -> None:
@@ -161,6 +170,22 @@ class PlaySessionBaseline:
             "recorded_at",
             validate_utc_timestamp(self.recorded_at, field_path="recorded_at"),
         )
+        _require_non_negative_int(self.protocol_sequence, "protocol_sequence")
+        object.__setattr__(
+            self,
+            "accepted_sha256",
+            _optional_sha256(self.accepted_sha256, field_path="accepted_sha256"),
+        )
+        if self.protocol_sequence == 0 and self.accepted_sha256 is not None:
+            raise DomainValidationError(
+                "sequence 0 must not carry an accepted hash",
+                field_path="accepted_sha256",
+            )
+        if self.protocol_sequence > 0 and self.accepted_sha256 is None:
+            raise DomainValidationError(
+                "sequence > 0 requires an accepted hash",
+                field_path="accepted_sha256",
+            )
         entries = canonicalize_tuple(
             self.entries,
             BaselineEntry,
@@ -179,7 +204,9 @@ class PlaySessionBaseline:
 
     def to_mapping(self) -> dict[str, object]:
         return {
+            "accepted_sha256": self.accepted_sha256,
             "entries": [entry.to_mapping() for entry in self.entries],
+            "protocol_sequence": self.protocol_sequence,
             "recorded_at": self.recorded_at,
         }
 
@@ -198,7 +225,61 @@ class PlaySessionBaseline:
         try:
             return cls(
                 recorded_at=get_string(mapping, "recorded_at", path=path),
+                protocol_sequence=get_integer(mapping, "protocol_sequence", path=path),
+                accepted_sha256=get_optional_string(
+                    mapping, "accepted_sha256", path=path
+                ),
                 entries=tuple(entries),
+            )
+        except DomainValidationError as error:
+            raise error.with_prefix(path) from None
+
+
+@dataclass(frozen=True, slots=True)
+class StabilityObservation:
+    """One durable size sample for outgoing-candidate stability."""
+
+    path: str
+    size_bytes: int
+    observed_at_seconds: float
+
+    def __post_init__(self) -> None:
+        validate_windows_local_path(self.path, field_path="path")
+        _require_non_negative_int(self.size_bytes, "size_bytes")
+        if isinstance(self.observed_at_seconds, bool) or not isinstance(
+            self.observed_at_seconds, int | float
+        ):
+            raise DomainValidationError(
+                "expected a numeric timestamp in seconds",
+                field_path="observed_at_seconds",
+            )
+        object.__setattr__(self, "observed_at_seconds", float(self.observed_at_seconds))
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "observed_at_seconds": self.observed_at_seconds,
+            "path": self.path,
+            "size_bytes": self.size_bytes,
+        }
+
+    @classmethod
+    def from_mapping(
+        cls, mapping: Mapping[str, object], *, path: str = ""
+    ) -> StabilityObservation:
+        check_exact_keys(mapping, _STABILITY_OBSERVATION_KEYS, path=path)
+        raw_time = mapping["observed_at_seconds"]
+        if isinstance(raw_time, bool) or not isinstance(raw_time, int | float):
+            raise DomainValidationError(
+                "expected a numeric timestamp in seconds",
+                field_path=(
+                    f"{path}.observed_at_seconds" if path else "observed_at_seconds"
+                ),
+            )
+        try:
+            return cls(
+                path=get_string(mapping, "path", path=path),
+                size_bytes=get_integer(mapping, "size_bytes", path=path),
+                observed_at_seconds=float(raw_time),
             )
         except DomainValidationError as error:
             raise error.with_prefix(path) from None
@@ -514,6 +595,7 @@ class MatchLocalRecords:
     play_session_baseline: PlaySessionBaseline | None = None
     outgoing_candidate: OutgoingCandidateRecord | None = None
     processed_outgoing_hashes: tuple[str, ...] = ()
+    stability_observations: tuple[StabilityObservation, ...] = ()
     in_progress_handoff: InProgressHandoff | None = None
     attempted_handoff_hashes: tuple[str, ...] = ()
     historically_accepted_hashes: tuple[str, ...] = ()
@@ -577,6 +659,16 @@ class MatchLocalRecords:
             _canonicalize_digest_tuple(
                 self.processed_outgoing_hashes,
                 field_path="processed_outgoing_hashes",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "stability_observations",
+            canonicalize_tuple(
+                self.stability_observations,
+                StabilityObservation,
+                field_path="stability_observations",
+                item_label="StabilityObservation instance",
             ),
         )
         object.__setattr__(
@@ -700,6 +792,9 @@ class MatchLocalRecords:
             "processed_outgoing_hashes": list(self.processed_outgoing_hashes),
             "retry_count": self.retry_count,
             "schema_version": self.schema_version,
+            "stability_observations": [
+                item.to_mapping() for item in self.stability_observations
+            ],
             "verified_remote": (
                 None
                 if self.verified_remote is None
@@ -757,6 +852,21 @@ class MatchLocalRecords:
             if "processed_outgoing_hashes" in mapping
             else ()
         )
+        if "stability_observations" in mapping:
+            raw_obs = get_array(mapping, "stability_observations")
+            observations: list[StabilityObservation] = []
+            for index, item in enumerate(raw_obs):
+                item_path = f"stability_observations[{index}]"
+                if not isinstance(item, Mapping):
+                    raise DomainValidationError(
+                        "expected an object", field_path=item_path
+                    )
+                observations.append(
+                    StabilityObservation.from_mapping(item, path=item_path)
+                )
+            stability = tuple(observations)
+        else:
+            stability = ()
         attempted = (
             _string_tuple_from_array(
                 get_array(mapping, "attempted_handoff_hashes"),
@@ -816,6 +926,7 @@ class MatchLocalRecords:
                 )
             ),
             processed_outgoing_hashes=processed,
+            stability_observations=stability,
             in_progress_handoff=(
                 None
                 if in_progress_raw is None

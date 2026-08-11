@@ -59,9 +59,11 @@ def _full_mapping() -> dict[str, Any]:
             "size_bytes": 34,
         },
         "play_session_baseline": {
+            "accepted_sha256": HASH_1,
             "entries": [
                 {"path": PATH, "sha256": HASH_1, "size_bytes": 12},
             ],
+            "protocol_sequence": 1,
             "recorded_at": "2026-08-11T11:59:00Z",
         },
         "process_association": {
@@ -128,6 +130,8 @@ def test_baseline_rejects_duplicate_paths() -> None:
     with pytest.raises(DomainValidationError) as exc_info:
         PlaySessionBaseline(
             recorded_at="2026-08-11T11:59:00Z",
+            protocol_sequence=1,
+            accepted_sha256=HASH_1,
             entries=(entry, entry),
         )
     assert exc_info.value.field_path == "entries[1].path"

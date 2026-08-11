@@ -1,4 +1,4 @@
-"""Atomic local JSON byte writes (temp + fsync + replace).
+"""Atomic local JSON byte writes (temp + fsync + replace / no-replace).
 
 Used by :class:`~civ4_turn_relay.local.store.LocalStore`. Small injectable
 hooks support deterministic failure tests without a large FS framework.
@@ -7,6 +7,7 @@ hooks support deterministic failure tests without a large FS framework.
 from __future__ import annotations
 
 import os
+import sys
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -17,6 +18,7 @@ from civ4_turn_relay.local.errors import LocalStoreIOError
 ReplaceFn = Callable[[str, str], None]
 FsyncFn = Callable[[int], None]
 UuidFactory = Callable[[], uuid.UUID]
+PublishNoReplaceFn = Callable[[str, str], bool]
 
 
 def atomic_write_bytes(
@@ -70,18 +72,61 @@ def atomic_write_bytes(
                 pass
 
 
-def exclusive_create_bytes(
+def publish_no_replace(source: str, destination: str) -> bool:
+    """Publish ``source`` onto ``destination`` only when destination is absent.
+
+    Returns ``True`` when published, ``False`` when destination already exists.
+    Never overwrites an existing destination. Windows uses ``os.rename``
+    (fails if destination exists). POSIX uses ``os.link`` then unlinks the
+    source so a complete inode is published without replace-on-exist.
+    """
+    if Path(destination).exists():
+        return False
+    if sys.platform == "win32":
+        try:
+            os.rename(source, destination)
+            return True
+        except FileExistsError:
+            return False
+        except OSError as error:
+            if Path(destination).exists():
+                return False
+            raise LocalStoreIOError(
+                "failed to publish document without replace",
+                path=destination,
+            ) from error
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        return False
+    except OSError as error:
+        if Path(destination).exists():
+            return False
+        raise LocalStoreIOError(
+            "failed to publish document without replace",
+            path=destination,
+        ) from error
+    try:
+        os.unlink(source)
+    except OSError:
+        pass
+    return True
+
+
+def atomic_publish_no_replace_bytes(
     path: Path,
     data: bytes,
     *,
     fsync_fn: FsyncFn = os.fsync,
+    uuid_factory: UuidFactory = uuid.uuid4,
+    publish_fn: PublishNoReplaceFn = publish_no_replace,
 ) -> bool:
-    """Create ``path`` exclusively with ``data``.
+    """Write+fsync a temp file, then publish with no-replace semantics.
 
-    Returns ``True`` when this caller created the file. Returns ``False`` when
-    the destination already existed (another writer won the race). Raises
-    :class:`LocalStoreIOError` on other filesystem failures. A partial create
-    is removed when writing fails after exclusive open.
+    Returns ``True`` when this caller published ``path``. Returns ``False``
+    when another complete destination already won. A crash before successful
+    publication leaves no corrupt destination; owned temps are cleaned when
+    safely possible and never become authoritative.
     """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
@@ -94,38 +139,26 @@ def exclusive_create_bytes(
             path=str(path),
         ) from error
 
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    if hasattr(os, "O_BINARY"):
-        flags |= os.O_BINARY
-    try:
-        fd = os.open(str(path), flags)
-    except FileExistsError:
+    if path.exists():
         return False
-    except OSError as error:
-        raise LocalStoreIOError(
-            "failed to exclusively create document",
-            path=str(path),
-        ) from error
 
+    temporary = parent / f".{path.name}.{uuid_factory().hex}.tmp"
     try:
-        with os.fdopen(fd, "wb") as handle:
-            _write_fsync(handle, data, fsync_fn=fsync_fn)
-    except OSError as error:
         try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise LocalStoreIOError(
-            "failed to write exclusively created document",
-            path=str(path),
-        ) from error
-    except Exception:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-    return True
+            with temporary.open("wb") as handle:
+                _write_fsync(handle, data, fsync_fn=fsync_fn)
+        except OSError as error:
+            raise LocalStoreIOError(
+                "failed to write temporary document",
+                path=str(temporary),
+            ) from error
+        return publish_fn(str(temporary), str(path))
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _write_fsync(handle: BinaryIO, data: bytes, *, fsync_fn: FsyncFn) -> None:

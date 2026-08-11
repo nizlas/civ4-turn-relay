@@ -46,10 +46,12 @@ def validate_player_id(value: str, *, field_path: str = "player_id") -> str:
 
 
 def validate_client_id(value: str, *, field_path: str = "client_id") -> str:
-    """Validate a stable local installation / client ID for lock ownership.
+    """Validate a protocol lock/client ID.
 
-    Accepts a canonical lowercase UUID (preferred installation identity) or the
-    legacy ``^[a-z][a-z0-9_-]{0,63}$`` form used by earlier fixtures.
+    Accepts a canonical lowercase UUID or the legacy
+    ``^[a-z][a-z0-9_-]{0,63}$`` form used by earlier fixtures. Installation
+    identity in ``installation.json`` MUST use
+    :func:`validate_installation_client_id` instead.
     """
     if isinstance(value, str) and OPERATION_ID_PATTERN.fullmatch(value):
         return value
@@ -60,6 +62,13 @@ def validate_client_id(value: str, *, field_path: str = "client_id") -> str:
         "^[a-z][a-z0-9_-]{0,63}$",
         field_path=field_path,
     )
+
+
+def validate_installation_client_id(
+    value: str, *, field_path: str = "client_id"
+) -> str:
+    """Validate installation identity: canonical lowercase UUID only."""
+    return validate_operation_id(value, field_path=field_path)
 
 
 def validate_sha256_hex(value: str, *, field_path: str = "sha256") -> str:

@@ -17,6 +17,7 @@ from civ4_turn_relay.domain import (
     TurnHandlingMode,
 )
 from civ4_turn_relay.local import (
+    InstallationIdentity,
     LocalStore,
     LocalStoreCorruptError,
     LocalStoreIOError,
@@ -105,6 +106,34 @@ def test_unsupported_installation_schema(tmp_path: Path) -> None:
     )
     with pytest.raises(LocalStoreUnsupportedSchemaError):
         LocalStore(tmp_path).get_or_create_installation_identity()
+
+
+def test_legacy_installation_client_id_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "installation.json"
+    path.write_text(
+        '{\n  "client_id": "client-alpha",\n  "schema_version": 1\n}\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    with pytest.raises(LocalStoreCorruptError):
+        LocalStore(tmp_path).get_or_create_installation_identity()
+
+
+def test_publish_failure_leaves_no_installation_json(tmp_path: Path) -> None:
+    def never_publish(source: str, destination: str) -> bool:
+        del source, destination
+        return False
+
+    store = LocalStore(tmp_path, publish_no_replace_fn=never_publish)
+    with pytest.raises(LocalStoreCorruptError):
+        store.get_or_create_installation_identity(uuid_factory=lambda: FIXED_UUID)
+    assert not (tmp_path / "installation.json").exists()
+
+
+def test_legacy_installation_identity_rejected_at_parse() -> None:
+    with pytest.raises(DomainValidationError) as exc_info:
+        InstallationIdentity(client_id="client-alpha")
+    assert exc_info.value.field_path == "client_id"
 
 
 def test_match_config_round_trip(tmp_path: Path) -> None:

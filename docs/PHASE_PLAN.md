@@ -31,8 +31,8 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 | P1 | Domain types, configuration models, validation, deterministic serialization | **COMPLETE** |
 | P2 | Storage abstraction and failure-injectable fake storage | **COMPLETE** |
 | P3 | Core sync protocol engine | **COMPLETE** |
-| P4 | Local persistence, reconciliation, baseline, save detection, watching | **ACTIVE** |
-| P5 | Headless two-client end-to-end (fake storage) | NOT STARTED |
+| P4 | Local persistence, reconciliation, baseline, save detection, watching | **COMPLETE** |
+| P5 | Headless two-client end-to-end (fake storage) | **ACTIVE** |
 | P6 | Paramiko SFTP adapter and disposable-server integration tests | NOT STARTED |
 | P7 | Windows Civ IV / BTS / AdvCiv launch and process integration | NOT STARTED |
 | P8 | Minimal PySide6 UI, matches, settings, status, diagnostics | NOT STARTED |
@@ -40,7 +40,7 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 
 ## 4. Active implementation phase
 
-**P4 — Local persistence, reconciliation, baseline, save detection, watching** is the only ACTIVE phase.
+**P5 — Headless two-client end-to-end workflow (fake storage)** is the only ACTIVE phase.
 
 ## 5. Phase-gate process
 
@@ -404,7 +404,7 @@ P3 closed with fake-storage protocol coverage for all P3-primary PT IDs: match i
 
 ## P4 — Local persistence, reconciliation, baseline, save detection, watching
 
-**Status:** ACTIVE
+**Status:** COMPLETE
 
 ### Goal
 
@@ -471,11 +471,15 @@ P3 complete.
 - Resolve stable-file sampling interval with tests ([DESIGN_SPEC §13](DESIGN_SPEC.md#13-open-decisions))
 - Watchdog flakiness on Windows — polling fallback must be first-class
 
+### Completion note
+
+P4 closed with LocalStore (`installation.json`, per-match `config.json`/`state.json`), UUID-only installation identity via temp+fsync+no-replace publish, durable `HandoffJournal` embedded in match state, verified download promotion, play-session baselines keyed by sequence/hash, outgoing detection with injected-clock 1.0s × 2 stability sampling, recursive Watchdog watcher + polling fallback (`fs/`), and pure Standard/Fully Managed orchestration intents (no real process I/O). Primary PT coverage: PT-06, PT-19–PT-24, PT-34; FR-004/010/011/012/013 and FR-015 foundation covered in `tests/local/`. Paramiko, real Civ process ops, UI, and packaging remain later phases. Stable-file sampling default recorded as **1.0s between size samples, twice**.
+
 ---
 
 ## P5 — Headless two-client end-to-end workflow (fake storage)
 
-**Status:** NOT STARTED
+**Status:** ACTIVE
 
 ### Goal
 
