@@ -9,7 +9,9 @@ from civ4_turn_relay.domain import (
     Player,
     SaveMatchingRules,
 )
+from civ4_turn_relay.protocol import InMemoryOperationJournal, initialize_match
 from civ4_turn_relay.storage import (
+    FakeStorage,
     Storage,
     StorageCapabilities,
     StorageEntry,
@@ -19,9 +21,14 @@ from civ4_turn_relay.storage import (
 
 OP_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 OP_ID_2 = "11111111-2222-3333-4444-555555555555"
+OP_ID_3 = "99999999-aaaa-bbbb-cccc-dddddddddddd"
 HASH_1 = "a1b2c3d4e5f6789012345678abcdef9012345678abcdef9012345678abcdef90"
 HASH_2 = "b" * 64
 HASH_3 = "c" * 64
+CLIENT_A = "client-alpha"
+CLIENT_B = "client-bravo"
+NOW_UTC = "2026-08-10T19:00:00Z"
+SAVE_NAME = "ExampleMatch_PlayerA.CivBeyondSwordSave"
 
 
 def sample_players() -> tuple[Player, ...]:
@@ -50,6 +57,26 @@ def sample_match_config(
         save_matching=SaveMatchingRules(filename_glob="*.CivBeyondSwordSave"),
         auto_launch=False,
     )
+
+
+def initialize_ready_match(
+    *,
+    storage: FakeStorage | None = None,
+    journal: InMemoryOperationJournal | None = None,
+    game_id: str = "example-match",
+    players: tuple[Player, ...] | None = None,
+    local_player_id: str = "player_a",
+    operation_id: str = OP_ID,
+) -> tuple[FakeStorage, InMemoryOperationJournal, str]:
+    """Create a sequence-zero match ready for handoff tests."""
+    resolved_storage = storage if storage is not None else FakeStorage()
+    resolved_journal = journal if journal is not None else InMemoryOperationJournal()
+    config = sample_match_config(
+        game_id=game_id, players=players, local_player_id=local_player_id
+    )
+    result = initialize_match(resolved_storage, config, operation_id=operation_id)
+    assert result.initialized, result.outcome
+    return resolved_storage, resolved_journal, config.game_id
 
 
 class CountingStorage:

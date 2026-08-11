@@ -17,6 +17,8 @@ from civ4_turn_relay.domain.config import (
 from civ4_turn_relay.domain.errors import DomainValidationError
 from civ4_turn_relay.domain.hashing import sha256_hex
 from civ4_turn_relay.domain.ids import (
+    add_utc_seconds,
+    validate_client_id,
     validate_game_id,
     validate_operation_id,
     validate_player_id,
@@ -73,7 +75,9 @@ __all__ = [
     "redact_structure",
     "sha256_hex",
     "to_canonical_json_bytes",
+    "add_utc_seconds",
     "validate_accepted_save_path",
+    "validate_client_id",
     "validate_game_id",
     "validate_history_manifest_ref",
     "validate_operation_id",

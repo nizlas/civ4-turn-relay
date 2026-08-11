@@ -7,12 +7,13 @@ The patterns are normative in ``docs/SYNC_PROTOCOL.md`` (§2.1 for game IDs,
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from civ4_turn_relay.domain.errors import DomainValidationError
 
 GAME_ID_PATTERN = re.compile(r"^[a-z][a-z0-9-]{1,62}[a-z0-9]$")
 PLAYER_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+CLIENT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 OPERATION_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -39,6 +40,16 @@ def validate_player_id(value: str, *, field_path: str = "player_id") -> str:
     if not isinstance(value, str) or not PLAYER_ID_PATTERN.fullmatch(value):
         raise DomainValidationError(
             "expected a player ID matching ^[a-z][a-z0-9_-]{0,31}$",
+            field_path=field_path,
+        )
+    return value
+
+
+def validate_client_id(value: str, *, field_path: str = "client_id") -> str:
+    """Validate a stable local installation / client ID for lock ownership."""
+    if not isinstance(value, str) or not CLIENT_ID_PATTERN.fullmatch(value):
+        raise DomainValidationError(
+            "expected a client ID matching ^[a-z][a-z0-9_-]{0,63}$",
             field_path=field_path,
         )
     return value
@@ -76,3 +87,15 @@ def validate_utc_timestamp(value: str, *, field_path: str = "timestamp") -> str:
     except ValueError:
         raise DomainValidationError(message, field_path=field_path) from None
     return value
+
+
+def add_utc_seconds(value: str, seconds: int, *, field_path: str = "timestamp") -> str:
+    """Return ``value`` advanced by ``seconds`` (injected-time arithmetic only)."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise DomainValidationError(
+            "expected an integer second delta",
+            field_path="seconds",
+        )
+    validated = validate_utc_timestamp(value, field_path=field_path)
+    moment = datetime.strptime(validated, _UTC_TIMESTAMP_FORMAT)
+    return (moment + timedelta(seconds=seconds)).strftime(_UTC_TIMESTAMP_FORMAT)
