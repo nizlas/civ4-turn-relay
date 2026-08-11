@@ -1,0 +1,124 @@
+"""Authoritative manifest reader coverage (PT-18, PT-38, mismatch)."""
+
+from __future__ import annotations
+
+import pytest
+
+from civ4_turn_relay.domain import DomainValidationError, Manifest
+from civ4_turn_relay.protocol import (
+    GamePaths,
+    ManifestReadOutcome,
+    initialize_match,
+    read_authoritative_manifest,
+)
+from civ4_turn_relay.storage import FakeStorage, FaultMoment, StorageOp
+from tests.protocol.helpers import (
+    OP_ID,
+    CountingStorage,
+    sample_match_config,
+)
+
+
+@pytest.mark.pt("PT-18")
+def test_pt18_invalid_initial_manifest_rejected() -> None:
+    storage = FakeStorage()
+    config = sample_match_config()
+    created = initialize_match(storage, config, operation_id=OP_ID)
+    assert created.outcome.name == "CREATED"
+    assert created.manifest is not None
+
+    # Overwrite committed bytes with schema-invalid JSON (test-only mutation).
+    storage.write_file(
+        GamePaths(config.game_id).manifest,
+        b'{"schema_version":1}',
+        overwrite=True,
+    )
+    result = read_authoritative_manifest(storage, config.game_id)
+    assert result.outcome is ManifestReadOutcome.INVALID
+    assert result.manifest is None
+
+
+@pytest.mark.pt("PT-38")
+def test_pt38_invalid_manifest_schema_or_hash_list_no_state_advance() -> None:
+    storage = FakeStorage()
+    config = sample_match_config()
+    created = initialize_match(storage, config, operation_id=OP_ID)
+    assert created.manifest is not None
+    before = storage.snapshot()
+
+    bad = (
+        b'{"accepted_save":null,"accepted_save_hashes":["not-a-hash"],'
+        b'"current_player_id":"player_a","display_name":"Example Match",'
+        b'"game_id":"example-match","last_sender_id":null,'
+        b'"players":[{"display_name":"Player A","id":"player_a"},'
+        b'{"display_name":"Player B","id":"player_b"}],'
+        b'"previous_manifest_ref":null,'
+        b'"protocol":{"last_operation_id":null,"min_client_protocol":1},'
+        b'"protocol_sequence":0,"schema_version":1}\n'
+    )
+    storage.write_file(GamePaths(config.game_id).manifest, bad, overwrite=True)
+    result = read_authoritative_manifest(storage, config.game_id)
+    assert result.outcome is ManifestReadOutcome.INVALID
+    after = storage.snapshot()
+    # Reader must not mutate; only the intentional overwrite differs.
+    assert after.directories == before.directories
+    assert set(after.files) == set(before.files)
+
+
+def test_directory_game_id_versus_manifest_game_id_mismatch() -> None:
+    storage = FakeStorage()
+    config = sample_match_config(game_id="example-match")
+    created = initialize_match(storage, config, operation_id=OP_ID)
+    assert created.manifest is not None
+
+    # Rewrite manifest game_id while keeping directory name.
+    mapping = created.manifest.to_mapping()
+    mapping["game_id"] = "other-match"
+    # Bypass Manifest validation for the mismatched bytes by hand-editing JSON
+    # through a valid Manifest for other-match is impossible under example-match
+    # directory constraint — write raw swapped id with otherwise valid seq0 body.
+    raw = created.manifest.to_json_bytes().replace(
+        b'"game_id": "example-match"', b'"game_id": "other-match"'
+    )
+    storage.write_file(GamePaths("example-match").manifest, raw, overwrite=True)
+    # Confirm the swapped bytes would parse as a Manifest for other-match.
+    assert Manifest.from_json_bytes(raw).game_id == "other-match"
+
+    result = read_authoritative_manifest(storage, "example-match")
+    assert result.outcome is ManifestReadOutcome.GAME_ID_MISMATCH
+    assert result.manifest is None
+
+
+def test_missing_manifest_outcome() -> None:
+    storage = FakeStorage()
+    storage.mkdir("example-match")
+    result = read_authoritative_manifest(storage, "example-match")
+    assert result.outcome is ManifestReadOutcome.MISSING
+
+
+def test_transport_failure_on_manifest_read() -> None:
+    storage = FakeStorage()
+    config = sample_match_config()
+    assert initialize_match(storage, config, operation_id=OP_ID).initialized
+    storage.faults.inject(StorageOp.READ, moment=FaultMoment.BEFORE, occurrence=1)
+    result = read_authoritative_manifest(storage, config.game_id)
+    assert result.outcome is ManifestReadOutcome.TRANSPORT_FAILURE
+
+
+def test_repeated_join_reads_do_not_mutate_storage() -> None:
+    storage = FakeStorage()
+    config = sample_match_config()
+    assert initialize_match(storage, config, operation_id=OP_ID).initialized
+    before = storage.snapshot()
+    for _ in range(3):
+        result = read_authoritative_manifest(storage, config.game_id)
+        assert result.outcome is ManifestReadOutcome.OK
+    assert storage.snapshot() == before
+
+
+def test_validation_before_io_rejects_bad_game_id() -> None:
+    inner = FakeStorage()
+    storage = CountingStorage(inner)
+    with pytest.raises(DomainValidationError):
+        read_authoritative_manifest(storage, "../evil")
+    assert storage.calls == []
