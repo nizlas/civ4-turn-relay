@@ -275,17 +275,17 @@ def test_all_failure_results_preserve_authoritative_remote_state() -> None:
     assert storage.snapshot() == before
 
 
-def test_uncertain_replace_exact_intended_manifest_is_created() -> None:
+def _sequence_zero_manifest_for(config: object) -> Manifest:
     from civ4_turn_relay.domain import (
         MANIFEST_SCHEMA_VERSION,
         MIN_CLIENT_PROTOCOL,
         Manifest,
+        MatchConfig,
         ProtocolMetadata,
     )
-    from tests.protocol.helpers import UncertainReplaceStorage
 
-    config = sample_match_config()
-    intended = Manifest(
+    assert isinstance(config, MatchConfig)
+    return Manifest(
         schema_version=MANIFEST_SCHEMA_VERSION,
         game_id=config.game_id,
         display_name=config.display_name,
@@ -300,6 +300,13 @@ def test_uncertain_replace_exact_intended_manifest_is_created() -> None:
             min_client_protocol=MIN_CLIENT_PROTOCOL, last_operation_id=None
         ),
     )
+
+
+def test_uncertain_replace_exact_intended_manifest_is_created() -> None:
+    from tests.protocol.helpers import UncertainReplaceStorage
+
+    config = sample_match_config()
+    intended = _sequence_zero_manifest_for(config)
     inner = FakeStorage()
     storage = UncertainReplaceStorage(inner, committed_bytes="source")
     result = initialize_match(storage, config, operation_id=OP_ID)
@@ -309,6 +316,39 @@ def test_uncertain_replace_exact_intended_manifest_is_created() -> None:
     assert (
         inner.read_file(GamePaths(config.game_id).manifest) == intended.to_json_bytes()
     )
+
+
+def test_uncertain_replace_noncanonical_identical_semantics_is_joined() -> None:
+    """Byte-different but semantically identical JSON must not report CREATED."""
+    import json
+
+    from tests.protocol.helpers import UncertainReplaceStorage
+
+    config = sample_match_config()
+    intended = _sequence_zero_manifest_for(config)
+    intended_payload = intended.to_json_bytes()
+
+    # Compact JSON with reversed top-level key order and no pretty indentation.
+    mapping = intended.to_mapping()
+    noncanonical_obj = {key: mapping[key] for key in reversed(list(mapping))}
+    noncanonical = json.dumps(
+        noncanonical_obj, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+    assert noncanonical != intended_payload
+    # Canonical reserialization matches intended — old attribution would CREATED.
+    assert Manifest.from_json_bytes(noncanonical).to_json_bytes() == intended_payload
+
+    inner = FakeStorage()
+    storage = UncertainReplaceStorage(inner, committed_bytes=noncanonical)
+    before_classify_dirs = set(inner.snapshot().directories)
+    result = initialize_match(storage, config, operation_id=OP_ID)
+    assert result.outcome is InitializeOutcome.JOINED_EXISTING
+    assert result.manifest == intended
+    assert storage.mutations_after_uncertain == 0
+    assert inner.read_file(GamePaths(config.game_id).manifest) == noncanonical
+    # Recovery classification must not mutate beyond the uncertain replace itself.
+    assert set(inner.snapshot().directories) >= before_classify_dirs
 
 
 def test_uncertain_replace_different_valid_manifest_is_joined_not_created() -> None:
@@ -336,6 +376,8 @@ def test_uncertain_replace_different_valid_manifest_is_joined_not_created() -> N
             min_client_protocol=MIN_CLIENT_PROTOCOL, last_operation_id=None
         ),
     )
+    intended_bytes = _sequence_zero_manifest_for(config).to_json_bytes()
+    assert foreign.to_json_bytes() != intended_bytes
     inner = FakeStorage()
     storage = UncertainReplaceStorage(inner, committed_bytes=foreign.to_json_bytes())
     result = initialize_match(storage, config, operation_id=OP_ID)
