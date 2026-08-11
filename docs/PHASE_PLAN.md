@@ -28,8 +28,8 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 | Phase | Name | Status |
 |-------|------|--------|
 | P0 | Python project skeleton and quality gates | **COMPLETE** |
-| P1 | Domain types, configuration models, validation, deterministic serialization | **ACTIVE** |
-| P2 | Storage abstraction and failure-injectable fake storage | NOT STARTED |
+| P1 | Domain types, configuration models, validation, deterministic serialization | **COMPLETE** |
+| P2 | Storage abstraction and failure-injectable fake storage | **ACTIVE** |
 | P3 | Core sync protocol engine | NOT STARTED |
 | P4 | Local persistence, reconciliation, baseline, save detection, watching | NOT STARTED |
 | P5 | Headless two-client end-to-end (fake storage) | NOT STARTED |
@@ -40,7 +40,7 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 
 ## 4. Active implementation phase
 
-**P1 — Domain types, configuration models, validation, deterministic serialization** is the only ACTIVE phase.
+**P2 — Storage abstraction and failure-injectable fake storage** is the only ACTIVE phase.
 
 ## 5. Phase-gate process
 
@@ -196,7 +196,7 @@ None (tooling only).
 
 ## P1 — Domain types, configuration models, validation, deterministic serialization
 
-**Status:** ACTIVE
+**Status:** COMPLETE
 
 ### Goal
 
@@ -258,13 +258,13 @@ None required.
 
 ### Risks / decisions
 
-- Concrete config file format on disk (TOML/JSON) — pick one simple local format; keep `.env` for secrets/global seeds only
+- Concrete config file format on disk (TOML/JSON) — **resolved:** JSON for local per-match configuration, using the same strict deterministic serialization conventions as the manifest ([protocol §3.3](SYNC_PROTOCOL.md#33-serialization-conventions)); `.env` remains for global secrets/seeds only
 
 ---
 
 ## P2 — Storage abstraction and failure-injectable fake storage
 
-**Status:** NOT STARTED
+**Status:** ACTIVE
 
 ### Goal
 
