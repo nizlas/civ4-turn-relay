@@ -115,6 +115,39 @@ def test_my_turn_fully_managed_automatic_launch_disables_button() -> None:
     assert vm.primary_enabled is False
 
 
+def test_my_turn_fully_managed_waits_for_existing_civ() -> None:
+    vm = build_view_model(
+        client_snapshot(OperationalState.MY_TURN_DOWNLOADED, mode=MANAGED),
+        process_snapshot(ProcessStatus.WAITING_FOR_EXISTING_CIV),
+    )
+    assert vm.status_text == "Your turn — save downloaded"
+    assert vm.detail_text == "Your turn is ready — waiting for Civilization to close."
+    assert vm.primary_action is PrimaryActionKind.NONE
+    assert vm.primary_label == "Waiting for Civilization to close…"
+    assert vm.primary_enabled is False
+
+
+def test_my_turn_standard_waiting_for_existing_civ_keeps_start_button() -> None:
+    vm = build_view_model(
+        client_snapshot(OperationalState.MY_TURN_DOWNLOADED, mode=STANDARD),
+        process_snapshot(ProcessStatus.WAITING_FOR_EXISTING_CIV),
+    )
+    assert vm.detail_text == "Your turn is ready — waiting for Civilization to close."
+    assert vm.primary_action is PrimaryActionKind.START_CIV
+    assert vm.primary_label == "Start Civilization and play"
+    assert vm.primary_enabled is True
+
+
+def test_first_save_fully_managed_waits_for_existing_civ() -> None:
+    vm = build_view_model(
+        client_snapshot(OperationalState.WAITING_FOR_MY_FIRST_SAVE, mode=MANAGED),
+        process_snapshot(ProcessStatus.WAITING_FOR_EXISTING_CIV),
+    )
+    assert vm.status_text == "Waiting for your first save (sequence 0)"
+    assert vm.detail_text == "Your turn is ready — waiting for Civilization to close."
+    assert vm.primary_enabled is False
+
+
 def test_first_save_standard_create_button() -> None:
     vm = build_view_model(
         client_snapshot(

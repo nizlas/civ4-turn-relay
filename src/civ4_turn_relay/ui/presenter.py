@@ -134,8 +134,14 @@ def _map_waiting_for_other(
     return draft
 
 
-def _map_my_turn_downloaded(draft: _Draft, snapshot: MatchClientSnapshot) -> _Draft:
+def _map_my_turn_downloaded(
+    draft: _Draft,
+    snapshot: MatchClientSnapshot,
+    process: ProcessStatusSnapshot | None,
+) -> _Draft:
     draft.status_text = "Your turn — save downloaded"
+    if process is not None and process.status is ProcessStatus.WAITING_FOR_EXISTING_CIV:
+        return _map_waiting_for_existing_civ(draft, snapshot)
     if snapshot.turn_handling_mode is TurnHandlingMode.STANDARD:
         return _action(
             draft, PrimaryActionKind.START_CIV, "Start Civilization and play"
@@ -145,6 +151,23 @@ def _map_my_turn_downloaded(draft: _Draft, snapshot: MatchClientSnapshot) -> _Dr
             draft, PrimaryActionKind.START_CIV, "Start / Resume Civilization"
         )
     return _disabled(draft, "Starting automatically…")
+
+
+def _map_waiting_for_existing_civ(
+    draft: _Draft, snapshot: MatchClientSnapshot
+) -> _Draft:
+    """An existing Civilization process defers this match's launch.
+
+    Fully Managed retries automatically on later ticks, so the button stays
+    disabled; Standard mode never auto-launches, so the user may explicitly
+    retry Start once the existing Civilization has closed.
+    """
+    draft.detail_text = "Your turn is ready — waiting for Civilization to close."
+    if snapshot.turn_handling_mode is TurnHandlingMode.STANDARD:
+        return _action(
+            draft, PrimaryActionKind.START_CIV, "Start Civilization and play"
+        )
+    return _disabled(draft, "Waiting for Civilization to close…")
 
 
 def _map_first_save(draft: _Draft, snapshot: MatchClientSnapshot) -> _Draft:
@@ -200,8 +223,14 @@ def _map_state(
     if state is OperationalState.WAITING_FOR_OTHER_PLAYER:
         return _map_waiting_for_other(draft, snapshot, process)
     if state is OperationalState.MY_TURN_DOWNLOADED:
-        return _map_my_turn_downloaded(draft, snapshot)
+        return _map_my_turn_downloaded(draft, snapshot, process)
     if state is OperationalState.WAITING_FOR_MY_FIRST_SAVE:
+        if (
+            process is not None
+            and process.status is ProcessStatus.WAITING_FOR_EXISTING_CIV
+        ):
+            draft.status_text = "Waiting for your first save (sequence 0)"
+            return _map_waiting_for_existing_civ(draft, snapshot)
         return _map_first_save(draft, snapshot)
     if state is OperationalState.CIV_RUNNING:
         return _map_civ_running(draft, process)

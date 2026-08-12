@@ -9,6 +9,7 @@ from civ4_turn_relay.app import ProcessStatus, RelayClient
 from civ4_turn_relay.domain import MatchConfig, OperationalState, TurnHandlingMode
 from civ4_turn_relay.local import FakeClock, LocalStore
 from civ4_turn_relay.process import (
+    FakeMachine,
     FakeProcessSupervisor,
     FocusOutcome,
     LaunchPlanOutcome,
@@ -32,6 +33,7 @@ from tests.e2e_fake.helpers import (
 
 LOCAL_UUID = uuid.UUID("21212121-2121-4121-8121-212121212121")
 OPPONENT_UUID = uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+PROFILE_B_UUID = uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
 
 
 def _exe_path(tmp_path: Path) -> str:
@@ -629,6 +631,182 @@ def test_unavailable_supervisor_reports_unavailable(tmp_path: Path) -> None:
     assert no_adapter.status is ProcessStatus.UNAVAILABLE
     assert no_adapter.message == "no process adapter configured"
     plain.close()
+
+
+# --- cross-instance launch guard: two Relay profiles on one computer --------
+
+
+def _two_profile_setup(
+    tmp_path: Path,
+    storage: FakeStorage,
+    clock: FakeClock,
+    machine: FakeMachine,
+    *,
+    mode_b: TurnHandlingMode = TurnHandlingMode.FULLY_MANAGED,
+) -> tuple[
+    RelayClient,
+    RelayClient,
+    FakeProcessSupervisor,
+    FakeProcessSupervisor,
+    ProcessIdentity,
+]:
+    """Two Relay profiles (A and B) sharing one PC and one Civ install.
+
+    Profile A launches Civ at sequence 0, commits its first turn, and its
+    Civ process is still closing (graceful close requested, not yet exited)
+    while profile B already owns the next turn.
+    """
+    exe = _exe_path(tmp_path)
+    supervisor_a = FakeProcessSupervisor(machine=machine)
+    supervisor_a.exit_on_close_request = False
+    supervisor_b = FakeProcessSupervisor(machine=machine)
+
+    root_a = tmp_path / "profile-a"
+    client_a = _make_process_client(
+        root_a, storage, clock, supervisor_a, civ4_executable=exe
+    )
+    config_a = match_config(
+        root_a,
+        local_player_id="player_a",
+        mode=TurnHandlingMode.FULLY_MANAGED,
+        pbem_name="pbem-a",
+    )
+    created = client_a.initialize_or_join(
+        config_a, operation_id="e1e1e1e1-e1e1-4e1e-8e1e-e1e1e1e1e1e1"
+    )
+    assert created.outcome is InitializeOutcome.CREATED
+
+    root_b = tmp_path / "profile-b"
+    client_b = _make_process_client(
+        root_b,
+        storage,
+        clock,
+        supervisor_b,
+        civ4_executable=exe,
+        client_uuid=PROFILE_B_UUID,
+    )
+    config_b = match_config(
+        root_b, local_player_id="player_b", mode=mode_b, pbem_name="pbem-b"
+    )
+    joined = client_b.initialize_or_join(
+        config_b, operation_id="e2e2e2e2-e2e2-4e2e-8e2e-e2e2e2e2e2e2"
+    )
+    assert joined.outcome is InitializeOutcome.JOINED_EXISTING
+
+    snap_a = client_a.tick(GAME_ID)
+    assert snap_a.operational_state is OperationalState.CIV_RUNNING
+    write_stable_save(
+        Path(config_a.pbem_save_directory),
+        SAVE_NAME_A,
+        SAVE_A,
+        clock,
+        client_a,
+        GAME_ID,
+    )
+    commit = client_a.tick(
+        GAME_ID, auto_handoff_operation_id="e3e3e3e3-e3e3-4e3e-8e3e-e3e3e3e3e3e3"
+    )
+    assert commit.protocol_sequence == 1
+    identity_a = _associated_identity(client_a)
+    assert supervisor_a.close_requests == [identity_a]
+    assert machine.is_running(identity_a)
+    return client_a, client_b, supervisor_a, supervisor_b, identity_a
+
+
+def test_second_profile_waits_for_existing_civ_then_launches_once(
+    tmp_path: Path,
+) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    machine = FakeMachine()
+    client_a, client_b, supervisor_a, supervisor_b, identity_a = _two_profile_setup(
+        tmp_path, storage, clock, machine
+    )
+    acquisitions_before = len(machine.guard_acquisitions)
+
+    # B's Fully Managed tick defers: A's Civ is still closing.
+    snap_b = client_b.tick(GAME_ID)
+    assert snap_b.operational_state is OperationalState.MY_TURN_DOWNLOADED
+    assert supervisor_b.launched == []
+    status = client_b.process_status(GAME_ID)
+    assert status.status is ProcessStatus.WAITING_FOR_EXISTING_CIV
+    records_b = client_b.store.load_match_state_or_empty(GAME_ID)
+    # The launch-attempt key is not consumed and the foreign Civ is never
+    # adopted as this match's process.
+    assert records_b.launch_attempt is None
+    assert records_b.process_association is None
+    assert records_b.downloaded_save is not None
+
+    # One guarded attempt per ordinary tick — no busy retry loop.
+    assert len(machine.guard_acquisitions) == acquisitions_before + 1
+    client_b.tick(GAME_ID)
+    assert len(machine.guard_acquisitions) == acquisitions_before + 2
+    assert supervisor_b.launched == []
+
+    # Safety: the blocking foreign process is never focused, closed,
+    # terminated, or associated; ownership stays with B on the server.
+    assert supervisor_b.focus_requests == []
+    assert supervisor_b.close_requests == []
+    assert supervisor_b.terminations == []
+    assert machine.is_running(identity_a)
+    assert snap_b.protocol_sequence == 1
+    assert snap_b.current_player_id == "player_b"
+
+    # After A's Civ finally exits, B's next ordinary tick launches once.
+    supervisor_a.mark_exited(identity_a)
+    snap_launched = client_b.tick(GAME_ID)
+    assert snap_launched.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor_b.launched) == 1
+    assert client_b.process_status(GAME_ID).status is ProcessStatus.RUNNING
+    records_after = client_b.store.load_match_state_or_empty(GAME_ID)
+    assert records_after.process_association is not None
+    assert records_after.launch_attempt is not None
+
+    # Exactly once: further ticks never spawn a duplicate.
+    client_b.tick(GAME_ID)
+    client_b.tick(GAME_ID)
+    assert len(supervisor_b.launched) == 1
+    client_a.close()
+    client_b.close()
+
+
+def test_standard_profile_blocked_start_never_surprise_launches(
+    tmp_path: Path,
+) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    machine = FakeMachine()
+    client_a, client_b, supervisor_a, supervisor_b, identity_a = _two_profile_setup(
+        tmp_path, storage, clock, machine, mode_b=TurnHandlingMode.STANDARD
+    )
+
+    client_b.tick(GAME_ID)
+    assert supervisor_b.launched == []
+
+    # An explicit Start while A's Civ still runs is reported and deferred.
+    deferred = client_b.request_start(GAME_ID)
+    assert deferred.operational_state is OperationalState.MY_TURN_DOWNLOADED
+    assert supervisor_b.launched == []
+    status = client_b.process_status(GAME_ID)
+    assert status.status is ProcessStatus.WAITING_FOR_EXISTING_CIV
+    records_b = client_b.store.load_match_state_or_empty(GAME_ID)
+    assert records_b.launch_attempt is None
+
+    # No silently scheduled auto-launch on later ticks — not even after
+    # the existing Civ exits.
+    client_b.tick(GAME_ID)
+    client_b.tick(GAME_ID)
+    supervisor_a.mark_exited(identity_a)
+    client_b.tick(GAME_ID)
+    assert supervisor_b.launched == []
+
+    # A second explicit Start now launches normally.
+    started = client_b.request_start(GAME_ID)
+    assert started.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor_b.launched) == 1
+    assert client_b.process_status(GAME_ID).status is ProcessStatus.RUNNING
+    client_a.close()
+    client_b.close()
 
 
 def test_focus_verifies_identity_before_acting(tmp_path: Path) -> None:

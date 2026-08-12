@@ -28,10 +28,10 @@ from civ4_turn_relay.process import (
     CloseRequestResult,
     FocusOutcome,
     FocusResult,
-    LaunchOutcome,
+    GuardedLaunchOutcome,
+    GuardedLaunchResult,
     LaunchPlan,
     LaunchPlanOutcome,
-    LaunchResult,
     ProbeOutcome,
     ProbeResult,
     ProcessIdentity,
@@ -51,6 +51,7 @@ class ProcessStatus(Enum):
     READY = "ready"
     STARTING = "starting"
     RUNNING = "running"
+    WAITING_FOR_EXISTING_CIV = "waiting_for_existing_civ"
     CLOSE_REQUESTED = "close_requested"
     CLOSE_DEADLINE_ELAPSED = "close_deadline_elapsed"
     SAFELY_CLOSED = "safely_closed"
@@ -143,6 +144,7 @@ class ProcessCoordinator:
         self._session_running = False
         self._launch_failure_message: str | None = None
         self._launch_blocked_reason: str | None = None
+        self._launch_deferred_message: str | None = None
         self._mismatched_keys: set[tuple[int, int, str]] = set()
         self._mismatch_message: str | None = None
         self._close_identity: ProcessIdentity | None = None
@@ -195,13 +197,20 @@ class ProcessCoordinator:
                 self._session_running = False
         return result
 
-    def attempt_launch(self, plan: LaunchPlan) -> LaunchResult | None:
-        """Launch a READY plan unless a duplicate guard applies.
+    def attempt_launch(self, plan: LaunchPlan) -> GuardedLaunchResult | None:
+        """Run the guarded launch for a READY plan unless refused locally.
 
         ``None`` means the launch was refused locally without spawning:
         either the plan was not READY (the refusal reason is recorded for
         the status snapshot) or a launch is already in flight / the
         session's process is already running.
+
+        Every actual launch goes through the supervisor's guarded launch:
+        an interprocess guard serializes Relay instances and a machine scan
+        for the exact configured executable runs before the spawn. A
+        deferred outcome (existing Civ, busy guard, indeterminate scan) is
+        not a failure: it is recorded as a typed waiting status and a later
+        ordinary tick may retry.
         """
         if plan.outcome is not LaunchPlanOutcome.READY or plan.command is None:
             self._launch_blocked_reason = plan.reason
@@ -210,21 +219,33 @@ class ProcessCoordinator:
             return None
         self._launch_in_flight = True
         try:
-            result = self._supervisor.launch(plan.command)
+            result = self._supervisor.guarded_launch(plan.command)
         finally:
             self._launch_in_flight = False
-        if result.outcome is LaunchOutcome.LAUNCHED and result.identity is not None:
+        if (
+            result.outcome is GuardedLaunchOutcome.LAUNCHED
+            and result.identity is not None
+        ):
             self._session_identity = result.identity
             self._session_running = True
             self._launch_failure_message = None
             self._launch_blocked_reason = None
+            self._launch_deferred_message = None
             self._close_identity = None
             self._close_deadline = None
             self._force_close_attempted = False
             self._safely_closed = False
+        elif result.deferred:
+            self._launch_deferred_message = result.message or result.outcome.value
+            self._launch_failure_message = None
         else:
             self._launch_failure_message = result.message or result.outcome.value
+            self._launch_deferred_message = None
         return result
+
+    def clear_launch_deferral(self) -> None:
+        """Forget a deferred-launch status once no launch is wanted anymore."""
+        self._launch_deferred_message = None
 
     def request_close(
         self,
@@ -366,6 +387,12 @@ class ProcessCoordinator:
             return ProcessStatusSnapshot(
                 status=ProcessStatus.STARTING,
                 message="launching Civilization",
+                force_close_allowed=force_close_allowed,
+            )
+        if self._launch_deferred_message is not None:
+            return ProcessStatusSnapshot(
+                status=ProcessStatus.WAITING_FOR_EXISTING_CIV,
+                message=self._launch_deferred_message,
                 force_close_allowed=force_close_allowed,
             )
         if (
