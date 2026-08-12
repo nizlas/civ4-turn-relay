@@ -20,7 +20,7 @@ _SHUTDOWN_NODE_IDS = (
     "tests/ui/test_tray_and_quit.py::test_quit_when_idle_needs_no_confirmation",
     "tests/ui/test_tray_and_quit.py::test_shutdown_is_idempotent_and_blocks_further_commands",
     "tests/ui/test_controller.py::test_shutdown_stops_thread_and_is_idempotent",
-    "tests/ui/test_tray_and_quit.py::test_about_to_quit_triggers_shutdown",
+    "tests/ui/test_tray_and_quit.py::test_successful_gated_quit_authorizes_application_exit",
 )
 
 

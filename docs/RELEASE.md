@@ -127,19 +127,25 @@ whether to sign).
 
 Orderly shutdown now:
 
-1. Stops the worker-owned poll timer on the worker thread
-2. Joins the worker before closing `RelayClient` (never uses `QThread.terminate()`)
-3. On join timeout: keeps Relay open, leaves `RelayClient` open, shows a
-   diagnostic, and allows Quit to be retried after the in-flight operation
-4. Destroys the worker via `QThread.finished → deleteLater` (not a post-join
+1. `GatedQApplication` gates ordinary `quit()`/`exit()` and `QEvent.Quit`,
+   running the same pre-quit path as tray/menu/window Quit (`request_quit`)
+2. `setQuitOnLastWindowClosed(False)` so last-window-close cannot bypass the gate
+3. Stops the worker-owned poll timer on the worker thread
+4. Joins the worker before closing `RelayClient` (never uses `QThread.terminate()`)
+5. On join timeout: ignores/defers the Quit event, keeps Relay open, leaves
+   `RelayClient` open, shows a diagnostic, and allows Quit to be retried
+6. Destroys the worker via `QThread.finished → deleteLater` (not a post-join
    GUI-thread `deleteLater`)
-5. Disconnects queued signals and disposes tray/menu on the Qt thread only
-   after a successful join
-6. Hooks `QApplication.aboutToQuit`
+7. `aboutToQuit` only runs idempotent cleanup after orderly shutdown already
+   completed — it never closes `RelayClient` while the worker may still run
+8. `main()` calls `finalize_after_exec()` only when orderly shutdown completed
+
+**Limitation:** an OS-forced process kill or session teardown cannot be vetoed
+by this gate. That is not treated as a successful orderly shutdown.
 
 Automated coverage:
 
-- In-process UI shutdown tests under `tests/ui/` (including join-timeout + retry)
+- In-process UI shutdown tests under `tests/ui/` (join-timeout, Quit-event deferral, retry)
 - Fresh-interpreter checks in `tests/ui/test_teardown_subprocess.py`
 
 **Windows stress (manual / CI agent with GUI stack):**

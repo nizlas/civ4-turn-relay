@@ -703,12 +703,14 @@ consent, and close-failure-is-not-protocol-failure presentation. P8's
 prerequisite is "P7 complete", so this phase cannot be marked COMPLETE until
 the P7 manual Windows smoke test is performed. P7 stays the sole ACTIVE phase.
 
-Teardown hardening (2026-08-12): quit/shutdown stops the worker-owned timer on
-the worker thread, joins before `RelayClient.close()`, never calls
-`QThread.terminate()`, surfaces join timeouts without quitting the app or
-closing the client, destroys the worker via `QThread.finished → deleteLater`,
-disposes tray/menu on the Qt thread after a successful join, and hooks
-`QApplication.aboutToQuit`. Fresh-interpreter coverage lives in
+Teardown hardening (2026-08-12): `GatedQApplication` gates ordinary
+`quit()`/`exit()` and `QEvent.Quit` through the same pre-quit path as
+tray/menu/window Quit; `setQuitOnLastWindowClosed(False)`; join before
+`RelayClient.close()`;
+never `QThread.terminate()`; join timeouts defer Quit and keep the client open;
+worker destruction via `QThread.finished → deleteLater`; `aboutToQuit` is
+idempotent cleanup only after orderly shutdown (never the join gate). OS-forced
+process kill cannot be vetoed. Fresh-interpreter coverage:
 `tests/ui/test_teardown_subprocess.py`; Windows stress:
 `packaging/tools/run_ui_teardown_stress.ps1`. Until that stress run is green
 on a real Windows agent, treat intermittent PySide6 interpreter-teardown heap

@@ -6,6 +6,12 @@ flows. ``main()`` stays thin: it loads configuration (errors surface in the
 UI instead of crashing), builds the production adapters, and runs the Qt
 event loop. Quitting never terminates Civilization and never touches match
 state.
+
+Ordinary Qt quit is gated by :class:`GatedQApplication` before
+``QApplication.quit`` is allowed to tear down the process. A join timeout
+keeps Relay open for a later retry. OS-forced process kill / session teardown
+cannot be vetoed by this gate and is documented as an unavoidable limitation,
+not as a successful orderly shutdown.
 """
 
 from __future__ import annotations
@@ -15,6 +21,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from civ4_turn_relay.app.config_load import load_global_config
@@ -51,6 +58,97 @@ _SHUTDOWN_TIMEOUT_MESSAGE = (
     "Civilization was NOT closed and match state was not changed. Wait "
     "for the operation to finish, then choose Quit again."
 )
+
+
+class GatedQApplication(QApplication):
+    """QApplication that defers ordinary quit until Relay authorizes exit.
+
+    Installs a Python-level ``quit`` wrapper on this subclass (PySide's C++
+    ``quit`` binding does not reliably enter a Python ``exit`` override),
+    overrides instance ``exit``, and handles ``QEvent.Quit``. OS-forced
+    process termination and session teardown are outside this gate and cannot
+    be blocked.
+    """
+
+    _quit_wrapper_installed = False
+
+    def __init__(self, argv: list[str]) -> None:
+        super().__init__(argv)
+        self.setQuitOnLastWindowClosed(False)
+        self._quit_gate: Callable[[], None] | None = None
+        self._quit_authorized = False
+        self._handling_quit_gate = False
+        self._install_quit_wrapper()
+
+    @classmethod
+    def _install_quit_wrapper(cls) -> None:
+        if cls._quit_wrapper_installed:
+            return
+        cls._quit_wrapper_installed = True
+
+        def quit() -> None:
+            app = QApplication.instance()
+            if isinstance(app, GatedQApplication):
+                app._request_gated_exit(0)
+                return
+            # No gated app (should not happen in production main).
+            QApplication.exit(0)
+
+        cls.quit = staticmethod(quit)  # type: ignore[method-assign]
+
+    def set_quit_gate(self, gate: Callable[[], None] | None) -> None:
+        """Register the coordinator callback invoked on unauthorized quit."""
+        self._quit_gate = gate
+
+    def authorize_quit(self) -> None:
+        """Permit process exit after orderly shutdown succeeded."""
+        self._quit_authorized = True
+
+    def reset_quit_authorization(self) -> None:
+        """Test helper: clear authorization and the quit gate callback."""
+        self._quit_authorized = False
+        self._quit_gate = None
+        self._handling_quit_gate = False
+
+    @property
+    def quit_authorized(self) -> bool:
+        return self._quit_authorized
+
+    def exit(self, returnCode: int | None = 0) -> None:  # type: ignore[override]
+        code = 0 if returnCode is None else int(returnCode)
+        self._request_gated_exit(code)
+
+    def event(self, event: QEvent) -> bool:  # noqa: A003 — Qt API
+        if event.type() is not QEvent.Type.Quit:
+            return super().event(event)
+        if self._quit_authorized:
+            return super().event(event)
+        # Session-manager / platform Quit request: same gate as quit()/exit().
+        self._run_quit_gate()
+        if self._quit_authorized:
+            return super().event(event)
+        return True
+
+    def _request_gated_exit(self, return_code: int) -> None:
+        if self._quit_authorized:
+            super().exit(return_code)
+            return
+        self._run_quit_gate()
+        if self._quit_authorized:
+            super().exit(return_code)
+        # JOIN_TIMED_OUT / declined: do not exit the event loop.
+
+    def _run_quit_gate(self) -> None:
+        if self._quit_authorized or self._handling_quit_gate:
+            return
+        gate = self._quit_gate
+        if gate is None:
+            return
+        self._handling_quit_gate = True
+        try:
+            gate()
+        finally:
+            self._handling_quit_gate = False
 
 
 class _UnconfiguredStorage:
@@ -123,6 +221,11 @@ class RelayApplication:
         self._configs: dict[str, MatchConfig] = {}
         self._shut_down = False
 
+        app = QApplication.instance()
+        if app is not None:
+            # Last-window-close must not bypass the pre-quit worker join gate.
+            QApplication.setQuitOnLastWindowClosed(False)
+
         self.hub = hub if hub is not None else RelayWorkerHub(client)
         self.window = MainWindow(self.hub, save_directory_provider=self._pbem_dir_for)
         self.hub.snapshot_ready.connect(self.window.on_snapshot)
@@ -137,9 +240,11 @@ class RelayApplication:
         if enable_tray and RelayTray.is_available():
             self.tray = RelayTray(on_open=self._show_window, on_quit=self.request_quit)
             self.window.set_tray_available(True)
-            app = QApplication.instance()
-            if app is not None:
-                QApplication.setQuitOnLastWindowClosed(False)
+
+    @property
+    def orderly_shutdown_complete(self) -> bool:
+        """True after a successful gated shutdown closed the worker client."""
+        return self._shut_down and self.hub.client_closed
 
     # ----- lifecycle ----------------------------------------------------
 
@@ -147,9 +252,12 @@ class RelayApplication:
         """Open stored matches through the hub, start polling, show the UI."""
         app = QApplication.instance()
         if app is not None:
-            # Ensure every quit path (last-window-close, tray, OS) joins the
-            # worker before Qt begins tearing down widgets.
-            app.aboutToQuit.connect(self.shutdown)
+            QApplication.setQuitOnLastWindowClosed(False)
+            if isinstance(app, GatedQApplication):
+                app.set_quit_gate(self._on_quit_event)
+            # aboutToQuit is too late to enforce JOIN_TIMED_OUT "stay open".
+            # Only run idempotent cleanup when orderly shutdown already finished.
+            app.aboutToQuit.connect(self._about_to_quit_cleanup)
         store = self._client.store
         for game_id in store.list_match_ids():
             try:
@@ -170,11 +278,13 @@ class RelayApplication:
     def request_quit(self) -> None:
         """Quit flow: confirm while active, then shut down cleanly.
 
-        Does not call ``QApplication.quit`` until the worker has joined
+        Does not authorize ``QApplication`` exit until the worker has joined
         successfully. A timed-out join keeps Relay open for a later retry and
         never terminates Civilization.
         """
         if self._shut_down:
+            self._authorize_application_quit()
+            self._quit_fn()
             return
         if self.window.has_active_match():
             answer = QMessageBox.question(
@@ -188,6 +298,7 @@ class RelayApplication:
                 return
         result = self.shutdown()
         if result.succeeded:
+            self._authorize_application_quit()
             self._quit_fn()
             return
         QMessageBox.warning(
@@ -227,6 +338,31 @@ class RelayApplication:
             tray.dispose()
         self.window.close()
         return result
+
+    def finalize_after_exec(self) -> None:
+        """Idempotent post-``exec`` cleanup only after orderly shutdown.
+
+        Must not close ``RelayClient`` when ``exec`` returned without a gated
+        successful quit (for example an ungated or OS-forced teardown).
+        """
+        if not self.orderly_shutdown_complete:
+            return
+        self.hub.shutdown()
+
+    def _on_quit_event(self) -> None:
+        """GatedQApplication Quit callback: same pre-quit gate as UI Quit."""
+        self.request_quit()
+
+    def _about_to_quit_cleanup(self) -> None:
+        """Idempotent finalization only; never close a live worker's client."""
+        if not self._shut_down:
+            return
+        self.hub.shutdown()
+
+    def _authorize_application_quit(self) -> None:
+        app = QApplication.instance()
+        if isinstance(app, GatedQApplication):
+            app.authorize_quit()
 
     # ----- coordinator actions ------------------------------------------
 
@@ -358,9 +494,10 @@ def _find_env_example() -> Path | None:
 
 def main() -> int:
     """GUI entry point (``civ4-turn-relay-ui``)."""
-    app = QApplication(sys.argv)
+    app = GatedQApplication(sys.argv)
     app.setApplicationName("civ4-turn-relay")
     app.setOrganizationName("civ4-turn-relay")
+    app.setQuitOnLastWindowClosed(False)
 
     data_dir = user_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -425,8 +562,7 @@ def main() -> int:
     if startup_error is not None:
         relay.window.on_error(startup_error)
     relay.start()
-    # aboutToQuit → shutdown is wired in start(); call again after exec for
-    # idempotent cleanup if the loop exited without emitting aboutToQuit.
     exit_code = app.exec()
-    relay.shutdown()
+    # Never close RelayClient here unless the gated quit already completed.
+    relay.finalize_after_exec()
     return int(exit_code)

@@ -101,6 +101,11 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.quit_requested.emit)
+        file_menu.addAction(quit_action)
+
         match_menu = menu_bar.addMenu("&Match")
         add_action = QAction("Add match…", self)
         add_action.triggered.connect(self._on_add_match)
