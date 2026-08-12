@@ -73,6 +73,7 @@ To inspect the command without launching, call `RelayClient.launch_preview(game_
 
 - Process identity is always the triple **PID + precise process creation token (`process_create_time_ns`, the high-resolution creation time reported by the process backend) + normalized executable path**. A human-readable second-resolution UTC start timestamp is kept for diagnostics but is never the equality check, so even a PID recycled within the same wall-clock second is detected as a different process. Relay never acts on a PID alone.
 - Relay never attaches to, focuses, or closes a manually launched Civilization process — only the exact process it launched and verified.
+- Before every launch, an OS-backed cross-instance guard defers the launch while any Civilization of the configured executable is still running anywhere on the computer — see [Cross-instance launch guard](#cross-instance-launch-guard-one-civilization-per-computer).
 - A graceful close (a normal Windows close request) is issued only after the turn is authoritatively committed on the server, or a retry is proven to be an idempotent acknowledgement.
 - After requesting a close, Relay waits 15 seconds. If Civilization is still open it shows **"Turn safely sent, but Civilization did not close."** with manual **Focus** and **Close** fallback buttons.
 - Force close is an advanced per-match opt-in (default off), available only in fully managed mode, and fires at most once — only after the graceful deadline elapsed *and* the durable post-commit entitlement *and* the exact process identity are re-verified.
@@ -80,6 +81,87 @@ To inspect the command without launching, call `RelayClient.launch_preview(game_
 - A process failure (close refused, deadline elapsed, Relay restart) never changes or rolls back an already committed turn.
 
 Normative closing policy and force-close rules: [`DESIGN_SPEC.md` §8.5](DESIGN_SPEC.md#85-turn-handling-modes).
+
+## Cross-instance launch guard (one Civilization per computer)
+
+Civilization IV cannot meaningfully run twice on one computer, and one PC
+often hosts more than one Relay context: several matches in one Relay, or two
+isolated Relay profiles (for example one per household player) connected to
+the same server. Without coordination, the moment player A commits a turn and
+their Civ is still gracefully closing, player B's Relay could download the
+new turn and start a second `Civ4BeyondSword.exe`.
+
+Every Civ launch therefore runs as one **guarded launch** operation:
+
+1. Acquire a short-lived interprocess launch guard — a Windows named mutex
+   whose name is derived from a SHA-256 digest of the normalized executable
+   path (`Local\civ4-turn-relay-launch-<digest>`), so all Relay instances in
+   the same Windows session targeting the same Civ installation share one
+   guard.
+2. While holding the guard, scan the machine's processes for the exact
+   configured Civ executable (normalized absolute path, case-insensitive).
+3. If a matching process is already running, release the guard and **defer**:
+   nothing is spawned, and the existing process is never focused, closed,
+   terminated, adopted, or associated with the match.
+4. Only when the scan is clear does Relay spawn Civilization, verify the
+   spawned process identity, persist the association, and release the guard.
+
+The check and the spawn are never two separate unprotected steps, so two
+Relay instances can never both pass the check and both launch. If Windows
+reports the guard was abandoned by a crashed Relay, ownership is recovered
+(the OS never leaves a stale lock) but a fresh process scan still runs before
+any spawn.
+
+A deferred launch is a typed waiting status, not a failure. The three
+deferral reasons stay distinct:
+
+- **Existing Civilization** (`WAITING_FOR_EXISTING_CIV`): the UI shows
+  **"Your turn is ready — waiting for Civilization to close."**
+- **Busy launch guard** (`WAITING_FOR_LAUNCH_GUARD`): another Relay instance
+  in this Windows session is currently checking or launching Civilization.
+- **Indeterminate scan** (`LAUNCH_SCAN_INDETERMINATE`): a process looks like
+  the configured executable but its path could not be verified. The UI shows
+  that diagnostic rather than claiming Civilization is already running.
+
+In every deferred case:
+
+- The verified downloaded turn stays ready, and the durable one-launch-per-
+  turn key is not consumed — the deferral never counts as a launch.
+- **Fully managed:** Relay retries the guarded launch on later ordinary polls
+  and launches exactly once when the blocker is gone — no user click needed
+  and no rapid retry loop (one attempt per poll tick).
+- **Standard:** Relay never schedules a silent automatic launch; press Start
+  again after the blocker has cleared.
+
+Scan defensiveness: unrelated processes whose executables cannot be read
+never block a launch; a process that *looks like* the Civ executable by name
+but cannot be verified fails closed (launch deferred) rather than risking a
+second instance; processes disappearing mid-scan are ignored.
+
+**Limitation:** the guard serializes Relay instances only. It cannot prevent
+a user or an unrelated external program from manually starting Civilization
+at the same moment outside Relay; the scan narrows that window but cannot
+eliminate it.
+
+### Two-profile self-test on one PC
+
+A realistic end-to-end rehearsal of a two-player household setup, using a
+disposable test server and test saves only (never a live match or real
+credentials):
+
+1. Start two isolated Relay instances, each with its own data directory —
+   for example by launching each from a shell with a different `%APPDATA%`
+   value so their local stores never overlap.
+2. Join both profiles (as different players) to the same disposable match,
+   both pointing at the same Civ executable but at separate PBEM save
+   folders.
+3. Let profile A launch Civilization and commit a test turn while keeping
+   Civilization open (or closing it slowly).
+4. Confirm profile B downloads the new turn but shows
+   *"Your turn is ready — waiting for Civilization to close."* instead of
+   starting a second Civilization.
+5. Close A's Civilization and confirm B launches exactly once on a later
+   poll (fully managed) or after pressing Start again (standard).
 
 ## Tray and background behavior
 

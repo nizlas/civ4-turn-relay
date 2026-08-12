@@ -48,6 +48,7 @@ from civ4_turn_relay.local import (
     ReconcileResult,
     SystemClock,
     attribute_handoff_result,
+    emit_diagnostic,
     observe_outgoing_candidates,
     reconcile_match,
     revalidate_candidate_file,
@@ -57,7 +58,8 @@ from civ4_turn_relay.process import (
     CloseRequestResult,
     FocusOutcome,
     FocusResult,
-    LaunchOutcome,
+    GuardedLaunchOutcome,
+    GuardedLaunchResult,
     LaunchPlan,
     ProbeOutcome,
     ProcessIdentity,
@@ -824,6 +826,43 @@ class RelayClient:
 
         self._store.update_match_state(game_id, mutate)
 
+    def _clear_launch_attempt(self, game_id: str) -> None:
+        """Restore the launch-attempt key after a deferred guarded launch.
+
+        A deferred launch (existing Civ, busy guard, indeterminate scan)
+        spawned nothing, so the durable one-launch-per-sequence/hash key
+        written alongside the START_CIV intent must not stay consumed.
+        """
+
+        def mutate(records: MatchLocalRecords) -> MatchLocalRecords:
+            return replace(records, launch_attempt=None)
+
+        self._store.update_match_state(game_id, mutate)
+
+    def _note_guard_cleanup_failure(
+        self, session: _MatchSession, launch: GuardedLaunchResult
+    ) -> None:
+        """Surface a held-guard cleanup failure without changing launch outcome."""
+        if not launch.cleanup_failed:
+            return
+        diagnostic = emit_diagnostic(
+            "launch_guard_cleanup_failed",
+            fields={
+                "cleanup_outcome": (
+                    launch.cleanup_outcome.value
+                    if launch.cleanup_outcome is not None
+                    else "unknown"
+                ),
+                "launch_outcome": launch.outcome.value,
+            },
+            message=launch.cleanup_message or "launch-guard cleanup failed",
+        )
+        if session.last_reconcile is not None:
+            session.last_reconcile = replace(
+                session.last_reconcile,
+                diagnostics=(*session.last_reconcile.diagnostics, diagnostic),
+            )
+
     def _act_on_process_intents(
         self,
         session: _MatchSession,
@@ -843,7 +882,7 @@ class RelayClient:
                 launch = coordinator.attempt_launch(plan)
                 if (
                     launch is not None
-                    and launch.outcome is LaunchOutcome.LAUNCHED
+                    and launch.outcome is GuardedLaunchOutcome.LAUNCHED
                     and launch.identity is not None
                 ):
                     self._persist_process_association(game_id, launch.identity)
@@ -852,6 +891,21 @@ class RelayClient:
                         observation_from_identity(launch.identity, running=True),
                     )
                     result = self.reconcile(game_id, now_utc=now_utc)
+                elif launch is not None and launch.deferred:
+                    # Nothing was spawned, adopted, or associated. The
+                    # reconcile that emitted START_CIV already persisted the
+                    # durable launch-attempt key; restore it so the deferral
+                    # never counts as a consumed launch and a later ordinary
+                    # tick (or explicit Start) retries the guarded launch.
+                    self._clear_launch_attempt(game_id)
+                if launch is not None:
+                    self._note_guard_cleanup_failure(session, launch)
+        elif result.operational_state not in {
+            OperationalState.WAITING_FOR_MY_FIRST_SAVE,
+            OperationalState.MY_TURN_DOWNLOADED,
+        }:
+            # No launch is wanted anymore; drop any stale waiting status.
+            coordinator.clear_launch_deferral()
         close_intent = next(
             (
                 intent

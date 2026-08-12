@@ -16,9 +16,8 @@ is re-armed once from the current clock.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, unique
 
 from civ4_turn_relay.local.clock import Clock
@@ -28,16 +27,17 @@ from civ4_turn_relay.process import (
     CloseRequestResult,
     FocusOutcome,
     FocusResult,
-    LaunchOutcome,
+    GuardedLaunchOutcome,
+    GuardedLaunchResult,
     LaunchPlan,
     LaunchPlanOutcome,
-    LaunchResult,
     ProbeOutcome,
     ProbeResult,
     ProcessIdentity,
     ProcessSupervisor,
     SupervisorAvailability,
     TerminateResult,
+    normalize_windows_executable,
 )
 
 GRACEFUL_CLOSE_DEADLINE_SECONDS: float = 15.0
@@ -51,6 +51,9 @@ class ProcessStatus(Enum):
     READY = "ready"
     STARTING = "starting"
     RUNNING = "running"
+    WAITING_FOR_EXISTING_CIV = "waiting_for_existing_civ"
+    WAITING_FOR_LAUNCH_GUARD = "waiting_for_launch_guard"
+    LAUNCH_SCAN_INDETERMINATE = "launch_scan_indeterminate"
     CLOSE_REQUESTED = "close_requested"
     CLOSE_DEADLINE_ELAPSED = "close_deadline_elapsed"
     SAFELY_CLOSED = "safely_closed"
@@ -68,6 +71,7 @@ class ProcessStatusSnapshot:
     launch_blocked_reason: str | None = None
     force_close_allowed: bool = False
     close_deadline_remaining_seconds: float | None = None
+    cleanup_warning: str | None = None
 
 
 def _identity_key(identity: ProcessIdentity) -> tuple[int, int, str]:
@@ -79,7 +83,7 @@ def _identity_key(identity: ProcessIdentity) -> tuple[int, int, str]:
     return (
         identity.pid,
         identity.process_create_time_ns,
-        os.path.normpath(identity.executable_path).casefold(),
+        normalize_windows_executable(identity.executable_path),
     )
 
 
@@ -143,6 +147,8 @@ class ProcessCoordinator:
         self._session_running = False
         self._launch_failure_message: str | None = None
         self._launch_blocked_reason: str | None = None
+        self._launch_deferred_outcome: GuardedLaunchOutcome | None = None
+        self._launch_deferred_message: str | None = None
         self._mismatched_keys: set[tuple[int, int, str]] = set()
         self._mismatch_message: str | None = None
         self._close_identity: ProcessIdentity | None = None
@@ -150,6 +156,7 @@ class ProcessCoordinator:
         self._close_deadline: float | None = None
         self._force_close_attempted = False
         self._safely_closed = False
+        self._cleanup_warning: str | None = None
 
     @property
     def civ4_executable(self) -> str | None:
@@ -195,13 +202,20 @@ class ProcessCoordinator:
                 self._session_running = False
         return result
 
-    def attempt_launch(self, plan: LaunchPlan) -> LaunchResult | None:
-        """Launch a READY plan unless a duplicate guard applies.
+    def attempt_launch(self, plan: LaunchPlan) -> GuardedLaunchResult | None:
+        """Run the guarded launch for a READY plan unless refused locally.
 
         ``None`` means the launch was refused locally without spawning:
         either the plan was not READY (the refusal reason is recorded for
         the status snapshot) or a launch is already in flight / the
         session's process is already running.
+
+        Every actual launch goes through the supervisor's guarded launch:
+        an interprocess guard serializes Relay instances and a machine scan
+        for the exact configured executable runs before the spawn. A
+        deferred outcome (existing Civ, busy guard, indeterminate scan) is
+        not a failure: it is recorded as a typed waiting status and a later
+        ordinary tick may retry.
         """
         if plan.outcome is not LaunchPlanOutcome.READY or plan.command is None:
             self._launch_blocked_reason = plan.reason
@@ -210,21 +224,45 @@ class ProcessCoordinator:
             return None
         self._launch_in_flight = True
         try:
-            result = self._supervisor.launch(plan.command)
+            result = self._supervisor.guarded_launch(plan.command)
         finally:
             self._launch_in_flight = False
-        if result.outcome is LaunchOutcome.LAUNCHED and result.identity is not None:
+        if (
+            result.outcome is GuardedLaunchOutcome.LAUNCHED
+            and result.identity is not None
+        ):
             self._session_identity = result.identity
             self._session_running = True
             self._launch_failure_message = None
             self._launch_blocked_reason = None
+            self._launch_deferred_outcome = None
+            self._launch_deferred_message = None
             self._close_identity = None
             self._close_deadline = None
             self._force_close_attempted = False
             self._safely_closed = False
+        elif result.deferred:
+            self._launch_deferred_outcome = result.outcome
+            self._launch_deferred_message = result.message or result.outcome.value
+            self._launch_failure_message = None
         else:
             self._launch_failure_message = result.message or result.outcome.value
+            self._launch_deferred_outcome = None
+            self._launch_deferred_message = None
+        if result.cleanup_failed:
+            self._cleanup_warning = result.cleanup_message or (
+                result.cleanup_outcome.value
+                if result.cleanup_outcome is not None
+                else "launch-guard cleanup failed"
+            )
+        else:
+            self._cleanup_warning = None
         return result
+
+    def clear_launch_deferral(self) -> None:
+        """Forget a deferred-launch status once no launch is wanted anymore."""
+        self._launch_deferred_outcome = None
+        self._launch_deferred_message = None
 
     def request_close(
         self,
@@ -342,6 +380,19 @@ class ProcessCoordinator:
         force_close_allowed: bool,
     ) -> ProcessStatusSnapshot:
         """Compute the typed status; probes here are read-only fact checks."""
+        snapshot = self._status_snapshot(
+            association=association, force_close_allowed=force_close_allowed
+        )
+        if self._cleanup_warning:
+            return replace(snapshot, cleanup_warning=self._cleanup_warning)
+        return snapshot
+
+    def _status_snapshot(
+        self,
+        *,
+        association: ProcessIdentity | None,
+        force_close_allowed: bool,
+    ) -> ProcessStatusSnapshot:
         availability = self._supervisor.availability()
         if not availability.available:
             return ProcessStatusSnapshot(
@@ -366,6 +417,39 @@ class ProcessCoordinator:
             return ProcessStatusSnapshot(
                 status=ProcessStatus.STARTING,
                 message="launching Civilization",
+                force_close_allowed=force_close_allowed,
+            )
+        if self._launch_deferred_outcome is GuardedLaunchOutcome.EXISTING_CIV_DETECTED:
+            return ProcessStatusSnapshot(
+                status=ProcessStatus.WAITING_FOR_EXISTING_CIV,
+                message=(
+                    self._launch_deferred_message
+                    or "Your turn is ready — waiting for Civilization to close."
+                ),
+                force_close_allowed=force_close_allowed,
+            )
+        if self._launch_deferred_outcome is GuardedLaunchOutcome.GUARD_BUSY:
+            return ProcessStatusSnapshot(
+                status=ProcessStatus.WAITING_FOR_LAUNCH_GUARD,
+                message=(
+                    self._launch_deferred_message
+                    or (
+                        "another Relay instance is currently checking or "
+                        "launching Civilization"
+                    )
+                ),
+                force_close_allowed=force_close_allowed,
+            )
+        if self._launch_deferred_outcome is GuardedLaunchOutcome.SCAN_INDETERMINATE:
+            return ProcessStatusSnapshot(
+                status=ProcessStatus.LAUNCH_SCAN_INDETERMINATE,
+                message=(
+                    self._launch_deferred_message
+                    or (
+                        "Relay cannot safely determine whether Civilization "
+                        "is already running"
+                    )
+                ),
                 force_close_allowed=force_close_allowed,
             )
         if (
