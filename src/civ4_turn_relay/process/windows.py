@@ -104,7 +104,8 @@ def _visible_top_level_windows(pid: int) -> list[int]:
     import ctypes
     from ctypes import wintypes
 
-    user32 = ctypes.windll.user32
+    # windll / WINFUNCTYPE exist only on Windows; stubs omit them on Linux.
+    user32 = getattr(ctypes, "windll").user32
     handles: list[int] = []
 
     def _collect(hwnd: int, _lparam: int) -> bool:
@@ -114,7 +115,8 @@ def _visible_top_level_windows(pid: int) -> list[int]:
             handles.append(hwnd)
         return True
 
-    enum_callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(
+    win_func_type = getattr(ctypes, "WINFUNCTYPE")
+    enum_callback = win_func_type(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(
         _collect
     )
     user32.EnumWindows(enum_callback, 0)
@@ -145,7 +147,7 @@ class RealWindowsBackend:
     def post_close_to_windows(self, pid: int) -> bool:
         import ctypes
 
-        user32 = ctypes.windll.user32
+        user32 = getattr(ctypes, "windll").user32
         posted = False
         for hwnd in _visible_top_level_windows(pid):
             if user32.PostMessageW(hwnd, _WM_CLOSE, 0, 0):
@@ -155,7 +157,7 @@ class RealWindowsBackend:
     def focus_window(self, pid: int) -> bool:
         import ctypes
 
-        user32 = ctypes.windll.user32
+        user32 = getattr(ctypes, "windll").user32
         handles = _visible_top_level_windows(pid)
         if not handles:
             return False

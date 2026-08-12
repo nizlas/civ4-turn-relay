@@ -197,13 +197,16 @@ def test_close_event_hides_while_match_active_without_tray(qtbot: QtBot) -> None
     assert window.isHidden()
 
 
-def test_close_event_allows_close_when_idle_without_tray(qtbot: QtBot) -> None:
+def test_close_event_idle_without_tray_requests_quit(qtbot: QtBot) -> None:
     window, _dispatcher = _window(qtbot)
     window.set_tray_available(False)
     window.on_snapshot(_waiting_payload())
     assert not window.has_active_match()
     window.show()
-    assert window.close() is True
+    with qtbot.waitSignal(window.quit_requested, timeout=2_000):
+        # Idle close is funneled through the coordinator (worker joins first).
+        assert window.close() is False
+    assert window.isVisible()
 
 
 def test_allow_quit_bypasses_hide_to_tray(qtbot: QtBot) -> None:

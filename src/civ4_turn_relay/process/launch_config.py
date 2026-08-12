@@ -24,11 +24,26 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, unique
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from civ4_turn_relay.domain import DomainValidationError, validate_windows_local_path
 
 _MOD_TOKEN_FORBIDDEN_CHARS = frozenset("/\"':")
+
+
+def _absolute_parent_directory(path: str) -> str:
+    """Parent directory of an absolute Windows or POSIX path string.
+
+    ``PureWindowsPath`` alone turns POSIX ``/tmp/...`` parents into
+    ``\\tmp\\...`` (rooted, no drive), which fails validation on Linux CI.
+    """
+    windows = PureWindowsPath(path)
+    if windows.is_absolute():
+        return str(windows.parent)
+    posix = PurePosixPath(path)
+    if posix.is_absolute():
+        return str(posix.parent)
+    return str(Path(path).parent)
 
 
 def _validate_mod_token(value: str, *, field_path: str) -> str:
@@ -216,7 +231,7 @@ def build_launch_plan(
             executable_path=executable_path,
             mod_name=mod_name,
             save_path=save_path,
-            working_directory=str(PureWindowsPath(executable_path).parent),
+            working_directory=_absolute_parent_directory(executable_path),
         )
     except DomainValidationError as error:
         return LaunchPlan(

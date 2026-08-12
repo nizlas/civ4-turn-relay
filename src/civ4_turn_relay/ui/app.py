@@ -120,6 +120,7 @@ class RelayApplication:
         self.window.edit_match_requested.connect(self.edit_match)
         self.window.settings_requested.connect(self.show_settings)
         self.window.reload_requested.connect(self.reload_config)
+        self.window.quit_requested.connect(self.request_quit)
 
         self.tray: RelayTray | None = None
         if enable_tray and RelayTray.is_available():
@@ -133,6 +134,11 @@ class RelayApplication:
 
     def start(self) -> None:
         """Open stored matches through the hub, start polling, show the UI."""
+        app = QApplication.instance()
+        if app is not None:
+            # Ensure every quit path (last-window-close, tray, OS) joins the
+            # worker before Qt begins tearing down widgets.
+            app.aboutToQuit.connect(self.shutdown)
         store = self._client.store
         for game_id in store.list_match_ids():
             try:
@@ -152,6 +158,8 @@ class RelayApplication:
 
     def request_quit(self) -> None:
         """Quit flow: confirm while active, then shut down cleanly."""
+        if self._shut_down:
+            return
         if self.window.has_active_match():
             answer = QMessageBox.question(
                 self.window,
@@ -166,14 +174,28 @@ class RelayApplication:
         self._quit_fn()
 
     def shutdown(self) -> None:
-        """Stop timers, join the worker, close the client. Idempotent."""
+        """Stop timers, join the worker, dispose tray/window. Idempotent.
+
+        Never terminates Civilization and never mutates match ownership.
+        """
         if self._shut_down:
             return
         self._shut_down = True
         self.window.allow_quit()
-        if self.tray is not None:
-            self.tray.hide()
+        try:
+            self.hub.snapshot_ready.disconnect(self.window.on_snapshot)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self.hub.error.disconnect(self.window.on_error)
+        except (RuntimeError, TypeError):
+            pass
+        tray = self.tray
+        self.tray = None
+        if tray is not None:
+            tray.dispose()
         self.hub.shutdown()
+        self.window.close()
 
     # ----- coordinator actions ------------------------------------------
 
@@ -276,8 +298,19 @@ class RelayApplication:
             app.quit()
 
 
-def _user_data_dir() -> Path:
+def user_data_dir() -> Path:
+    """Per-user Relay data root (config, matches, installation identity).
+
+    On Windows this is ``%APPDATA%\\civ4-turn-relay``. When ``APPDATA`` is
+    unset (non-Windows / tests), ``~/civ4-turn-relay`` is used. Installers
+    and packaging docs MUST preserve this directory on upgrade and uninstall.
+    """
     return Path(os.environ.get("APPDATA", str(Path.home()))) / "civ4-turn-relay"
+
+
+def _user_data_dir() -> Path:
+    """Backward-compatible alias for :func:`user_data_dir`."""
+    return user_data_dir()
 
 
 def _find_dotenv(data_dir: Path) -> Path | None:
@@ -296,8 +329,9 @@ def main() -> int:
     """GUI entry point (``civ4-turn-relay-ui``)."""
     app = QApplication(sys.argv)
     app.setApplicationName("civ4-turn-relay")
+    app.setOrganizationName("civ4-turn-relay")
 
-    data_dir = _user_data_dir()
+    data_dir = user_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     dotenv_path = _find_dotenv(data_dir)
     env_example_path = _find_env_example()
@@ -360,6 +394,8 @@ def main() -> int:
     if startup_error is not None:
         relay.window.on_error(startup_error)
     relay.start()
+    # aboutToQuit → shutdown is wired in start(); call again after exec for
+    # idempotent cleanup if the loop exited without emitting aboutToQuit.
     exit_code = app.exec()
     relay.shutdown()
-    return exit_code
+    return int(exit_code)

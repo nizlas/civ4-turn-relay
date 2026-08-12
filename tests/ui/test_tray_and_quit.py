@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+from pytestqt.qtbot import QtBot
 
 from civ4_turn_relay.app import RelayClient
 from civ4_turn_relay.app.process_runtime import ProcessStatus
@@ -153,5 +154,46 @@ def test_quit_when_idle_needs_no_confirmation(
     env.app.request_quit()
 
     assert env.quits == [1]
+    assert env.app.hub.worker_thread.isFinished()
+    assert env.app.hub.join_timed_out is False
+    assert env.supervisor.terminations == []
+
+
+def test_shutdown_is_idempotent_and_blocks_further_commands(
+    relay_env: _Env, qtbot: QtBot
+) -> None:
+    env = relay_env
+    env.app.hub.start_polling(50)
+    env.app.shutdown()
+    assert env.app.hub.worker_thread.isFinished()
+    assert env.app.hub.join_timed_out is False
+    env.app.shutdown()
+    env.app.request_quit()
+    assert env.quits == []
+    with qtbot.waitSignal(env.app.hub.error, timeout=2_000) as errored:
+        env.app.hub.request_start(GAME_ID)
+    assert errored.args is not None
+    assert "shut down" in errored.args[0]
+    assert env.supervisor.terminations == []
+
+
+def test_tray_dispose_clears_menu(qapp: QApplication, qtbot: QtBot) -> None:
+    del qapp
+    tray = RelayTray(on_open=lambda: None, on_quit=lambda: None)
+    assert tray.contextMenu() is not None
+    tray.dispose()
+    assert tray.contextMenu() is None
+    tray.dispose()  # idempotent
+    qtbot.wait(10)
+
+
+def test_about_to_quit_triggers_shutdown(
+    relay_env: _Env, qapp: QApplication, qtbot: QtBot
+) -> None:
+    env = relay_env
+    env.app.start()
+    qtbot.wait(20)
+    assert env.app.hub.worker_thread.isRunning()
+    qapp.aboutToQuit.emit()
     assert env.app.hub.worker_thread.isFinished()
     assert env.supervisor.terminations == []

@@ -35,8 +35,8 @@ Agent routing: [`AGENTS.md`](../AGENTS.md).
 | P5 | Headless two-client end-to-end (fake storage) | **COMPLETE** |
 | P6 | Paramiko SFTP adapter and disposable-server integration tests | **COMPLETE** |
 | P7 | Windows Civ IV / BTS / AdvCiv launch and process integration | **ACTIVE** |
-| P8 | Minimal PySide6 UI, matches, settings, status, diagnostics | NOT STARTED |
-| P9 | Two-player hardening, packaging, ops docs, release readiness | NOT STARTED |
+| P8 | Minimal PySide6 UI, matches, settings, status, diagnostics | IMPLEMENTED |
+| P9 | Two-player hardening, packaging, ops docs, release readiness | PREPARED |
 
 ## 4. Active implementation phase
 
@@ -693,7 +693,7 @@ None new; supports PT-22 behavior with real process optional manually.
 
 ## P8 — Minimal PySide6 UI, match management, settings, status, diagnostics
 
-**Status:** IMPLEMENTED — not complete until P7 closes
+**Status:** IMPLEMENTED — not complete until P7 closes and PySide6 teardown is verified
 
 Implementation note (2026-08-11): the PySide6 desktop client (`civ4_turn_relay/
 ui/`), worker/controller threading, tray integration, settings and match
@@ -701,8 +701,16 @@ editors, and the required automated UI tests (headless offscreen, pytest-qt)
 are implemented and passing, including redaction, mode-selector/force-close
 consent, and close-failure-is-not-protocol-failure presentation. P8's
 prerequisite is "P7 complete", so this phase cannot be marked COMPLETE until
-the P7 manual Windows smoke test is performed. P7 stays the sole ACTIVE phase;
-P9 is not active.
+the P7 manual Windows smoke test is performed. P7 stays the sole ACTIVE phase.
+
+Teardown hardening (2026-08-12): quit/shutdown now stops the worker-owned
+timer on the worker thread, joins before `RelayClient.close()`, disconnects
+queued signals, disposes tray/menu on the Qt thread, and hooks
+`QApplication.aboutToQuit`. Fresh-interpreter coverage lives in
+`tests/ui/test_teardown_subprocess.py`; Windows stress:
+`packaging/tools/run_ui_teardown_stress.ps1`. Until that stress run is green
+on a real Windows agent, treat intermittent PySide6 interpreter-teardown heap
+corruption as an open **release blocker** for marking P8 COMPLETE.
 
 ### Goal
 
@@ -773,7 +781,16 @@ None exclusively; exercises PT-11 / PT-23 paths via UI commands.
 
 ## P9 — Real two-player hardening, Windows packaging, ops docs, release readiness
 
-**Status:** NOT STARTED
+**Status:** PREPARED — portable/installer scaffolding present; not complete
+
+Preparation note (2026-08-12): `packaging/build_windows.ps1`,
+`packaging/civ4-turn-relay.spec`, `packaging/installer.iss`, and
+[`docs/RELEASE.md`](RELEASE.md) provide a portable PyInstaller onedir+ZIP and a
+per-user Inno Setup installer that preserve `%APPDATA%\civ4-turn-relay`. Static
+invariant tests live under `tests/packaging/`. This does **not** close P9:
+P7/P8 prerequisites remain, real Windows artifact builds/smoke checks are
+still required, and two-player hardening / signing decisions are unfinished.
+P7 remains the sole ACTIVE phase.
 
 ### Goal
 

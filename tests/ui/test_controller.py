@@ -184,8 +184,14 @@ def test_command_errors_are_reported_not_raised(
 
 def test_shutdown_stops_thread_and_is_idempotent(env: _Env, qtbot: QtBot) -> None:
     _open(env, qtbot, GAME_ID)
+    env.hub.start_polling(25)
     env.hub.shutdown()
     assert env.hub.worker_thread.isFinished()
+    assert env.hub.join_timed_out is False
     env.hub.shutdown()  # idempotent
     with pytest.raises(RuntimeError):
         env.client.snapshot(GAME_ID)
+    with qtbot.waitSignal(env.hub.error, timeout=TIMEOUT_MS) as errored:
+        env.hub.request_start(GAME_ID)
+    assert errored.args is not None
+    assert "shut down" in errored.args[0]
