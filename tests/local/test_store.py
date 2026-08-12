@@ -144,6 +144,18 @@ def test_match_config_round_trip(tmp_path: Path) -> None:
     assert (tmp_path / "matches" / "example-match" / "config.json").is_file()
 
 
+def test_list_match_ids_sorted_and_filtered(tmp_path: Path) -> None:
+    store = LocalStore(tmp_path)
+    assert store.list_match_ids() == ()
+    store.write_match_config(_config("match-b"))
+    store.write_match_config(_config("match-a"))
+    # A match directory without config.json is not listed.
+    (tmp_path / "matches" / "match-c").mkdir(parents=True)
+    # A stray file directly under matches/ is not listed either.
+    (tmp_path / "matches" / "stray.txt").write_bytes(b"noise")
+    assert store.list_match_ids() == ("match-a", "match-b")
+
+
 def test_missing_config_and_state_are_typed(tmp_path: Path) -> None:
     store = LocalStore(tmp_path)
     with pytest.raises(LocalStoreMissingError):

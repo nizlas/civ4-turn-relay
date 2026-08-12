@@ -59,6 +59,7 @@ _POST_COMMIT_CLOSE_KEYS = (
     "game_id",
     "operation_id",
     "pid",
+    "process_create_time_ns",
     "process_start_time_utc",
     "sha256",
     "source_protocol_sequence",
@@ -72,6 +73,7 @@ _PROCESS_ASSOCIATION_KEYS = (
     "associated_at",
     "executable_path",
     "pid",
+    "process_create_time_ns",
     "process_start_time_utc",
     "protocol_sequence",
 )
@@ -344,7 +346,11 @@ class StabilityObservation:
 
 @dataclass(frozen=True, slots=True)
 class PostCommitCloseRecord:
-    """Durable entitlement to close the exact Relay-launched Civ process."""
+    """Durable entitlement to close the exact Relay-launched Civ process.
+
+    Exact-match identity is pid + ``process_create_time_ns`` + executable
+    path; the second-resolution UTC timestamp is diagnostic only.
+    """
 
     game_id: str
     source_protocol_sequence: int
@@ -352,6 +358,7 @@ class PostCommitCloseRecord:
     sha256: str
     pid: int
     process_start_time_utc: str
+    process_create_time_ns: int
     executable_path: str
     close_requested: bool = False
 
@@ -382,6 +389,12 @@ class PostCommitCloseRecord:
                 self.process_start_time_utc, field_path="process_start_time_utc"
             ),
         )
+        _require_true_int(self.process_create_time_ns, "process_create_time_ns")
+        if self.process_create_time_ns <= 0:
+            raise DomainValidationError(
+                "expected a positive creation token",
+                field_path="process_create_time_ns",
+            )
         validate_windows_local_path(self.executable_path, field_path="executable_path")
         if not isinstance(self.close_requested, bool):
             raise DomainValidationError(
@@ -396,6 +409,7 @@ class PostCommitCloseRecord:
             "game_id": self.game_id,
             "operation_id": self.operation_id,
             "pid": self.pid,
+            "process_create_time_ns": self.process_create_time_ns,
             "process_start_time_utc": self.process_start_time_utc,
             "sha256": self.sha256,
             "source_protocol_sequence": self.source_protocol_sequence,
@@ -419,6 +433,9 @@ class PostCommitCloseRecord:
                 pid=get_integer(mapping, "pid", path=path),
                 process_start_time_utc=get_string(
                     mapping, "process_start_time_utc", path=path
+                ),
+                process_create_time_ns=get_integer(
+                    mapping, "process_create_time_ns", path=path
                 ),
                 executable_path=get_string(mapping, "executable_path", path=path),
                 close_requested=get_boolean(mapping, "close_requested", path=path),
@@ -614,12 +631,17 @@ class LaunchAttemptRecord:
 
 @dataclass(frozen=True, slots=True)
 class ProcessAssociationRecord:
-    """Relay-owned Civ process association evidence (design §8.1 / §9.1)."""
+    """Relay-owned Civ process association evidence (design §8.1 / §9.1).
+
+    Exact-match identity is pid + ``process_create_time_ns`` + executable
+    path; the second-resolution UTC timestamp is diagnostic only.
+    """
 
     protocol_sequence: int
     accepted_sha256: str | None
     pid: int
     process_start_time_utc: str
+    process_create_time_ns: int
     executable_path: str
     associated_at: str
 
@@ -642,6 +664,12 @@ class ProcessAssociationRecord:
                 self.process_start_time_utc, field_path="process_start_time_utc"
             ),
         )
+        _require_true_int(self.process_create_time_ns, "process_create_time_ns")
+        if self.process_create_time_ns <= 0:
+            raise DomainValidationError(
+                "expected a positive creation token",
+                field_path="process_create_time_ns",
+            )
         validate_windows_local_path(self.executable_path, field_path="executable_path")
         object.__setattr__(
             self,
@@ -665,6 +693,7 @@ class ProcessAssociationRecord:
             "associated_at": self.associated_at,
             "executable_path": self.executable_path,
             "pid": self.pid,
+            "process_create_time_ns": self.process_create_time_ns,
             "process_start_time_utc": self.process_start_time_utc,
             "protocol_sequence": self.protocol_sequence,
         }
@@ -683,6 +712,9 @@ class ProcessAssociationRecord:
                 pid=get_integer(mapping, "pid", path=path),
                 process_start_time_utc=get_string(
                     mapping, "process_start_time_utc", path=path
+                ),
+                process_create_time_ns=get_integer(
+                    mapping, "process_create_time_ns", path=path
                 ),
                 executable_path=get_string(mapping, "executable_path", path=path),
                 associated_at=get_string(mapping, "associated_at", path=path),
@@ -1125,16 +1157,21 @@ class MatchLocalRecords:
                 if launch_raw is None
                 else LaunchAttemptRecord.from_mapping(launch_raw, path="launch_attempt")
             ),
+            # Strict migration for pre-release records: a stored process
+            # association or close entitlement without the precise
+            # process_create_time_ns token is unverifiable weak identity.
+            # It is discarded (never upgraded into a trusted identity), so
+            # nothing can ever be focused, closed, or terminated based on it.
             process_association=(
                 None
-                if process_raw is None
+                if process_raw is None or "process_create_time_ns" not in process_raw
                 else ProcessAssociationRecord.from_mapping(
                     process_raw, path="process_association"
                 )
             ),
             pending_post_commit_close=(
                 None
-                if close_raw is None
+                if close_raw is None or "process_create_time_ns" not in close_raw
                 else PostCommitCloseRecord.from_mapping(
                     close_raw, path="pending_post_commit_close"
                 )

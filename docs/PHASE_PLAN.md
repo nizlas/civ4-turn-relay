@@ -613,7 +613,16 @@ P6 closed with `ParamikoStorage` implementing the full Storage contract (path co
 
 ## P7 — Windows Civilization IV / BTS / Advanced Civ launch and process integration
 
-**Status:** ACTIVE
+**Status:** ACTIVE — implementation complete; pending the manual Windows smoke test
+
+Implementation note (2026-08-11): the launch port (`civ4_turn_relay/process/`),
+Windows adapter (psutil + WM_CLOSE), `RelayClient` integration, and all required
+automated tests (fake process supervisor; FR-010 and FR-015 paths) are
+implemented and passing. The exit criteria require the exact Steam/BTS/AdvCiv
+CLI behavior to be **empirically verified** on a real Windows Civ install; that
+evidence does not exist yet. The manual smoke-test checklist lives in
+[`DESKTOP_CLIENT.md`](DESKTOP_CLIENT.md). P7 remains the sole ACTIVE phase
+until that checklist is performed and its results recorded here.
 
 ### Goal
 
@@ -638,7 +647,7 @@ P6 complete.
 - Empirical notes (developer-local) for exact CLI / Steam behaviors — **do not commit real install paths as secrets/defaults beyond placeholders**
 - Already-running / unrelated process warnings and protection
 - Wire launch to baseline recording and durable process-association evidence from P4
-- Real Windows launch; PID / start-time / executable verification
+- Real Windows launch; PID / precise-creation-token / executable verification
 - Graceful close request, 15s wait, and optional post-commit forced termination when `allow_force_close_after_commit` is enabled
 - BTS/AdvCiv verification paths; never close an unrelated/manually launched process by executable name alone
 - Defer auto-launch when no interactive/unlocked desktop is available
@@ -684,7 +693,16 @@ None new; supports PT-22 behavior with real process optional manually.
 
 ## P8 — Minimal PySide6 UI, match management, settings, status, diagnostics
 
-**Status:** NOT STARTED
+**Status:** IMPLEMENTED — not complete until P7 closes
+
+Implementation note (2026-08-11): the PySide6 desktop client (`civ4_turn_relay/
+ui/`), worker/controller threading, tray integration, settings and match
+editors, and the required automated UI tests (headless offscreen, pytest-qt)
+are implemented and passing, including redaction, mode-selector/force-close
+consent, and close-failure-is-not-protocol-failure presentation. P8's
+prerequisite is "P7 complete", so this phase cannot be marked COMPLETE until
+the P7 manual Windows smoke test is performed. P7 stays the sole ACTIVE phase;
+P9 is not active.
 
 ### Goal
 

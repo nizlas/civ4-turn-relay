@@ -24,6 +24,7 @@ SAVE_NAME_A = "E2E_PlayerA.CivBeyondSwordSave"
 SAVE_NAME_B = "E2E_PlayerB.CivBeyondSwordSave"
 GLOB = "*.CivBeyondSwordSave"
 EXE = r"C:\Placeholder\Civ4BeyondSword.exe"
+CREATE_NS = 1_760_184_000_000_000_000
 
 
 def players() -> tuple[Player, ...]:
@@ -55,7 +56,7 @@ def match_config(
         players=players(),
         local_player_id=local_player_id,
         launch_profile="default",
-        mod_name="AdvCiv",
+        mod_name="Mods\\AdvCiv",
         pbem_save_directory=str(pbem.resolve()),
         save_matching=SaveMatchingRules(filename_glob=GLOB),
         turn_handling_mode=mode,
@@ -107,6 +108,7 @@ def running_process(pid: int = 4242) -> ProcessObservation:
     return ProcessObservation(
         pid=pid,
         process_start_time_utc=NOW_UTC,
+        process_create_time_ns=CREATE_NS,
         executable_path=EXE,
         running=True,
     )
@@ -116,6 +118,7 @@ def stopped_process(pid: int = 4242) -> ProcessObservation:
     return ProcessObservation(
         pid=pid,
         process_start_time_utc=NOW_UTC,
+        process_create_time_ns=CREATE_NS,
         executable_path=EXE,
         running=False,
     )

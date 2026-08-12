@@ -64,6 +64,7 @@ from tests.protocol.helpers import (
 
 SAVE_A = b"synthetic-outgoing-save-bytes-player-a-v1"
 SAVE_B = b"synthetic-outgoing-save-bytes-player-b-v2"
+CREATE_NS = 1_760_184_000_000_004_242
 FIXED_UUID = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 CLIENT_UUID = str(FIXED_UUID)
 GLOB = "*.CivBeyondSwordSave"
@@ -232,6 +233,7 @@ def _process_obs(*, running: bool = True) -> ProcessObservation:
     return ProcessObservation(
         pid=4242,
         process_start_time_utc=NOW_UTC,
+        process_create_time_ns=CREATE_NS,
         executable_path=r"C:\Games\Civ4\BeyondSword.exe",
         running=running,
     )
@@ -628,6 +630,7 @@ def test_pt22_baseline_survives_restart_while_civ_running(tmp_path: Path) -> Non
                 accepted_sha256=digest,
                 pid=obs.pid,
                 process_start_time_utc=obs.process_start_time_utc,
+                process_create_time_ns=obs.process_create_time_ns,
                 executable_path=obs.executable_path,
                 associated_at=NOW_UTC,
             ),
@@ -936,6 +939,7 @@ def test_process_association_suppresses_relaunch(tmp_path: Path) -> None:
             accepted_sha256=digest,
             pid=4242,
             process_start_time_utc=NOW_UTC,
+            process_create_time_ns=CREATE_NS,
             executable_path=r"C:\Games\Civ4\BeyondSword.exe",
             associated_at=NOW_UTC,
         ),
@@ -1003,6 +1007,7 @@ def test_close_after_committed_or_idempotent(tmp_path: Path) -> None:
             accepted_sha256=None,
             pid=4242,
             process_start_time_utc=NOW_UTC,
+            process_create_time_ns=CREATE_NS,
             executable_path=r"C:\Games\Civ4\BeyondSword.exe",
             associated_at=NOW_UTC,
         ),
@@ -1040,6 +1045,7 @@ def test_close_after_committed_or_idempotent(tmp_path: Path) -> None:
         ProcessObservation(
             pid=9999,
             process_start_time_utc=NOW_UTC,
+            process_create_time_ns=CREATE_NS,
             executable_path=r"C:\Games\Civ4\BeyondSword.exe",
             running=True,
         ),
@@ -1088,6 +1094,7 @@ def test_allow_force_close_never_emits_terminate(tmp_path: Path) -> None:
             accepted_sha256=None,
             pid=4242,
             process_start_time_utc=NOW_UTC,
+            process_create_time_ns=CREATE_NS,
             executable_path=r"C:\Games\Civ4\BeyondSword.exe",
             associated_at=NOW_UTC,
         ),

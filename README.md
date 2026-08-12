@@ -50,7 +50,7 @@ Detailed lifecycle and safety semantics: [`docs/DESIGN_SPEC.md`](docs/DESIGN_SPE
 
 ### Implementation status
 
-Protocol, local persistence, reconciliation, save detection, and orchestration foundations are implemented. The **complete** end-to-end Fully Managed experience — real Windows launch/close integration and the UI — is an explicit design goal still being completed in **P7/P8** ([`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md)). Until that work lands, do not rely on Fully Managed mode for real matches.
+Protocol, local persistence, reconciliation, save detection, orchestration, the Windows process adapter (launch, identity verification, graceful close), and the PySide6 desktop client are implemented with full automated test coverage. What remains for **P7** ([`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md)) is the manual smoke test against a real Civilization installation: the exact `/fxsload` and `mod=<mod folder>` command-line behavior is modeled and unit-tested but not yet empirically confirmed. **P7 stays ACTIVE until that checklist is completed** ([`docs/DESKTOP_CLIENT.md`](docs/DESKTOP_CLIENT.md)). Until then, do not rely on Fully Managed mode for real matches.
 
 ## Standard mode
 
@@ -71,13 +71,17 @@ The Linux host is only a shared SFTP file store. It does not run Civilization or
 - Immutable save history.
 - SHA-256 identity for saves.
 
-## Planned UI
+## Desktop client
 
-- One clearly displayed state.
-- An explanation of why the app is in that state.
-- Last successful operation.
-- One context-sensitive primary action.
-- Secondary settings and diagnostics.
+Launch the desktop client with the installed GUI script:
+
+```bash
+civ4-turn-relay-ui
+```
+
+The client shows a match list with one clearly displayed state per match, an explanation of why the app is in that state, and one context-sensitive primary action; secondary controls (Focus/Close Civilization, settings, diagnostics) appear only when relevant. Closing the window hides Relay to the system tray while matches are active, so Fully Managed matches keep running in the background.
+
+Setup, turn flow, configuration, process safety, and the manual smoke-test checklist: [`docs/DESKTOP_CLIENT.md`](docs/DESKTOP_CLIENT.md).
 
 ## Non-goals
 
@@ -87,11 +91,12 @@ The Linux host is only a shared SFTP file store. It does not run Civilization or
 - No game server running on Linux.
 - No requirement that all settings be copied for each match.
 
-## Planned technology
+## Technology
 
 - Python 3.12
-- PySide6
-- SFTP
+- PySide6 (desktop client)
+- psutil (process identity verification)
+- SFTP (Paramiko)
 - Windows distribution: portable/distributable build (PyInstaller or equivalent) **and** a real Windows installer (Inno Setup or justified equivalent); see [`docs/PHASE_PLAN.md` P9](docs/PHASE_PLAN.md#p9--real-two-player-hardening-windows-packaging-ops-docs-release-readiness)
 
 ## Implementation sequence

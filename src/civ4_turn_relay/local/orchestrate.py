@@ -20,10 +20,16 @@ from civ4_turn_relay.protocol.handoff import HandoffOutcome
 
 @dataclass(frozen=True, slots=True)
 class ProcessObservation:
-    """Supplied process facts from an adapter (P7 later)."""
+    """Supplied process facts from an adapter (P7 later).
+
+    ``process_create_time_ns`` is the precise creation token from the process
+    backend; the second-resolution UTC timestamp is diagnostic only and never
+    the sole identity check.
+    """
 
     pid: int
     process_start_time_utc: str
+    process_create_time_ns: int
     executable_path: str
     running: bool
 
@@ -45,6 +51,18 @@ class ProcessObservation:
                 self.process_start_time_utc, field_path="process_start_time_utc"
             ),
         )
+        if isinstance(self.process_create_time_ns, bool) or not isinstance(
+            self.process_create_time_ns, int
+        ):
+            raise DomainValidationError(
+                "expected an integer creation token",
+                field_path="process_create_time_ns",
+            )
+        if self.process_create_time_ns <= 0:
+            raise DomainValidationError(
+                "expected a positive creation token",
+                field_path="process_create_time_ns",
+            )
         validate_windows_local_path(self.executable_path, field_path="executable_path")
         if not isinstance(self.running, bool):
             raise DomainValidationError(
@@ -57,15 +75,19 @@ def observation_matches_association(
     observation: ProcessObservation | None,
     *,
     pid: int,
-    process_start_time_utc: str,
+    process_create_time_ns: int,
     executable_path: str,
 ) -> bool:
-    """True only when observation identity exactly matches the durable association."""
+    """True only when observation identity exactly matches the durable association.
+
+    Identity is pid + precise creation token + executable path; a matching
+    whole-second timestamp with a different creation token is a mismatch.
+    """
     if observation is None:
         return False
     return (
         observation.pid == pid
-        and observation.process_start_time_utc == process_start_time_utc
+        and observation.process_create_time_ns == process_create_time_ns
         and observation.executable_path == executable_path
     )
 
@@ -98,7 +120,7 @@ def _matched_running_process(
         observation_matches_association(
             observation,
             pid=association.pid,
-            process_start_time_utc=association.process_start_time_utc,
+            process_create_time_ns=association.process_create_time_ns,
             executable_path=association.executable_path,
         )
         and observation is not None
@@ -140,6 +162,7 @@ def _close_target(
         sha256=handoff.sha256,
         pid=association.pid,
         process_start_time_utc=association.process_start_time_utc,
+        process_create_time_ns=association.process_create_time_ns,
         executable_path=association.executable_path,
         close_requested=False,
     )
@@ -173,7 +196,7 @@ def decide_intents(
             and observation_matches_association(
                 process_observation,
                 pid=close_target.pid,
-                process_start_time_utc=close_target.process_start_time_utc,
+                process_create_time_ns=close_target.process_create_time_ns,
                 executable_path=close_target.executable_path,
             )
             and process_observation is not None
@@ -185,6 +208,7 @@ def decide_intents(
                     payload={
                         "pid": close_target.pid,
                         "process_start_time_utc": close_target.process_start_time_utc,
+                        "process_create_time_ns": (close_target.process_create_time_ns),
                         "executable_path": close_target.executable_path,
                         "operation_id": close_target.operation_id,
                         "sha256": close_target.sha256,

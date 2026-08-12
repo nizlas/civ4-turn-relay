@@ -71,6 +71,7 @@ def _full_mapping() -> dict[str, Any]:
             "associated_at": "2026-08-11T12:00:01Z",
             "executable_path": EXE,
             "pid": 4242,
+            "process_create_time_ns": 1_760_184_001_250_000_000,
             "process_start_time_utc": "2026-08-11T12:00:01Z",
             "protocol_sequence": 1,
         },
@@ -90,6 +91,10 @@ def test_match_local_records_round_trip() -> None:
     assert records.in_progress_handoff is not None
     assert records.in_progress_handoff.step_reached == "lock_acquired"
     assert records.last_transition_reason == "civ_still_running_after_restart"
+    assert records.process_association is not None
+    assert records.process_association.process_create_time_ns == (
+        1_760_184_001_250_000_000
+    )
     data = records.to_json_bytes()
     assert data == records.to_json_bytes()
     assert MatchLocalRecords.from_json_bytes(data) == records
@@ -144,10 +149,63 @@ def test_process_association_requires_positive_pid() -> None:
             accepted_sha256=HASH_1,
             pid=0,
             process_start_time_utc="2026-08-11T12:00:01Z",
+            process_create_time_ns=1_760_184_001_000_000_000,
             executable_path=EXE,
             associated_at="2026-08-11T12:00:01Z",
         )
     assert exc_info.value.field_path == "pid"
+
+
+def test_legacy_association_without_precise_identity_is_discarded() -> None:
+    """Pre-release records carry only the weak second-resolution identity.
+
+    Such an association is unverifiable and must be discarded on load rather
+    than upgraded into a trusted identity.
+    """
+    mapping = _full_mapping()
+    del mapping["process_association"]["process_create_time_ns"]
+    records = MatchLocalRecords.from_mapping(mapping)
+    assert records.process_association is None
+
+
+def test_legacy_pending_close_without_precise_identity_is_discarded() -> None:
+    mapping = _full_mapping()
+    mapping["pending_post_commit_close"] = {
+        "close_requested": False,
+        "executable_path": EXE,
+        "game_id": "example-match",
+        "operation_id": OP_ID,
+        "pid": 4242,
+        "process_start_time_utc": "2026-08-11T12:00:01Z",
+        "sha256": HASH_1,
+        "source_protocol_sequence": 1,
+    }
+    records = MatchLocalRecords.from_mapping(mapping)
+    assert records.pending_post_commit_close is None
+
+
+def test_modern_pending_close_with_precise_identity_round_trips() -> None:
+    mapping = _full_mapping()
+    mapping["pending_post_commit_close"] = {
+        "close_requested": False,
+        "executable_path": EXE,
+        "game_id": "example-match",
+        "operation_id": OP_ID,
+        "pid": 4242,
+        "process_create_time_ns": 1_760_184_001_250_000_000,
+        "process_start_time_utc": "2026-08-11T12:00:01Z",
+        "sha256": HASH_1,
+        "source_protocol_sequence": 1,
+    }
+    records = MatchLocalRecords.from_mapping(mapping)
+    assert records.pending_post_commit_close is not None
+    assert records.pending_post_commit_close.process_create_time_ns == (
+        1_760_184_001_250_000_000
+    )
+    assert (
+        records.to_mapping()["pending_post_commit_close"]
+        == (mapping["pending_post_commit_close"])
+    )
 
 
 def test_unsupported_schema_version_rejected() -> None:

@@ -14,8 +14,13 @@ authors = [{ name = "Niclas Danielsson" }]
 dependencies = [
     "watchdog>=4.0.0,<7",
     "paramiko>=3.4.0,<4",
+    "psutil>=5.9,<8",
+    "PySide6>=6.7,<7",
     "python-dotenv>=1.0.0,<2",
 ]
+
+[project.gui-scripts]
+civ4-turn-relay-ui = "civ4_turn_relay.ui.app:main"
 
 [project.optional-dependencies]
 dev = [
@@ -23,6 +28,8 @@ dev = [
     "ruff",
     "mypy",
     "types-paramiko",
+    "types-psutil",
+    "pytest-qt",
 ]
 
 [tool.pytest.ini_options]

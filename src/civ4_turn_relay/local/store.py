@@ -133,6 +133,19 @@ class LocalStore:
     def match_config_path(self, game_id: str) -> Path:
         return self._contained(self.match_dir(game_id) / "config.json")
 
+    def list_match_ids(self) -> tuple[str, ...]:
+        """Sorted game_ids of match directories that contain a config.json."""
+        matches = self._root / "matches"
+        if not matches.is_dir():
+            return ()
+        return tuple(
+            sorted(
+                entry.name
+                for entry in matches.iterdir()
+                if entry.is_dir() and (entry / "config.json").is_file()
+            )
+        )
+
     def match_state_path(self, game_id: str) -> Path:
         return self._contained(self.match_dir(game_id) / "state.json")
 

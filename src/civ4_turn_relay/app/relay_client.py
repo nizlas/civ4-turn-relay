@@ -13,6 +13,13 @@ from dataclasses import dataclass, replace
 from datetime import UTC
 from pathlib import Path
 
+from civ4_turn_relay.app.process_runtime import (
+    ProcessCoordinator,
+    ProcessStatus,
+    ProcessStatusSnapshot,
+    close_payload_matches_record,
+    identity_from_close_record,
+)
 from civ4_turn_relay.app.snapshot import MatchClientSnapshot, PendingUserAction
 from civ4_turn_relay.domain import (
     DomainValidationError,
@@ -32,6 +39,7 @@ from civ4_turn_relay.local import (
     DurableHandoffJournal,
     HandoffEvidence,
     LocalStore,
+    MatchLocalRecords,
     OrchestrationIntent,
     OrchestrationIntentKind,
     OutgoingCandidateRecord,
@@ -43,6 +51,20 @@ from civ4_turn_relay.local import (
     observe_outgoing_candidates,
     reconcile_match,
     revalidate_candidate_file,
+)
+from civ4_turn_relay.process import (
+    CloseRequestOutcome,
+    CloseRequestResult,
+    FocusOutcome,
+    FocusResult,
+    LaunchOutcome,
+    LaunchPlan,
+    ProbeOutcome,
+    ProcessIdentity,
+    ProcessSupervisor,
+    TerminateOutcome,
+    build_launch_plan,
+    observation_from_identity,
 )
 from civ4_turn_relay.protocol import (
     DEFAULT_MAX_SAVE_BYTES,
@@ -82,6 +104,7 @@ class _MatchSession:
     last_close_operation_id: str | None = None
     last_outgoing_bytes: bytes | None = None
     last_outgoing_filename: str | None = None
+    coordinator: ProcessCoordinator | None = None
 
 
 class RelayClient:
@@ -99,11 +122,19 @@ class RelayClient:
         owns_storage: bool = False,
         auto_execute_managed_handoff: bool = True,
         enable_monitoring: bool = True,
+        process_supervisor: ProcessSupervisor | None = None,
+        civ4_executable: str | None = None,
     ) -> None:
         if not isinstance(store, LocalStore):
             raise TypeError("store must be a LocalStore instance")
         if not isinstance(storage, Storage):
             raise TypeError("storage must satisfy Storage")
+        if process_supervisor is not None and not isinstance(
+            process_supervisor, ProcessSupervisor
+        ):
+            raise TypeError("process_supervisor must satisfy ProcessSupervisor")
+        if civ4_executable is not None and not isinstance(civ4_executable, str):
+            raise TypeError("civ4_executable must be a string or None")
         if isinstance(poll_interval_seconds, bool) or not isinstance(
             poll_interval_seconds, int | float
         ):
@@ -123,6 +154,8 @@ class RelayClient:
         self._owns_storage = owns_storage
         self._auto_execute_managed_handoff = auto_execute_managed_handoff
         self._enable_monitoring = enable_monitoring
+        self._process_supervisor = process_supervisor
+        self._civ4_executable = civ4_executable
         self._sessions: dict[str, _MatchSession] = {}
         self._closed = False
         # Ensure installation identity exists without inventing remote state.
@@ -255,7 +288,14 @@ class RelayClient:
         now_utc: str | None = None,
         auto_handoff_operation_id: str | None = None,
     ) -> MatchClientSnapshot:
-        """Poll watchers, reconcile, and optionally auto-handoff in managed mode."""
+        """Poll watchers, reconcile, and optionally auto-handoff in managed mode.
+
+        With a configured process supervisor the tick additionally refreshes
+        the process observation via an identity probe before reconciling,
+        acts on the resulting launch/close intents through the supervisor,
+        and tracks any pending post-commit close. Process outcomes never
+        advance remote protocol state.
+        """
         self._ensure_open()
         session = self._require_session(game_id)
         if session.monitor is not None:
@@ -264,6 +304,9 @@ class RelayClient:
                 session.monitoring_available = session.monitor.is_healthy()
             except Exception:
                 session.monitoring_available = False
+        coordinator = self._coordinator(session)
+        if coordinator is not None:
+            self._refresh_process_observation(session, coordinator)
         result = self.reconcile(game_id, now_utc=now_utc)
         if (
             self._auto_execute_managed_handoff
@@ -288,6 +331,12 @@ class RelayClient:
                     HandoffOutcome.IDEMPOTENT_ACK,
                 }:
                     session.last_auto_handoff_sha256 = candidate.sha256
+        if coordinator is not None:
+            latest = (
+                session.last_reconcile if session.last_reconcile is not None else result
+            )
+            self._act_on_process_intents(session, coordinator, latest, now_utc)
+            self._track_close_progress(session, coordinator, now_utc)
         return self.snapshot(game_id)
 
     def request_start(
@@ -296,15 +345,29 @@ class RelayClient:
         *,
         now_utc: str | None = None,
     ) -> ReconcileResult:
-        """Request Start/Resume; emits intents only (no real process launch)."""
-        return self.reconcile(game_id, user_requested_start=True, now_utc=now_utc)
+        """Request Start/Resume; launches through the supervisor when configured.
+
+        Without a configured process supervisor this only emits intents
+        (previous behavior). A user request bypasses the durable
+        launch-attempt suppression, which is the explicit retry path after
+        a failed or refused launch.
+        """
+        self._ensure_open()
+        session = self._require_session(game_id)
+        coordinator = self._coordinator(session)
+        if coordinator is not None:
+            self._refresh_process_observation(session, coordinator)
+        result = self.reconcile(game_id, user_requested_start=True, now_utc=now_utc)
+        if coordinator is not None:
+            result = self._act_on_process_intents(session, coordinator, result, now_utc)
+        return result
 
     def set_process_observation(
         self,
         game_id: str,
         observation: ProcessObservation | None,
     ) -> None:
-        """Accept process facts from a future P7 adapter."""
+        """Accept process facts observed through the process adapter."""
         self._ensure_open()
         session = self._require_session(game_id)
         session.process_observation = observation
@@ -323,6 +386,7 @@ class RelayClient:
                         ),
                         pid=observation.pid,
                         process_start_time_utc=observation.process_start_time_utc,
+                        process_create_time_ns=observation.process_create_time_ns,
                         executable_path=observation.executable_path,
                         associated_at=observation.process_start_time_utc,
                     ),
@@ -554,6 +618,330 @@ class RelayClient:
             retry_required=result.retry_required,
         )
 
+    def process_status(self, game_id: str) -> ProcessStatusSnapshot:
+        """Return the typed per-match process status for UI display."""
+        self._ensure_open()
+        session = self._require_session(game_id)
+        coordinator = self._coordinator(session)
+        if coordinator is None:
+            return ProcessStatusSnapshot(
+                status=ProcessStatus.UNAVAILABLE,
+                message="no process adapter configured",
+            )
+        records = self._store.load_match_state_or_empty(session.config.game_id)
+        association: ProcessIdentity | None = None
+        if records.process_association is not None:
+            assoc = records.process_association
+            association = ProcessIdentity(
+                pid=assoc.pid,
+                process_start_time_utc=assoc.process_start_time_utc,
+                process_create_time_ns=assoc.process_create_time_ns,
+                executable_path=assoc.executable_path,
+            )
+        force_allowed = (
+            session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
+            and session.config.allow_force_close_after_commit
+        )
+        return coordinator.status_snapshot(
+            association=association, force_close_allowed=force_allowed
+        )
+
+    def launch_preview(self, game_id: str) -> LaunchPlan:
+        """Build the launch plan for this match without launching (dry run)."""
+        self._ensure_open()
+        session = self._require_session(game_id)
+        records = self._store.load_match_state_or_empty(session.config.game_id)
+        return self._launch_plan_for(session.config, records)
+
+    def focus_civ(self, game_id: str) -> FocusResult:
+        """Focus the associated Civ window after identity verification."""
+        self._ensure_open()
+        session = self._require_session(game_id)
+        coordinator = self._coordinator(session)
+        if coordinator is None:
+            return FocusResult(
+                outcome=FocusOutcome.ADAPTER_UNAVAILABLE,
+                message="no process adapter configured",
+            )
+        identity = self._associated_identity(session, coordinator)
+        if identity is None:
+            return FocusResult(
+                outcome=FocusOutcome.NOT_RUNNING,
+                message="no Relay-launched process is associated with this match",
+            )
+        return coordinator.focus(identity)
+
+    def request_civ_close(self, game_id: str) -> CloseRequestResult:
+        """Manually request a graceful close backed by the durable entitlement.
+
+        This is the UI Close fallback after the graceful deadline. It is
+        allowed only when a durable ``pending_post_commit_close`` record
+        exists and a fresh probe verifies exactly that identity is running.
+        It never terminates.
+        """
+        self._ensure_open()
+        session = self._require_session(game_id)
+        coordinator = self._coordinator(session)
+        if coordinator is None:
+            return CloseRequestResult(
+                outcome=CloseRequestOutcome.ADAPTER_UNAVAILABLE,
+                message="no process adapter configured",
+            )
+        records = self._store.load_match_state_or_empty(session.config.game_id)
+        pending = records.pending_post_commit_close
+        if pending is None:
+            return CloseRequestResult(
+                outcome=CloseRequestOutcome.REQUEST_FAILED,
+                message="no committed-turn close entitlement exists for this match",
+            )
+        identity = identity_from_close_record(pending)
+        probe = coordinator.probe(identity)
+        if probe.outcome is ProbeOutcome.NOT_RUNNING:
+            return CloseRequestResult(outcome=CloseRequestOutcome.NOT_RUNNING)
+        if probe.outcome is ProbeOutcome.RUNNING_MISMATCH:
+            return CloseRequestResult(
+                outcome=CloseRequestOutcome.IDENTITY_MISMATCH,
+                message=probe.message,
+            )
+        if probe.outcome is not ProbeOutcome.RUNNING_MATCH:
+            return CloseRequestResult(
+                outcome=CloseRequestOutcome.ADAPTER_UNAVAILABLE,
+                message=probe.message,
+            )
+        result = coordinator.request_close(
+            identity, operation_id=pending.operation_id, allow_repeat=True
+        )
+        if result is None:
+            return CloseRequestResult(
+                outcome=CloseRequestOutcome.IDENTITY_MISMATCH,
+                message="the entitled process identity could not be verified",
+            )
+        if (
+            result.outcome is CloseRequestOutcome.REQUESTED
+            and not pending.close_requested
+        ):
+            self._store.update_match_state(
+                session.config.game_id, _mark_close_requested
+            )
+            session.last_close_operation_id = pending.operation_id
+        return result
+
+    def _coordinator(self, session: _MatchSession) -> ProcessCoordinator | None:
+        if self._process_supervisor is None:
+            return None
+        if session.coordinator is None:
+            session.coordinator = ProcessCoordinator(
+                supervisor=self._process_supervisor,
+                clock=self._clock,
+                now_utc_fn=self._now_utc_fn,
+                civ4_executable=self._civ4_executable,
+            )
+        return session.coordinator
+
+    def _associated_identity(
+        self, session: _MatchSession, coordinator: ProcessCoordinator
+    ) -> ProcessIdentity | None:
+        records = self._store.load_match_state_or_empty(session.config.game_id)
+        association = records.process_association
+        if association is not None:
+            return ProcessIdentity(
+                pid=association.pid,
+                process_start_time_utc=association.process_start_time_utc,
+                process_create_time_ns=association.process_create_time_ns,
+                executable_path=association.executable_path,
+            )
+        return coordinator.session_identity
+
+    def _refresh_process_observation(
+        self, session: _MatchSession, coordinator: ProcessCoordinator
+    ) -> None:
+        """Probe the associated identity and update the session observation.
+
+        On an unavailable adapter or failed probe the prior observation is
+        kept; a mismatch is remembered by the coordinator so no close,
+        focus, or terminate ever targets the reused pid.
+        """
+        game_id = session.config.game_id
+        identity = self._associated_identity(session, coordinator)
+        if identity is None:
+            return
+        probe = coordinator.probe(identity)
+        if probe.outcome is ProbeOutcome.RUNNING_MATCH:
+            self.set_process_observation(
+                game_id, observation_from_identity(identity, running=True)
+            )
+        elif probe.outcome in {
+            ProbeOutcome.NOT_RUNNING,
+            ProbeOutcome.RUNNING_MISMATCH,
+        }:
+            self.set_process_observation(
+                game_id, observation_from_identity(identity, running=False)
+            )
+
+    def _launch_plan_for(
+        self, config: MatchConfig, records: MatchLocalRecords
+    ) -> LaunchPlan:
+        save_path: str | None = None
+        verified = records.verified_remote
+        downloaded = records.downloaded_save
+        if (
+            verified is not None
+            and verified.protocol_sequence > 0
+            and downloaded is not None
+            and downloaded.protocol_sequence == verified.protocol_sequence
+        ):
+            save_path = downloaded.local_path
+        return build_launch_plan(
+            executable_path=self._civ4_executable,
+            mod_name=config.mod_name,
+            save_path=save_path,
+            pbem_save_directory=config.pbem_save_directory,
+        )
+
+    def _persist_process_association(
+        self, game_id: str, identity: ProcessIdentity
+    ) -> None:
+        """Durably associate the freshly launched identity with this match."""
+
+        def mutate(records: MatchLocalRecords) -> MatchLocalRecords:
+            verified = records.verified_remote
+            return replace(
+                records,
+                process_association=ProcessAssociationRecord(
+                    protocol_sequence=(
+                        0 if verified is None else verified.protocol_sequence
+                    ),
+                    accepted_sha256=(
+                        None if verified is None else verified.accepted_sha256
+                    ),
+                    pid=identity.pid,
+                    process_start_time_utc=identity.process_start_time_utc,
+                    process_create_time_ns=identity.process_create_time_ns,
+                    executable_path=identity.executable_path,
+                    associated_at=identity.process_start_time_utc,
+                ),
+            )
+
+        self._store.update_match_state(game_id, mutate)
+
+    def _act_on_process_intents(
+        self,
+        session: _MatchSession,
+        coordinator: ProcessCoordinator,
+        result: ReconcileResult,
+        now_utc: str | None,
+    ) -> ReconcileResult:
+        """Act on START_CIV and REQUEST_GRACEFUL_CLOSE reconcile intents."""
+        game_id = session.config.game_id
+        if any(
+            intent.kind is OrchestrationIntentKind.START_CIV
+            for intent in result.intents
+        ):
+            if coordinator.availability().available:
+                records = self._store.load_match_state_or_empty(game_id)
+                plan = self._launch_plan_for(session.config, records)
+                launch = coordinator.attempt_launch(plan)
+                if (
+                    launch is not None
+                    and launch.outcome is LaunchOutcome.LAUNCHED
+                    and launch.identity is not None
+                ):
+                    self._persist_process_association(game_id, launch.identity)
+                    self.set_process_observation(
+                        game_id,
+                        observation_from_identity(launch.identity, running=True),
+                    )
+                    result = self.reconcile(game_id, now_utc=now_utc)
+        close_intent = next(
+            (
+                intent
+                for intent in result.intents
+                if intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+            ),
+            None,
+        )
+        if (
+            close_intent is not None
+            and session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
+        ):
+            self._request_entitled_close(session, coordinator, close_intent)
+        return result
+
+    def _request_entitled_close(
+        self,
+        session: _MatchSession,
+        coordinator: ProcessCoordinator,
+        intent: OrchestrationIntent,
+    ) -> None:
+        """Request a graceful close only for the exact durable entitlement."""
+        game_id = session.config.game_id
+        payload = intent.payload or {}
+        records = self._store.load_match_state_or_empty(game_id)
+        pending = records.pending_post_commit_close
+        if pending is None or not close_payload_matches_record(payload, pending):
+            return
+        identity = identity_from_close_record(pending)
+        request = coordinator.request_close(identity, operation_id=pending.operation_id)
+        if request is None or request.outcome is not CloseRequestOutcome.REQUESTED:
+            return
+        session.last_close_operation_id = pending.operation_id
+        if not pending.close_requested:
+            self._store.update_match_state(game_id, _mark_close_requested)
+
+    def _track_close_progress(
+        self,
+        session: _MatchSession,
+        coordinator: ProcessCoordinator,
+        now_utc: str | None,
+    ) -> None:
+        """Advance a pending post-commit close: exit, deadline, force close.
+
+        Force termination happens at most once and only when the match is
+        fully managed with the force-close opt-in, the graceful deadline
+        elapsed, and both a fresh probe and the durable entitlement
+        re-verify the exact identity.
+        """
+        game_id = session.config.game_id
+        records = self._store.load_match_state_or_empty(game_id)
+        pending = records.pending_post_commit_close
+        if pending is not None and pending.close_requested:
+            coordinator.rearm_close_after_restart(pending)
+        identity = coordinator.close_identity
+        if identity is None or coordinator.safely_closed:
+            return
+        probe = coordinator.probe(identity)
+        if probe.outcome is ProbeOutcome.NOT_RUNNING:
+            self.set_process_observation(
+                game_id, observation_from_identity(identity, running=False)
+            )
+            self.reconcile(game_id, now_utc=now_utc)
+            coordinator.note_safely_closed()
+            return
+        if probe.outcome is ProbeOutcome.RUNNING_MISMATCH:
+            coordinator.drop_close_attempt(
+                probe.message or "identity could not be verified"
+            )
+            return
+        if probe.outcome is not ProbeOutcome.RUNNING_MATCH:
+            return
+        if not coordinator.close_deadline_elapsed():
+            return
+        if (
+            session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
+            and session.config.allow_force_close_after_commit
+            and pending is not None
+        ):
+            terminate = coordinator.terminate_entitled(identity, pending)
+            if (
+                terminate is not None
+                and terminate.outcome is TerminateOutcome.TERMINATED
+            ):
+                self.set_process_observation(
+                    game_id, observation_from_identity(identity, running=False)
+                )
+                self.reconcile(game_id, now_utc=now_utc)
+                coordinator.note_safely_closed()
+
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("RelayClient is closed")
@@ -624,6 +1012,17 @@ class RelayClient:
             persisted=True,
             retry_required=True,
         )
+
+
+def _mark_close_requested(records: MatchLocalRecords) -> MatchLocalRecords:
+    """Flip the durable close_requested flag when an entitlement exists."""
+    pending = records.pending_post_commit_close
+    if pending is None or pending.close_requested:
+        return records
+    return replace(
+        records,
+        pending_post_commit_close=replace(pending, close_requested=True),
+    )
 
 
 def _pending_action(

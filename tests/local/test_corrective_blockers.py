@@ -551,6 +551,7 @@ def test_waiting_still_emits_post_commit_close() -> None:
             accepted_sha256=None,
             pid=7,
             process_start_time_utc=NOW_UTC,
+            process_create_time_ns=1_760_184_000_000_000_007,
             executable_path=EXE,
             associated_at=NOW_UTC,
         ),
@@ -567,6 +568,7 @@ def test_waiting_still_emits_post_commit_close() -> None:
         ProcessObservation(
             pid=7,
             process_start_time_utc=NOW_UTC,
+            process_create_time_ns=1_760_184_000_000_000_007,
             executable_path=EXE,
             running=True,
         ),

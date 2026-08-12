@@ -160,6 +160,7 @@ def _apply_exact_handoff_evidence(
                 sha256=evidence.sha256,
                 pid=association.pid,
                 process_start_time_utc=association.process_start_time_utc,
+                process_create_time_ns=association.process_create_time_ns,
                 executable_path=association.executable_path,
                 close_requested=False,
             )
@@ -170,7 +171,7 @@ def _apply_exact_handoff_evidence(
         and observation_matches_association(
             process_observation,
             pid=pending.pid,
-            process_start_time_utc=pending.process_start_time_utc,
+            process_create_time_ns=pending.process_create_time_ns,
             executable_path=pending.executable_path,
         )
         and not process_observation.running
@@ -394,7 +395,7 @@ def reconcile_match(
         and observation_matches_association(
             process_observation,
             pid=pending.pid,
-            process_start_time_utc=pending.process_start_time_utc,
+            process_create_time_ns=pending.process_create_time_ns,
             executable_path=pending.executable_path,
         )
         and not process_observation.running
@@ -560,7 +561,7 @@ def reconcile_match(
         and observation_matches_association(
             process_observation,
             pid=records.process_association.pid,
-            process_start_time_utc=records.process_association.process_start_time_utc,
+            process_create_time_ns=(records.process_association.process_create_time_ns),
             executable_path=records.process_association.executable_path,
         )
         and process_observation.running
