@@ -99,7 +99,7 @@ Output: `dist\civ4-turn-relay-<version>-win64-setup.exe`
 
 | Topic | Behavior |
 |-------|----------|
-| Scope | Per-user only (`PrivilegesRequired=lowest`, `PrivilegesRequiredOverridesAllowed=none`) |
+| Scope | Per-user only (`PrivilegesRequired=lowest`; privilege overrides omitted) |
 | Install dir | `%LOCALAPPDATA%\Programs\civ4-turn-relay` |
 | Shortcuts | Start Menu always; desktop optional |
 | Upgrade | Same `AppId`; replaces files under the install dir only |

@@ -10,12 +10,21 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-    [string]$DistRoot = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot "..")).Path "dist"),
+    [string]$RepoRoot = "",
+    [string]$DistRoot = "",
     [string]$IsccPath = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+# Windows PowerShell may evaluate parameter defaults before $PSScriptRoot is
+# populated. Resolve script-relative defaults after parameter binding instead.
+if (-not $RepoRoot) {
+    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
+if (-not $DistRoot) {
+    $DistRoot = Join-Path $RepoRoot "dist"
+}
 
 function Get-ProjectVersion {
     param([string]$Root)
@@ -42,11 +51,16 @@ function Resolve-Iscc {
     if ($cmd) {
         return $cmd.Source
     }
-    $default = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-    if (Test-Path -LiteralPath $default) {
-        return $default
+    $candidates = @("C:\Program Files (x86)\Inno Setup 6\ISCC.exe")
+    if ($env:LOCALAPPDATA) {
+        $candidates += Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
     }
-    throw "Inno Setup compiler (ISCC.exe) was not found on PATH or at '$default'. Install Inno Setup 6 or pass -IsccPath."
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) {
+            return $candidate
+        }
+    }
+    throw "Inno Setup compiler (ISCC.exe) was not found on PATH or in a standard per-machine/per-user location. Install Inno Setup 6 or pass -IsccPath."
 }
 
 Write-Host "==> civ4-turn-relay installer build"

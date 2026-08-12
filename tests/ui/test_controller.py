@@ -17,10 +17,11 @@ from civ4_turn_relay.app import RelayClient
 from civ4_turn_relay.domain import MatchConfig
 from civ4_turn_relay.local import FakeClock, LocalStore
 from civ4_turn_relay.process import FakeProcessSupervisor
-from civ4_turn_relay.protocol import InitializeOutcome
+from civ4_turn_relay.protocol import InitializeOutcome, InitializeResult
 from civ4_turn_relay.storage import FakeStorage
 from civ4_turn_relay.ui.controller import (
     MatchUiSnapshot,
+    MatchWorker,
     RelayWorkerHub,
     WorkerShutdownOutcome,
 )
@@ -185,6 +186,39 @@ def test_command_errors_are_reported_not_raised(
     assert GAME_ID in message
     # Unknown exception types surface as their class name only (secret-free).
     assert "scripted failure" not in message
+
+
+def test_failed_initialize_does_not_open_or_snapshot_missing_local_config(
+    env: _Env,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = match_config(
+        tmp_path,
+        game_id="failed-initialize",
+        local_player_id="player_a",
+        pbem_name="failed-pbem",
+    )
+    monkeypatch.setattr(
+        env.client,
+        "initialize_or_join",
+        lambda _config: InitializeResult(InitializeOutcome.CAPABILITY_FAILURE),
+    )
+    worker = MatchWorker(env.client)
+    errors: list[str] = []
+    snapshots: list[MatchUiSnapshot] = []
+    worker.error.connect(errors.append)
+    worker.snapshot_ready.connect(snapshots.append)
+
+    worker.initialize_match(config)
+
+    assert worker.open_game_ids == ()
+    assert snapshots == []
+    assert errors == [
+        "failed-initialize: remote match initialization did not complete "
+        "(capability_failure)"
+    ]
+    assert "LocalStoreMissingError" not in errors[0]
 
 
 def test_shutdown_stops_thread_and_is_idempotent(env: _Env, qtbot: QtBot) -> None:

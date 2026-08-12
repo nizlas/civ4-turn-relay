@@ -13,13 +13,22 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
-    [string]$DistRoot = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot "..")).Path "dist"),
+    [string]$RepoRoot = "",
+    [string]$DistRoot = "",
     [switch]$SkipZip,
     [switch]$SkipSmoke
 )
 
 $ErrorActionPreference = "Stop"
+
+# Windows PowerShell may evaluate parameter defaults before $PSScriptRoot is
+# populated. Resolve script-relative defaults after parameter binding instead.
+if (-not $RepoRoot) {
+    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
+if (-not $DistRoot) {
+    $DistRoot = Join-Path $RepoRoot "dist"
+}
 
 function Get-ProjectVersion {
     param([string]$Root)
@@ -116,7 +125,7 @@ if (-not $SkipSmoke) {
     $exe = Join-Path $portableDir "$appName.exe"
     $proc = Start-Process -FilePath $exe -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 3
-    if ($proc.HasExited -and $proc.ExitCode -ne 0) {
+    if ($proc.HasExited) {
         throw "Packaged executable exited early with code $($proc.ExitCode)"
     }
     if (-not $proc.HasExited) {

@@ -488,8 +488,16 @@ def _find_dotenv(data_dir: Path) -> Path | None:
 
 
 def _find_env_example() -> Path | None:
-    candidate = Path.cwd() / ".env.example"
-    return candidate if candidate.is_file() else None
+    candidates = [Path.cwd() / ".env.example"]
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if isinstance(bundle_root, str) and bundle_root:
+        candidates.append(Path(bundle_root) / ".env.example")
+    candidates.append(Path(sys.executable).resolve().parent / ".env.example")
+    candidates.append(Path(__file__).resolve().parents[3] / ".env.example")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def main() -> int:
@@ -501,7 +509,9 @@ def main() -> int:
 
     data_dir = user_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
-    dotenv_path = _find_dotenv(data_dir)
+    # Keep a canonical target even on first run so the settings dialog can
+    # offer to create %APPDATA%\civ4-turn-relay\.env from the packaged template.
+    dotenv_path = _find_dotenv(data_dir) or data_dir / ".env"
     env_example_path = _find_env_example()
 
     config: GlobalConfig | None = None
@@ -566,3 +576,7 @@ def main() -> int:
     # Never close RelayClient here unless the gated quit already completed.
     relay.finalize_after_exec()
     return int(exit_code)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

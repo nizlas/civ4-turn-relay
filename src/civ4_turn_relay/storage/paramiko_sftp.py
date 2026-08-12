@@ -127,8 +127,8 @@ class ParamikoStorage:
 
     def mkdir(self, path: str) -> None:
         remote = self._resolve(path)
-        self._require_capability("exclusive_mkdir", self._capabilities.exclusive_mkdir)
         sftp = self._require_sftp()
+        self._require_capability("exclusive_mkdir", self._capabilities.exclusive_mkdir)
         relative_parent = str(PurePosixPath(path).parent)
         if relative_parent not in {".", ""}:
             parent_remote = self._resolve(relative_parent)
@@ -172,10 +172,10 @@ class ParamikoStorage:
 
     def read_file(self, path: str) -> bytes:
         remote = self._resolve(path)
+        sftp = self._require_sftp()
         self._require_capability(
             "complete_readback", self._capabilities.complete_readback
         )
-        sftp = self._require_sftp()
         kind = self._stat_kind(remote)
         if kind is StorageEntryKind.DIRECTORY:
             raise StorageWrongKindError("path is a directory", path=path)
@@ -246,11 +246,11 @@ class ParamikoStorage:
     def publish_no_replace(self, source: str, destination: str) -> None:
         source_remote = self._resolve(source)
         dest_remote = self._resolve(destination)
+        sftp = self._require_sftp()
         self._require_capability(
             "atomic_publish_no_replace",
             self._capabilities.atomic_publish_no_replace,
         )
-        sftp = self._require_sftp()
         if self._stat_kind(source_remote) is not StorageEntryKind.FILE:
             if self._stat_kind(source_remote) is StorageEntryKind.DIRECTORY:
                 raise StorageWrongKindError("source is a directory", path=source)
@@ -284,8 +284,8 @@ class ParamikoStorage:
     def atomic_replace(self, source: str, destination: str) -> None:
         source_remote = self._resolve(source)
         dest_remote = self._resolve(destination)
-        self._require_capability("atomic_replace", self._capabilities.atomic_replace)
         sftp = self._require_sftp()
+        self._require_capability("atomic_replace", self._capabilities.atomic_replace)
         if not hasattr(sftp, "posix_rename"):
             raise StorageCapabilityError(
                 "posix-rename is unavailable", path=destination
