@@ -624,6 +624,18 @@ evidence does not exist yet. The manual smoke-test checklist lives in
 [`DESKTOP_CLIENT.md`](DESKTOP_CLIENT.md). P7 remains the sole ACTIVE phase
 until that checklist is performed and its results recorded here.
 
+Implementation note (2026-08-12): every Civ launch now runs as one guarded
+launch at the process boundary — an OS-backed interprocess guard (Windows
+named mutex derived from a SHA-256 digest of the normalized executable path)
+serializes Relay instances in the same Windows session, and a defensive
+machine scan for the exact configured executable runs under the guard before
+any spawn. An already-running Civ defers the launch as a typed waiting status
+(the launch-attempt key is not consumed; fully managed retries on later
+ticks, standard mode waits for an explicit Start), never touching the
+existing process. See [`DESKTOP_CLIENT.md`](DESKTOP_CLIENT.md) “Cross-instance
+launch guard”. Covered by deterministic two-client fake-machine tests; real
+named-mutex semantics are exercised by Windows-only tests.
+
 ### Goal
 
 Empirically determine and implement launch/process integration for Steam/BTS/AdvCiv: mod + save, already-running detection, exit without save (FR-010), and Fully managed close/verify behavior (FR-015).
