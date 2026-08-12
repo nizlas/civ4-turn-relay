@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -18,7 +19,11 @@ from civ4_turn_relay.local import FakeClock, LocalStore
 from civ4_turn_relay.process import FakeProcessSupervisor
 from civ4_turn_relay.protocol import InitializeOutcome
 from civ4_turn_relay.storage import FakeStorage
-from civ4_turn_relay.ui.controller import MatchUiSnapshot, RelayWorkerHub
+from civ4_turn_relay.ui.controller import (
+    MatchUiSnapshot,
+    RelayWorkerHub,
+    WorkerShutdownOutcome,
+)
 from tests.e2e_fake.helpers import GAME_ID, GAME_ID_B, NOW_UTC, match_config
 
 LOCAL_UUID = uuid.UUID("31313131-3131-4131-8131-313131313131")
@@ -185,13 +190,125 @@ def test_command_errors_are_reported_not_raised(
 def test_shutdown_stops_thread_and_is_idempotent(env: _Env, qtbot: QtBot) -> None:
     _open(env, qtbot, GAME_ID)
     env.hub.start_polling(25)
-    env.hub.shutdown()
+    first = env.hub.shutdown()
+    assert first.outcome is WorkerShutdownOutcome.SUCCEEDED
     assert env.hub.worker_thread.isFinished()
     assert env.hub.join_timed_out is False
-    env.hub.shutdown()  # idempotent
+    assert env.hub.client_closed is True
+    second = env.hub.shutdown()  # idempotent
+    assert second.outcome is WorkerShutdownOutcome.ALREADY_SHUT_DOWN
     with pytest.raises(RuntimeError):
         env.client.snapshot(GAME_ID)
     with qtbot.waitSignal(env.hub.error, timeout=TIMEOUT_MS) as errored:
         env.hub.request_start(GAME_ID)
     assert errored.args is not None
     assert "shut down" in errored.args[0]
+
+
+def test_successful_shutdown_uses_finished_deleteLater_not_gui_delete(
+    env: _Env, qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Worker destruction is owned by QThread.finished, not a post-join GUI call."""
+    _open(env, qtbot, GAME_ID)
+    terminate_calls: list[str] = []
+
+    def forbid_terminate(self: QThread) -> None:
+        terminate_calls.append(self.objectName() or "thread")
+        raise AssertionError("QThread.terminate must never be used")
+
+    monkeypatch.setattr(QThread, "terminate", forbid_terminate)
+
+    result = env.hub.shutdown()
+    assert result.outcome is WorkerShutdownOutcome.SUCCEEDED
+    assert env.hub.worker_thread.isFinished()
+    assert env.hub.worker_thread.isRunning() is False
+    assert env.hub.client_closed is True
+    assert terminate_calls == []
+    # finished→deleteLater eventually invalidates the worker QObject.
+    qtbot.waitUntil(
+        lambda: _worker_deleted(env.hub),
+        timeout=TIMEOUT_MS,
+    )
+
+
+def _worker_deleted(hub: RelayWorkerHub) -> bool:
+    try:
+        hub._worker.objectName()
+    except RuntimeError:
+        return True
+    return False
+
+
+def test_shutdown_join_timeout_keeps_client_open_and_allows_retry(
+    tmp_path: Path, qapp: QApplication, qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del qapp
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    root = tmp_path / "local"
+    store = LocalStore(root)
+    store.get_or_create_installation_identity(uuid_factory=lambda: LOCAL_UUID)
+    client = RelayClient(
+        store=store,
+        storage=storage,
+        clock=clock,
+        poll_interval_seconds=0.1,
+        now_utc_fn=lambda: NOW_UTC,
+        process_supervisor=supervisor,
+        civ4_executable=None,
+    )
+    config = match_config(root, local_player_id="player_a", pbem_name="pbem-a")
+    created = client.initialize_or_join(config, operation_id=OP_A)
+    assert created.outcome is InitializeOutcome.CREATED
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_request_start(game_id: str, **_kwargs: object) -> None:
+        del game_id
+        started.set()
+        if not release.wait(timeout=30):
+            raise TimeoutError("test release event was never set")
+
+    monkeypatch.setattr(client, "request_start", blocking_request_start)
+
+    terminate_calls: list[str] = []
+
+    def forbid_terminate(self: QThread) -> None:
+        terminate_calls.append(self.objectName() or "thread")
+        raise AssertionError("QThread.terminate must never be used")
+
+    monkeypatch.setattr(QThread, "terminate", forbid_terminate)
+
+    hub = RelayWorkerHub(client, shutdown_wait_ms=150)
+    try:
+        with qtbot.waitSignal(hub.snapshot_ready, timeout=TIMEOUT_MS):
+            hub.open_match(config)
+        hub.request_start(GAME_ID)
+        qtbot.waitUntil(started.is_set, timeout=TIMEOUT_MS)
+
+        timed_out = hub.shutdown()
+        assert timed_out.outcome is WorkerShutdownOutcome.JOIN_TIMED_OUT
+        assert timed_out.join_timed_out is True
+        assert hub.join_timed_out is True
+        assert hub.worker_thread.isRunning()
+        assert hub.client_closed is False
+        assert terminate_calls == []
+        # Premature close would make snapshot raise; it must still work.
+        assert client.snapshot(GAME_ID).game_id == GAME_ID
+
+        release.set()
+        qtbot.waitUntil(lambda: not hub.worker_thread.isRunning(), timeout=TIMEOUT_MS)
+
+        retried = hub.shutdown()
+        assert retried.outcome is WorkerShutdownOutcome.SUCCEEDED
+        assert hub.client_closed is True
+        assert hub.join_timed_out is False
+        assert hub.worker_thread.isFinished()
+        assert terminate_calls == []
+        with pytest.raises(RuntimeError):
+            client.snapshot(GAME_ID)
+    finally:
+        release.set()
+        hub.shutdown()

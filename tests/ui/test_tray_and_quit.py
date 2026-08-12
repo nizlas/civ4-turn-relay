@@ -2,24 +2,26 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 from pytestqt.qtbot import QtBot
 
 from civ4_turn_relay.app import RelayClient
 from civ4_turn_relay.app.process_runtime import ProcessStatus
-from civ4_turn_relay.domain import OperationalState
+from civ4_turn_relay.domain import MatchConfig, OperationalState
 from civ4_turn_relay.local import FakeClock, LocalStore
 from civ4_turn_relay.process import FakeProcessSupervisor
 from civ4_turn_relay.protocol import InitializeOutcome
 from civ4_turn_relay.storage import FakeStorage
 from civ4_turn_relay.ui.app import RelayApplication
-from civ4_turn_relay.ui.controller import MatchUiSnapshot
+from civ4_turn_relay.ui.controller import MatchUiSnapshot, RelayWorkerHub
 from civ4_turn_relay.ui.tray import RelayTray
 from tests.e2e_fake.helpers import GAME_ID, NOW_UTC, match_config
 from tests.ui.helpers import client_snapshot, process_snapshot
@@ -197,3 +199,91 @@ def test_about_to_quit_triggers_shutdown(
     qapp.aboutToQuit.emit()
     assert env.app.hub.worker_thread.isFinished()
     assert env.supervisor.terminations == []
+
+
+def test_request_quit_timeout_keeps_relay_open_then_retries(
+    tmp_path: Path,
+    qapp: QApplication,
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del qapp
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    root = tmp_path / "local"
+    store = LocalStore(root)
+    store.get_or_create_installation_identity(uuid_factory=lambda: LOCAL_UUID)
+    client = RelayClient(
+        store=store,
+        storage=storage,
+        clock=clock,
+        poll_interval_seconds=0.1,
+        now_utc_fn=lambda: NOW_UTC,
+        process_supervisor=supervisor,
+        civ4_executable=None,
+    )
+    config = match_config(root, local_player_id="player_a", pbem_name="pbem-a")
+    created = client.initialize_or_join(config, operation_id=OP_A)
+    assert created.outcome is InitializeOutcome.CREATED
+
+    started = threading.Event()
+    release = threading.Event()
+    real_open_match = client.open_match
+
+    def blocking_open(match_config_arg: MatchConfig) -> None:
+        started.set()
+        if not release.wait(timeout=30):
+            raise TimeoutError("test release event was never set")
+        real_open_match(match_config_arg)
+
+    quits: list[int] = []
+    warnings: list[str] = []
+
+    def fake_warning(
+        parent: QWidget | None, title: str, text: str, *args: object
+    ) -> QMessageBox.StandardButton:
+        del parent, args
+        warnings.append(f"{title}: {text}")
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(fake_warning))
+    monkeypatch.setattr(
+        QThread,
+        "terminate",
+        lambda self: (_ for _ in ()).throw(
+            AssertionError("QThread.terminate must never be used")
+        ),
+    )
+
+    hub = RelayWorkerHub(client, shutdown_wait_ms=150)
+    monkeypatch.setattr(client, "open_match", blocking_open)
+    app = RelayApplication(
+        client=client,
+        global_config=None,
+        enable_tray=False,
+        hub=hub,
+        quit_fn=lambda: quits.append(1),
+    )
+    try:
+        app.hub.open_match(config)
+        qtbot.waitUntil(started.is_set, timeout=5_000)
+
+        app.request_quit()
+        assert quits == []
+        assert len(warnings) == 1
+        assert "background operation" in warnings[0]
+        assert app.hub.worker_thread.isRunning()
+        assert app.hub.client_closed is False
+        assert client.snapshot(GAME_ID).game_id == GAME_ID
+        assert supervisor.terminations == []
+
+        release.set()
+        qtbot.waitUntil(lambda: not app.hub.worker_thread.isRunning(), timeout=5_000)
+        app.request_quit()
+        assert quits == [1]
+        assert app.hub.client_closed is True
+        assert supervisor.terminations == []
+    finally:
+        release.set()
+        app.shutdown()

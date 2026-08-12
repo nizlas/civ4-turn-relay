@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum, unique
 
 from PySide6.QtCore import (
     QDeadlineTimer,
     QObject,
-    Qt,
     QThread,
     QTimer,
     Signal,
@@ -43,6 +43,33 @@ class MatchUiSnapshot:
     @property
     def game_id(self) -> str:
         return self.client.game_id
+
+
+@unique
+class WorkerShutdownOutcome(Enum):
+    """Result of an orderly :meth:`RelayWorkerHub.shutdown` attempt."""
+
+    SUCCEEDED = "succeeded"
+    ALREADY_SHUT_DOWN = "already_shut_down"
+    JOIN_TIMED_OUT = "join_timed_out"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerShutdownResult:
+    """Typed shutdown result for the coordinator / UI."""
+
+    outcome: WorkerShutdownOutcome
+
+    @property
+    def succeeded(self) -> bool:
+        return self.outcome in {
+            WorkerShutdownOutcome.SUCCEEDED,
+            WorkerShutdownOutcome.ALREADY_SHUT_DOWN,
+        }
+
+    @property
+    def join_timed_out(self) -> bool:
+        return self.outcome is WorkerShutdownOutcome.JOIN_TIMED_OUT
 
 
 def _safe_error_text(game_id: str, error: BaseException) -> str:
@@ -222,16 +249,28 @@ class RelayWorkerHub(QObject):
     _focus_requested = Signal(str)
     _close_civ_requested = Signal(str)
 
-    def __init__(self, client: RelayClient, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        client: RelayClient,
+        parent: QObject | None = None,
+        *,
+        shutdown_wait_ms: int = _SHUTDOWN_WAIT_MS,
+    ) -> None:
         super().__init__(parent)
         self._client = client
         self._busy: set[str] = set()
         self._shut_down = False
+        self._client_closed = False
         self._join_timed_out = False
+        self._shutdown_quit_posted = False
+        self._shutdown_wait_ms = max(1, int(shutdown_wait_ms))
         self._thread = QThread()
         self._thread.setObjectName("relay-worker")
         self._worker = MatchWorker(client)
         self._worker.moveToThread(self._thread)
+        # Standard Qt ownership: delete the worker when its thread finishes.
+        # Do not call deleteLater() from the GUI thread after join.
+        self._thread.finished.connect(self._worker.deleteLater)
 
         self._worker.snapshot_ready.connect(self.snapshot_ready)
         self._worker.error.connect(self.error)
@@ -240,12 +279,9 @@ class RelayWorkerHub(QObject):
         self._open_match_requested.connect(self._worker.open_match)
         self._initialize_requested.connect(self._worker.initialize_match)
         self._start_polling_requested.connect(self._worker.start_polling)
-        # Blocking so shutdown() stops the worker-owned timer on that thread
-        # before the event loop is asked to quit.
-        self._prepare_shutdown_requested.connect(
-            self._worker.prepare_shutdown,
-            Qt.ConnectionType.BlockingQueuedConnection,
-        )
+        # Queued (not blocking): a long in-flight RelayClient call must not
+        # freeze the GUI thread; shutdown uses wait() with a typed timeout.
+        self._prepare_shutdown_requested.connect(self._worker.prepare_shutdown)
         self._poll_requested.connect(self._worker.poll)
         self._request_start_requested.connect(self._worker.request_start)
         self._send_save_requested.connect(self._worker.send_save)
@@ -262,8 +298,13 @@ class RelayWorkerHub(QObject):
 
     @property
     def join_timed_out(self) -> bool:
-        """True when the last shutdown could not join the worker in time."""
+        """True when the last shutdown attempt timed out joining the worker."""
         return self._join_timed_out
+
+    @property
+    def client_closed(self) -> bool:
+        """True after a successful shutdown closed the RelayClient."""
+        return self._client_closed
 
     def start_polling(self, interval_ms: int) -> None:
         self._start_polling_requested.emit(interval_ms)
@@ -303,58 +344,89 @@ class RelayWorkerHub(QObject):
         if self._dispatchable(game_id):
             self._close_civ_requested.emit(game_id)
 
-    def shutdown(self) -> None:
-        """Stop polling, join the worker, then close the client. Idempotent.
+    def shutdown(self) -> WorkerShutdownResult:
+        """Stop polling, join the worker, then close the client.
 
-        Order is deliberate for PySide6 teardown safety:
-
-        1. Refuse further GUI dispatch (``_shut_down``).
-        2. On the worker thread, stop the timer and refuse RelayClient calls.
-        3. Quit and join the worker thread before touching the client.
-        4. Disconnect queued signals so late emissions cannot reach a dying GUI.
-        5. Close the RelayClient (watchers / owned storage) only after the join.
+        Successful shutdown is idempotent. A join timeout is observable, never
+        uses ``QThread.terminate()``, never closes ``RelayClient`` while the
+        worker may still be running, and may be retried later.
         """
-        if self._shut_down:
-            return
+        if self._client_closed:
+            return WorkerShutdownResult(WorkerShutdownOutcome.ALREADY_SHUT_DOWN)
+
+        # Refuse new GUI dispatch for this and any concurrent quit attempts.
         self._shut_down = True
+        self._join_timed_out = False
+
         if self._thread.isRunning():
-            self._prepare_shutdown_requested.emit()
-            self._thread.quit()
-            joined = self._thread.wait(QDeadlineTimer(_SHUTDOWN_WAIT_MS))
+            # Post prepare+quit once; retries only wait again so we never race
+            # a second quit against an already-deleting worker.
+            if not self._shutdown_quit_posted:
+                # Queue prepare_shutdown first; the queued call remains even
+                # after disconnect. Disconnect while the worker is still alive
+                # so we never touch it after finished→deleteLater.
+                self._prepare_shutdown_requested.emit()
+                self._disconnect_worker_signals()
+                self._thread.quit()
+                self._shutdown_quit_posted = True
+            joined = self._thread.wait(QDeadlineTimer(self._shutdown_wait_ms))
             if not joined:
                 self._join_timed_out = True
-                # Last resort so process exit cannot hang forever with a live
-                # worker holding the storage connection.
-                self._thread.terminate()
-                self._thread.wait(QDeadlineTimer(2_000))
-        self._disconnect_worker_signals()
-        self._worker.deleteLater()
+                # Leave the worker and RelayClient intact for a later retry.
+                return WorkerShutdownResult(WorkerShutdownOutcome.JOIN_TIMED_OUT)
+        else:
+            # Thread already finished (e.g. after a prior timed-out quit).
+            self._disconnect_worker_signals()
+
         self._client.close()
+        self._client_closed = True
+        return WorkerShutdownResult(WorkerShutdownOutcome.SUCCEEDED)
+
+    def _worker_is_alive(self) -> bool:
+        try:
+            from shiboken6 import isValid
+
+            return bool(isValid(self._worker))
+        except Exception:
+            try:
+                self._worker.objectName()
+            except RuntimeError:
+                return False
+            return True
 
     def _disconnect_worker_signals(self) -> None:
-        pairs: tuple[tuple[object, object], ...] = (
-            (self._worker.snapshot_ready, self.snapshot_ready),
-            (self._worker.error, self.error),
-            (self._worker.command_finished, self._on_command_finished),
-            (self._open_match_requested, self._worker.open_match),
-            (self._initialize_requested, self._worker.initialize_match),
-            (self._start_polling_requested, self._worker.start_polling),
-            (self._prepare_shutdown_requested, self._worker.prepare_shutdown),
-            (self._poll_requested, self._worker.poll),
-            (self._request_start_requested, self._worker.request_start),
-            (self._send_save_requested, self._worker.send_save),
-            (self._select_candidate_requested, self._worker.select_candidate),
-            (self._retry_requested, self._worker.retry),
-            (self._focus_requested, self._worker.focus_civ),
-            (self._close_civ_requested, self._worker.close_civ),
-        )
+        if not self._worker_is_alive():
+            return
+        try:
+            worker = self._worker
+            pairs: tuple[tuple[object, object], ...] = (
+                (worker.snapshot_ready, self.snapshot_ready),
+                (worker.error, self.error),
+                (worker.command_finished, self._on_command_finished),
+                (self._open_match_requested, worker.open_match),
+                (self._initialize_requested, worker.initialize_match),
+                (self._start_polling_requested, worker.start_polling),
+                (self._prepare_shutdown_requested, worker.prepare_shutdown),
+                (self._poll_requested, worker.poll),
+                (self._request_start_requested, worker.request_start),
+                (self._send_save_requested, worker.send_save),
+                (self._select_candidate_requested, worker.select_candidate),
+                (self._retry_requested, worker.retry),
+                (self._focus_requested, worker.focus_civ),
+                (self._close_civ_requested, worker.close_civ),
+            )
+        except RuntimeError:
+            # Worker QObject already deleted via finished→deleteLater.
+            return
         for signal, slot in pairs:
+            if not self._worker_is_alive():
+                return
             disconnect = getattr(signal, "disconnect", None)
             if disconnect is None:
                 continue
             try:
                 disconnect(slot)
-            except (RuntimeError, TypeError):
+            except (RuntimeError, TypeError, SystemError):
                 pass
 
     def _dispatchable(self, game_id: str) -> bool:

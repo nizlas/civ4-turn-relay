@@ -29,7 +29,11 @@ from civ4_turn_relay.storage import (
     StorageEntry,
     StorageTransportError,
 )
-from civ4_turn_relay.ui.controller import RelayWorkerHub
+from civ4_turn_relay.ui.controller import (
+    RelayWorkerHub,
+    WorkerShutdownOutcome,
+    WorkerShutdownResult,
+)
 from civ4_turn_relay.ui.main_window import MainWindow
 from civ4_turn_relay.ui.match_dialog import MatchEditDialog
 from civ4_turn_relay.ui.settings_dialog import GlobalSettingsDialog
@@ -39,6 +43,13 @@ _QUIT_QUESTION = (
     "Civilization is still running or a turn operation is in flight.\n\n"
     "Relay will NOT close Civilization and will not change any match "
     "state. Quit anyway?"
+)
+
+_SHUTDOWN_TIMEOUT_MESSAGE = (
+    "Relay could not quit yet because a background operation is still "
+    "running (for example syncing with the server).\n\n"
+    "Civilization was NOT closed and match state was not changed. Wait "
+    "for the operation to finish, then choose Quit again."
 )
 
 
@@ -157,7 +168,12 @@ class RelayApplication:
         self.window.show()
 
     def request_quit(self) -> None:
-        """Quit flow: confirm while active, then shut down cleanly."""
+        """Quit flow: confirm while active, then shut down cleanly.
+
+        Does not call ``QApplication.quit`` until the worker has joined
+        successfully. A timed-out join keeps Relay open for a later retry and
+        never terminates Civilization.
+        """
         if self._shut_down:
             return
         if self.window.has_active_match():
@@ -170,16 +186,31 @@ class RelayApplication:
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        self.shutdown()
-        self._quit_fn()
+        result = self.shutdown()
+        if result.succeeded:
+            self._quit_fn()
+            return
+        QMessageBox.warning(
+            self.window,
+            "Relay is still busy",
+            _SHUTDOWN_TIMEOUT_MESSAGE,
+        )
 
-    def shutdown(self) -> None:
-        """Stop timers, join the worker, dispose tray/window. Idempotent.
+    def shutdown(self) -> WorkerShutdownResult:
+        """Stop timers, join the worker, dispose tray/window when successful.
 
-        Never terminates Civilization and never mutates match ownership.
+        Never terminates Civilization and never mutates match ownership. On a
+        join timeout the UI stays open, ``RelayClient`` stays open, and quit
+        may be retried after the in-flight worker operation finishes.
         """
         if self._shut_down:
-            return
+            return WorkerShutdownResult(WorkerShutdownOutcome.ALREADY_SHUT_DOWN)
+
+        result = self.hub.shutdown()
+        if not result.succeeded:
+            self.window.on_error(_SHUTDOWN_TIMEOUT_MESSAGE.replace("\n\n", " "))
+            return result
+
         self._shut_down = True
         self.window.allow_quit()
         try:
@@ -194,8 +225,8 @@ class RelayApplication:
         self.tray = None
         if tray is not None:
             tray.dispose()
-        self.hub.shutdown()
         self.window.close()
+        return result
 
     # ----- coordinator actions ------------------------------------------
 

@@ -45,6 +45,7 @@ def test_user_data_dir_falls_back_to_home(
 
 def test_packaging_scripts_exist() -> None:
     assert (PACKAGING / "build_windows.ps1").is_file()
+    assert (PACKAGING / "build_installer.ps1").is_file()
     assert (PACKAGING / "installer.iss").is_file()
     assert (PACKAGING / "civ4-turn-relay.spec").is_file()
     assert (PACKAGING / "tools" / "run_ui_teardown_stress.ps1").is_file()
@@ -54,6 +55,8 @@ def test_packaging_scripts_exist() -> None:
 def test_installer_is_per_user_and_preserves_appdata() -> None:
     text = (PACKAGING / "installer.iss").read_text(encoding="utf-8")
     assert "PrivilegesRequired=lowest" in text
+    assert "PrivilegesRequiredOverridesAllowed=none" in text
+    assert "PrivilegesRequiredOverridesAllowed=dialog" not in text
     assert r"{localappdata}\Programs\civ4-turn-relay" in text
     assert "{userdesktop}" in text
     assert "NEVER" in text and "civ4-turn-relay" in text
@@ -82,6 +85,26 @@ def test_build_script_refuses_secrets_and_uses_project_version() -> None:
     assert "mod=Mods" not in text  # launch argv belongs in process code, not packaging
 
 
+def test_installer_build_wrapper_reads_version_and_requires_portable() -> None:
+    text = (PACKAGING / "build_installer.ps1").read_text(encoding="utf-8")
+    assert "Get-ProjectVersion" in text
+    assert "pyproject.toml" in text
+    assert "MyAppVersion" in text
+    assert "ISCC" in text
+    assert "build_windows.ps1" in text
+    assert "Portable build output not found" in text or "portable" in text.lower()
+
+
+def test_teardown_stress_script_uses_reporoot() -> None:
+    text = (PACKAGING / "tools" / "run_ui_teardown_stress.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "Push-Location" in text
+    assert "Pop-Location" in text
+    assert "pyproject.toml" in text
+    assert "RepoRoot" in text
+
+
 def test_pyinstaller_spec_excludes_tests_and_ships_env_example_only() -> None:
     text = (PACKAGING / "civ4-turn-relay.spec").read_text(encoding="utf-8")
     assert "excludes=[" in text
@@ -106,4 +129,7 @@ def test_release_docs_mention_manual_p7_and_unsigned_builds() -> None:
     assert "unsigned" in text.lower()
     assert "%APPDATA%\\civ4-turn-relay" in text or "%APPDATA%" in text
     assert "run_ui_teardown_stress.ps1" in text
+    assert "build_installer.ps1" in text
+    assert "PrivilegesRequiredOverridesAllowed=none" in text
     assert "P7" in text and "ACTIVE" in text
+    assert "0.1.0" not in text.split("## Installer build", 1)[1].split("## ", 1)[0]

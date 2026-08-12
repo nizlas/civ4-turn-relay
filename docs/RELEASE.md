@@ -85,10 +85,13 @@ After a successful portable build:
 
 ```powershell
 # Optional: copy verified vc_redist.x64.exe into packaging\prereq\
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-  /DMyAppVersion=0.1.0 `
-  packaging\installer.iss
+powershell -File packaging\build_installer.ps1
 ```
+
+The wrapper reads `version` from `pyproject.toml`, requires
+`dist\civ4-turn-relay-<version>-win64-portable\`, and invokes `ISCC.exe` with
+matching `/DMyAppVersion=...`. It fails clearly when Inno Setup or the portable
+output is missing. Do not hand-copy the version into an ISCC command line.
 
 Output: `dist\civ4-turn-relay-<version>-win64-setup.exe`
 
@@ -96,7 +99,7 @@ Output: `dist\civ4-turn-relay-<version>-win64-setup.exe`
 
 | Topic | Behavior |
 |-------|----------|
-| Scope | Per-user (`PrivilegesRequired=lowest`) |
+| Scope | Per-user only (`PrivilegesRequired=lowest`, `PrivilegesRequiredOverridesAllowed=none`) |
 | Install dir | `%LOCALAPPDATA%\Programs\civ4-turn-relay` |
 | Shortcuts | Start Menu always; desktop optional |
 | Upgrade | Same `AppId`; replaces files under the install dir only |
@@ -125,13 +128,18 @@ whether to sign).
 Orderly shutdown now:
 
 1. Stops the worker-owned poll timer on the worker thread
-2. Joins the worker before closing `RelayClient`
-3. Disconnects queued signals and disposes tray/menu on the Qt thread
-4. Hooks `QApplication.aboutToQuit`
+2. Joins the worker before closing `RelayClient` (never uses `QThread.terminate()`)
+3. On join timeout: keeps Relay open, leaves `RelayClient` open, shows a
+   diagnostic, and allows Quit to be retried after the in-flight operation
+4. Destroys the worker via `QThread.finished → deleteLater` (not a post-join
+   GUI-thread `deleteLater`)
+5. Disconnects queued signals and disposes tray/menu on the Qt thread only
+   after a successful join
+6. Hooks `QApplication.aboutToQuit`
 
 Automated coverage:
 
-- In-process UI shutdown tests under `tests/ui/`
+- In-process UI shutdown tests under `tests/ui/` (including join-timeout + retry)
 - Fresh-interpreter checks in `tests/ui/test_teardown_subprocess.py`
 
 **Windows stress (manual / CI agent with GUI stack):**

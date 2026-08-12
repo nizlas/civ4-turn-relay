@@ -20,6 +20,15 @@ param(
 $ErrorActionPreference = "Stop"
 $env:QT_QPA_PLATFORM = "offscreen"
 
+if (-not (Test-Path -LiteralPath $RepoRoot)) {
+    throw "RepoRoot does not exist: $RepoRoot"
+}
+$RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
+$pyproject = Join-Path $RepoRoot "pyproject.toml"
+if (-not (Test-Path -LiteralPath $pyproject)) {
+    throw "RepoRoot must contain pyproject.toml (got: $RepoRoot)"
+}
+
 $nodeIds = @(
     "tests/ui/test_tray_and_quit.py::test_quit_when_idle_needs_no_confirmation",
     "tests/ui/test_tray_and_quit.py::test_shutdown_is_idempotent_and_blocks_further_commands",
@@ -30,14 +39,20 @@ $nodeIds = @(
 Write-Host "RepoRoot   : $RepoRoot"
 Write-Host "Iterations : $Iterations"
 
-for ($i = 1; $i -le $Iterations; $i++) {
-    Write-Host "==> Iteration $i / $Iterations"
-    foreach ($node in $nodeIds) {
-        & python -m pytest $node -q --tb=line
-        if ($LASTEXITCODE -ne 0) {
-            throw "UI teardown stress failed on iteration $i for $node (exit $LASTEXITCODE)"
+Push-Location -LiteralPath $RepoRoot
+try {
+    for ($i = 1; $i -le $Iterations; $i++) {
+        Write-Host "==> Iteration $i / $Iterations"
+        foreach ($node in $nodeIds) {
+            & python -m pytest $node -q --tb=line
+            if ($LASTEXITCODE -ne 0) {
+                throw "UI teardown stress failed on iteration $i for $node (exit $LASTEXITCODE)"
+            }
         }
     }
+}
+finally {
+    Pop-Location
 }
 
 Write-Host "All $Iterations iterations completed with exit code 0."
