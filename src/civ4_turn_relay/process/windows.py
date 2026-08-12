@@ -10,7 +10,6 @@ match ownership.
 from __future__ import annotations
 
 import math
-import os
 import subprocess
 import sys
 import time
@@ -34,6 +33,7 @@ from civ4_turn_relay.process.guard import (
     classify_scan_entries,
     execute_guarded_launch,
     launch_guard_name,
+    normalize_windows_executable,
 )
 from civ4_turn_relay.process.launch_config import CivLaunchCommand
 from civ4_turn_relay.process.port import (
@@ -123,8 +123,8 @@ def _epoch_to_create_time_ns(epoch: float) -> int:
 
 
 def _normalize_executable(path: str) -> str:
-    """Normalize an executable path for comparison only (never stored)."""
-    return os.path.normpath(path).casefold()
+    """Normalize a Windows executable path for comparison only (never stored)."""
+    return normalize_windows_executable(path)
 
 
 def _visible_top_level_windows(pid: int) -> list[int]:
@@ -270,6 +270,10 @@ def _handle_from_win32(value: object) -> int | None:
 class MutexReleaseError(OSError):
     """Raised when ReleaseMutex or CloseHandle fails for an owned mutex."""
 
+    def __init__(self, errno: int, strerror: str, *, operation: str) -> None:
+        super().__init__(errno, strerror)
+        self.operation = operation
+
 
 @runtime_checkable
 class Win32MutexApi(Protocol):
@@ -395,7 +399,14 @@ class WindowsNamedMutexLaunchGuard:
                     "a fresh process scan still runs before any launch"
                 ),
             )
-        self._api.close_handle(handle)
+        wait_error = self._api.get_last_error() if wait == WAIT_FAILED else 0
+        closed = self._api.close_handle(handle)
+        if not closed:
+            close_error = self._api.get_last_error()
+            return GuardAcquisition(
+                outcome=GuardAcquireOutcome.UNAVAILABLE,
+                message=f"CloseHandle failed (error {close_error})",
+            )
         if wait == WAIT_TIMEOUT:
             return GuardAcquisition(
                 outcome=GuardAcquireOutcome.BUSY,
@@ -406,7 +417,7 @@ class WindowsNamedMutexLaunchGuard:
             )
         return GuardAcquisition(
             outcome=GuardAcquireOutcome.UNAVAILABLE,
-            message=f"WaitForSingleObject failed (status {wait})",
+            message=(f"WaitForSingleObject failed (status {wait}, error {wait_error})"),
         )
 
     def release(self, acquisition: GuardAcquisition) -> None:
@@ -422,11 +433,15 @@ class WindowsNamedMutexLaunchGuard:
         close_error = 0 if closed else self._api.get_last_error()
         if not released:
             raise MutexReleaseError(
-                release_error, f"ReleaseMutex failed (error {release_error})"
+                release_error,
+                f"ReleaseMutex failed (error {release_error})",
+                operation="ReleaseMutex",
             )
         if not closed:
             raise MutexReleaseError(
-                close_error, f"CloseHandle failed (error {close_error})"
+                close_error,
+                f"CloseHandle failed (error {close_error})",
+                operation="CloseHandle",
             )
 
 

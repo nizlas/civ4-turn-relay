@@ -5,6 +5,7 @@ from civ4_turn_relay.process.guard import (
     LAUNCH_DEFERRED_OUTCOMES,
     GuardAcquireOutcome,
     GuardAcquisition,
+    GuardCleanupOutcome,
     GuardedLaunchOutcome,
     GuardedLaunchResult,
     LaunchGuard,
@@ -14,6 +15,8 @@ from civ4_turn_relay.process.guard import (
     classify_scan_entries,
     execute_guarded_launch,
     launch_guard_name,
+    normalize_windows_executable,
+    windows_executable_basename,
 )
 from civ4_turn_relay.process.launch_config import (
     CivLaunchCommand,
@@ -63,6 +66,7 @@ __all__ = [
     "FocusResult",
     "GuardAcquireOutcome",
     "GuardAcquisition",
+    "GuardCleanupOutcome",
     "GuardedLaunchOutcome",
     "GuardedLaunchResult",
     "LaunchGuard",
@@ -92,5 +96,7 @@ __all__ = [
     "classify_scan_entries",
     "execute_guarded_launch",
     "launch_guard_name",
+    "normalize_windows_executable",
     "observation_from_identity",
+    "windows_executable_basename",
 ]

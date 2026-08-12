@@ -16,9 +16,8 @@ is re-armed once from the current clock.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, unique
 
 from civ4_turn_relay.local.clock import Clock
@@ -38,6 +37,7 @@ from civ4_turn_relay.process import (
     ProcessSupervisor,
     SupervisorAvailability,
     TerminateResult,
+    normalize_windows_executable,
 )
 
 GRACEFUL_CLOSE_DEADLINE_SECONDS: float = 15.0
@@ -71,6 +71,7 @@ class ProcessStatusSnapshot:
     launch_blocked_reason: str | None = None
     force_close_allowed: bool = False
     close_deadline_remaining_seconds: float | None = None
+    cleanup_warning: str | None = None
 
 
 def _identity_key(identity: ProcessIdentity) -> tuple[int, int, str]:
@@ -82,7 +83,7 @@ def _identity_key(identity: ProcessIdentity) -> tuple[int, int, str]:
     return (
         identity.pid,
         identity.process_create_time_ns,
-        os.path.normpath(identity.executable_path).casefold(),
+        normalize_windows_executable(identity.executable_path),
     )
 
 
@@ -155,6 +156,7 @@ class ProcessCoordinator:
         self._close_deadline: float | None = None
         self._force_close_attempted = False
         self._safely_closed = False
+        self._cleanup_warning: str | None = None
 
     @property
     def civ4_executable(self) -> str | None:
@@ -247,6 +249,14 @@ class ProcessCoordinator:
             self._launch_failure_message = result.message or result.outcome.value
             self._launch_deferred_outcome = None
             self._launch_deferred_message = None
+        if result.cleanup_failed:
+            self._cleanup_warning = result.cleanup_message or (
+                result.cleanup_outcome.value
+                if result.cleanup_outcome is not None
+                else "launch-guard cleanup failed"
+            )
+        else:
+            self._cleanup_warning = None
         return result
 
     def clear_launch_deferral(self) -> None:
@@ -370,6 +380,19 @@ class ProcessCoordinator:
         force_close_allowed: bool,
     ) -> ProcessStatusSnapshot:
         """Compute the typed status; probes here are read-only fact checks."""
+        snapshot = self._status_snapshot(
+            association=association, force_close_allowed=force_close_allowed
+        )
+        if self._cleanup_warning:
+            return replace(snapshot, cleanup_warning=self._cleanup_warning)
+        return snapshot
+
+    def _status_snapshot(
+        self,
+        *,
+        association: ProcessIdentity | None,
+        force_close_allowed: bool,
+    ) -> ProcessStatusSnapshot:
         availability = self._supervisor.availability()
         if not availability.available:
             return ProcessStatusSnapshot(

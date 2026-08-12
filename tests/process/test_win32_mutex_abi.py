@@ -34,6 +34,9 @@ class FakeWin32MutexApi:
         self.release_result = True
         self.close_result = True
         self.last_error = 0
+        self.wait_error = 0
+        self.close_error = 0
+        self.release_error = 0
         self.calls: list[tuple[object, ...]] = []
 
     def create_mutex_w(self, name: str) -> int | None:
@@ -42,14 +45,23 @@ class FakeWin32MutexApi:
 
     def wait_for_single_object(self, handle: int, timeout_ms: int) -> int:
         self.calls.append(("WaitForSingleObject", handle, timeout_ms))
+        if self.wait_result == WAIT_FAILED and self.wait_error:
+            self.last_error = self.wait_error
         return self.wait_result
 
     def release_mutex(self, handle: int) -> bool:
         self.calls.append(("ReleaseMutex", handle))
+        if not self.release_result and self.release_error:
+            self.last_error = self.release_error
         return self.release_result
 
     def close_handle(self, handle: int) -> bool:
         self.calls.append(("CloseHandle", handle))
+        if not self.close_result:
+            if self.close_error:
+                self.last_error = self.close_error
+        else:
+            self.last_error = 0
         return self.close_result
 
     def get_last_error(self) -> int:
@@ -105,8 +117,39 @@ def test_busy_closes_the_full_handle_without_release() -> None:
 def test_wait_failed_closes_the_full_handle_without_release() -> None:
     api = FakeWin32MutexApi()
     api.wait_result = WAIT_FAILED
+    api.wait_error = 5
     result = _guard(api).acquire(_EXE)
     assert result.outcome is GuardAcquireOutcome.UNAVAILABLE
+    assert "error 5" in result.message
+    assert api.handles_for("CloseHandle") == [_WIDE_HANDLE]
+    assert api.handles_for("ReleaseMutex") == []
+
+
+def test_wait_timeout_failed_close_is_unavailable_not_busy() -> None:
+    api = FakeWin32MutexApi()
+    api.wait_result = WAIT_TIMEOUT
+    api.close_result = False
+    api.close_error = 6
+    result = _guard(api).acquire(_EXE)
+    assert result.outcome is GuardAcquireOutcome.UNAVAILABLE
+    assert "CloseHandle failed" in result.message
+    assert "error 6" in result.message
+    assert result.handle is None
+    assert api.handles_for("CloseHandle") == [_WIDE_HANDLE]
+    assert api.handles_for("ReleaseMutex") == []
+
+
+def test_wait_failed_failed_close_reports_close_error() -> None:
+    api = FakeWin32MutexApi()
+    api.wait_result = WAIT_FAILED
+    api.wait_error = 5
+    api.close_result = False
+    api.close_error = 6
+    result = _guard(api).acquire(_EXE)
+    assert result.outcome is GuardAcquireOutcome.UNAVAILABLE
+    assert "CloseHandle failed" in result.message
+    assert "error 6" in result.message
+    assert "error 5" not in result.message
     assert api.handles_for("CloseHandle") == [_WIDE_HANDLE]
     assert api.handles_for("ReleaseMutex") == []
 

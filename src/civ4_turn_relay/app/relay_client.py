@@ -48,6 +48,7 @@ from civ4_turn_relay.local import (
     ReconcileResult,
     SystemClock,
     attribute_handoff_result,
+    emit_diagnostic,
     observe_outgoing_candidates,
     reconcile_match,
     revalidate_candidate_file,
@@ -58,6 +59,7 @@ from civ4_turn_relay.process import (
     FocusOutcome,
     FocusResult,
     GuardedLaunchOutcome,
+    GuardedLaunchResult,
     LaunchPlan,
     ProbeOutcome,
     ProcessIdentity,
@@ -837,6 +839,30 @@ class RelayClient:
 
         self._store.update_match_state(game_id, mutate)
 
+    def _note_guard_cleanup_failure(
+        self, session: _MatchSession, launch: GuardedLaunchResult
+    ) -> None:
+        """Surface a held-guard cleanup failure without changing launch outcome."""
+        if not launch.cleanup_failed:
+            return
+        diagnostic = emit_diagnostic(
+            "launch_guard_cleanup_failed",
+            fields={
+                "cleanup_outcome": (
+                    launch.cleanup_outcome.value
+                    if launch.cleanup_outcome is not None
+                    else "unknown"
+                ),
+                "launch_outcome": launch.outcome.value,
+            },
+            message=launch.cleanup_message or "launch-guard cleanup failed",
+        )
+        if session.last_reconcile is not None:
+            session.last_reconcile = replace(
+                session.last_reconcile,
+                diagnostics=(*session.last_reconcile.diagnostics, diagnostic),
+            )
+
     def _act_on_process_intents(
         self,
         session: _MatchSession,
@@ -872,6 +898,8 @@ class RelayClient:
                     # never counts as a consumed launch and a later ordinary
                     # tick (or explicit Start) retries the guarded launch.
                     self._clear_launch_attempt(game_id)
+                if launch is not None:
+                    self._note_guard_cleanup_failure(session, launch)
         elif result.operational_state not in {
             OperationalState.WAITING_FOR_MY_FIRST_SAVE,
             OperationalState.MY_TURN_DOWNLOADED,

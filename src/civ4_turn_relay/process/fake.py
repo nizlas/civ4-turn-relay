@@ -12,7 +12,7 @@ Civ processes in scans and contends for the same launch guard.
 
 from __future__ import annotations
 
-import os
+import threading
 
 from civ4_turn_relay.process.guard import (
     GuardAcquireOutcome,
@@ -23,6 +23,8 @@ from civ4_turn_relay.process.guard import (
     ProcessScanEntry,
     classify_scan_entries,
     execute_guarded_launch,
+    normalize_windows_executable,
+    windows_executable_basename,
 )
 from civ4_turn_relay.process.launch_config import CivLaunchCommand
 from civ4_turn_relay.process.port import (
@@ -43,8 +45,16 @@ from civ4_turn_relay.process.port import (
 _DEFAULT_UNAVAILABLE_REASON = "fake_unavailable: scripted as unavailable"
 
 
+class _ScriptedReleaseError(OSError):
+    """Scripted ReleaseMutex/CloseHandle failure for FakeMachine tests."""
+
+    def __init__(self, operation: str) -> None:
+        super().__init__(6, f"{operation} failed (error 6)")
+        self.operation = operation
+
+
 def _normalize(path: str) -> str:
-    return os.path.normpath(path).casefold()
+    return normalize_windows_executable(path)
 
 
 def _key(identity: ProcessIdentity) -> tuple[int, int, str]:
@@ -87,6 +97,9 @@ class FakeMachine:
         self._held_handle: object | None = None
         self.guard_acquisitions: list[str] = []
         self.guard_releases: list[str] = []
+        self.guard_acquire_threads: list[int] = []
+        self.guard_release_threads: list[int] = []
+        self.release_failure_operation: str | None = None
 
     # --- process table -----------------------------------------------------
 
@@ -118,7 +131,7 @@ class FakeMachine:
             ProcessScanEntry(
                 pid=identity.pid,
                 executable_path=identity.executable_path,
-                name=os.path.basename(identity.executable_path),
+                name=windows_executable_basename(identity.executable_path),
             )
             for identity in self._processes.values()
         ]
@@ -146,6 +159,7 @@ class FakeMachine:
             )
         handle = object()
         self._held_handle = handle
+        self.guard_acquire_threads.append(threading.get_ident())
         if self._abandoned:
             self._abandoned = False
             return GuardAcquisition(
@@ -158,9 +172,14 @@ class FakeMachine:
     def release(self, acquisition: GuardAcquisition) -> None:
         if not acquisition.held:
             return
+        if self._held_handle is None or acquisition.handle is not self._held_handle:
+            return
         self.guard_releases.append("released")
-        if acquisition.handle is self._held_handle:
-            self._held_handle = None
+        self.guard_release_threads.append(threading.get_ident())
+        self._held_handle = None
+        operation = self.release_failure_operation
+        if operation is not None:
+            raise _ScriptedReleaseError(operation)
 
     @property
     def guard_held(self) -> bool:

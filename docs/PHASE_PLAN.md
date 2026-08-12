@@ -642,6 +642,13 @@ process scan preserves AccessDenied likely-Civ entries as
 ``SCAN_INDETERMINATE``; and deferred launches keep distinct process statuses
 for an existing Civ, a busy sibling guard, and an indeterminate scan.
 
+Implementation note (2026-08-12, follow-up): a verified launch is never
+forgotten because guard cleanup failed — ``ReleaseMutex`` / ``CloseHandle``
+errors attach as a typed cleanup result and diagnostic while the process
+association still persists. Windows executable matching uses ``ntpath`` so
+path comparison is host-independent. A failed ``CloseHandle`` after a
+non-owned wait is ``UNAVAILABLE``, not a clean busy result.
+
 ### Goal
 
 Empirically determine and implement launch/process integration for Steam/BTS/AdvCiv: mod + save, already-running detection, exit without save (FR-010), and Fully managed close/verify behavior (FR-015).

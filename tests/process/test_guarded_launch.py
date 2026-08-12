@@ -13,6 +13,7 @@ from civ4_turn_relay.process import (
     CivLaunchCommand,
     FakeMachine,
     FakeProcessSupervisor,
+    GuardCleanupOutcome,
     GuardedLaunchOutcome,
     GuardedLaunchResult,
     LaunchResult,
@@ -22,6 +23,9 @@ from civ4_turn_relay.process import (
     ProcessScanEntry,
     classify_scan_entries,
     execute_guarded_launch,
+    launch_guard_name,
+    normalize_windows_executable,
+    windows_executable_basename,
 )
 
 _EXE = "C:\\Games\\Civ4\\Civ4BeyondSword.exe"
@@ -269,3 +273,173 @@ def test_result_invariant_identity_only_on_launched() -> None:
         )
     with pytest.raises(Exception, match="identity"):
         GuardedLaunchResult(outcome=GuardedLaunchOutcome.LAUNCHED)
+
+
+# --- cleanup must not forget a verified launch --------------------------------
+
+
+def test_launched_result_survives_release_mutex_cleanup_failure() -> None:
+    machine = FakeMachine()
+    machine.release_failure_operation = "ReleaseMutex"
+    supervisor = FakeProcessSupervisor(machine=machine)
+    result = supervisor.guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.LAUNCHED
+    assert result.identity is not None
+    assert result.cleanup_outcome is GuardCleanupOutcome.RELEASE_FAILED
+    assert result.cleanup_failed
+    assert "ReleaseMutex" in result.cleanup_message
+    assert machine.guard_held is False
+    assert machine.guard_releases == ["released"]
+    assert len(supervisor.launched) == 1
+
+    second = supervisor.guarded_launch(_COMMAND)
+    assert second.outcome is GuardedLaunchOutcome.EXISTING_CIV_DETECTED
+    assert len(supervisor.launched) == 1
+
+
+def test_launched_result_survives_close_handle_cleanup_failure() -> None:
+    machine = FakeMachine()
+    machine.release_failure_operation = "CloseHandle"
+    supervisor = FakeProcessSupervisor(machine=machine)
+    result = supervisor.guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.LAUNCHED
+    assert result.identity is not None
+    assert result.cleanup_outcome is GuardCleanupOutcome.CLOSE_FAILED
+    assert result.cleanup_failed
+    assert "CloseHandle" in result.cleanup_message
+    assert machine.guard_held is False
+    assert machine.guard_releases == ["released"]
+
+    second = supervisor.guarded_launch(_COMMAND)
+    assert second.outcome is GuardedLaunchOutcome.EXISTING_CIV_DETECTED
+    assert len(supervisor.launched) == 1
+
+
+def test_deferred_result_keeps_primary_outcome_when_cleanup_fails() -> None:
+    machine = FakeMachine()
+    machine.release_failure_operation = "CloseHandle"
+    supervisor = FakeProcessSupervisor(machine=machine)
+    machine.add_scan_entry(
+        ProcessScanEntry(pid=321, executable_path=None, name="Civ4BeyondSword.exe")
+    )
+    result = supervisor.guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.SCAN_INDETERMINATE
+    assert result.deferred
+    assert result.cleanup_failed
+    assert result.cleanup_outcome is GuardCleanupOutcome.CLOSE_FAILED
+    assert supervisor.launched == []
+    assert machine.guard_held is False
+    assert machine.guard_releases == ["released"]
+
+
+def test_primary_launch_exception_is_not_masked_by_cleanup_failure() -> None:
+    machine = FakeMachine()
+    machine.release_failure_operation = "ReleaseMutex"
+
+    def exploding_launch(_command: CivLaunchCommand) -> LaunchResult:
+        raise RuntimeError("spawn exploded")
+
+    def clear_scan(_executable: str) -> MachineScanResult:
+        return MachineScanResult(outcome=MachineScanOutcome.NO_MATCH)
+
+    with pytest.raises(RuntimeError, match="spawn exploded") as caught:
+        execute_guarded_launch(
+            guard=machine,
+            scan=clear_scan,
+            launch=exploding_launch,
+            command=_COMMAND,
+        )
+    notes = "".join(caught.value.__notes__)
+    assert "cleanup also failed" in notes
+    assert caught.value.__cause__ is not None
+    assert "ReleaseMutex" in str(caught.value.__cause__)
+    assert machine.guard_held is False
+    assert machine.guard_releases == ["released"]
+
+
+def test_guard_release_is_exactly_once_on_the_same_thread() -> None:
+    machine = FakeMachine()
+    supervisor = FakeProcessSupervisor(machine=machine)
+    result = supervisor.guarded_launch(_COMMAND)
+    assert result.cleanup_outcome is GuardCleanupOutcome.RELEASED
+    assert not result.cleanup_failed
+    assert machine.guard_releases == ["released"]
+    assert machine.guard_acquire_threads == machine.guard_release_threads
+    assert len(machine.guard_release_threads) == 1
+
+    assert result.identity is not None
+    supervisor.mark_exited(result.identity)
+    machine.release_failure_operation = "ReleaseMutex"
+    failed = supervisor.guarded_launch(_COMMAND)
+    assert failed.outcome is GuardedLaunchOutcome.LAUNCHED
+    assert failed.cleanup_failed
+    assert len(machine.guard_releases) == 2
+    assert machine.guard_acquire_threads == machine.guard_release_threads
+
+
+def test_fake_machine_release_is_idempotent_after_cleanup_failure() -> None:
+    machine = FakeMachine()
+    machine.release_failure_operation = "CloseHandle"
+    acquired = machine.acquire(_EXE)
+    with pytest.raises(OSError, match="CloseHandle failed"):
+        machine.release(acquired)
+    machine.release(acquired)
+    assert machine.guard_releases == ["released"]
+    assert machine.guard_held is False
+
+
+# --- host-independent Windows path semantics ----------------------------------
+
+
+def test_windows_basename_from_backslash_path() -> None:
+    assert (
+        windows_executable_basename(r"C:\Games\Civ4\Civ4BeyondSword.exe")
+        == "civ4beyondsword.exe"
+    )
+
+
+def test_windows_path_case_insensitive_equality() -> None:
+    assert normalize_windows_executable(_EXE) == normalize_windows_executable(
+        _EXE.upper()
+    )
+
+
+def test_slash_and_backslash_spellings_are_equivalent() -> None:
+    slashed = "C:/Games/Civ4/Civ4BeyondSword.exe"
+    assert normalize_windows_executable(_EXE) == normalize_windows_executable(slashed)
+    assert windows_executable_basename(slashed) == "civ4beyondsword.exe"
+
+
+def test_dot_segment_normalization() -> None:
+    dotted = r"C:\Games\Civ4\.\Civ4BeyondSword.exe"
+    parent = r"C:\Games\Civ4\foo\..\Civ4BeyondSword.exe"
+    assert normalize_windows_executable(dotted) == normalize_windows_executable(_EXE)
+    assert normalize_windows_executable(parent) == normalize_windows_executable(_EXE)
+
+
+def test_inaccessible_civ_short_name_is_indeterminate_on_every_host() -> None:
+    entries = (
+        ProcessScanEntry(pid=321, executable_path=None, name="Civ4BeyondSword.exe"),
+    )
+    result = classify_scan_entries(entries, executable_path=_EXE)
+    assert result.outcome is MachineScanOutcome.INDETERMINATE
+    assert result.pid == 321
+
+
+def test_equivalent_executable_spellings_share_mutex_name() -> None:
+    name = launch_guard_name(_EXE)
+    assert launch_guard_name(_EXE.upper()) == name
+    assert launch_guard_name("C:/Games/Civ4/Civ4BeyondSword.exe") == name
+    assert launch_guard_name(r"C:\Games\Civ4\.\Civ4BeyondSword.exe") == name
+    assert launch_guard_name(r"C:\Games\Civ4\foo\..\Civ4BeyondSword.exe") == name
+    assert launch_guard_name(r"C:\Other\Civ4BeyondSword.exe") != name
+
+
+def test_slash_spelling_of_running_exe_still_blocks() -> None:
+    _machine, supervisor_a, supervisor_b = _shared_pair()
+    supervisor_a.spawn_external(
+        _foreign_identity(executable_path="C:/Games/Civ4/Civ4BeyondSword.exe")
+    )
+    result = supervisor_b.guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.EXISTING_CIV_DETECTED
+    assert supervisor_b.launched == []

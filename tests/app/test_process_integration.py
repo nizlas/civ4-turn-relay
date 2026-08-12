@@ -930,3 +930,92 @@ def test_focus_verifies_identity_before_acting(tmp_path: Path) -> None:
     assert mismatch.outcome is FocusOutcome.IDENTITY_MISMATCH
     assert supervisor.focus_requests == [identity]
     client.close()
+
+
+def _assert_persisted_launch_survives_cleanup_failure(
+    tmp_path: Path, operation: str
+) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    supervisor.machine.release_failure_operation = operation
+    client, _config, exe = _local_client_after_opponent_commit(
+        tmp_path, storage, clock, supervisor
+    )
+    snap = client.tick(GAME_ID)
+    assert snap.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor.launched) == 1
+    records = client.store.load_match_state_or_empty(GAME_ID)
+    assert records.process_association is not None
+    identity = _associated_identity(client)
+    assert identity.executable_path == exe
+    assert identity.pid == records.process_association.pid
+    assert (
+        identity.process_create_time_ns
+        == records.process_association.process_create_time_ns
+    )
+    status = client.process_status(GAME_ID)
+    assert status.status is ProcessStatus.RUNNING
+    assert status.identity == identity
+    assert status.cleanup_warning is not None
+    assert operation in status.cleanup_warning
+    assert snap.latest_diagnostic is not None
+    assert snap.latest_diagnostic.name == "launch_guard_cleanup_failed"
+    assert operation in snap.latest_diagnostic.message
+
+    client.tick(GAME_ID)
+    client.tick(GAME_ID)
+    assert len(supervisor.launched) == 1
+    assert client.process_status(GAME_ID).status is ProcessStatus.RUNNING
+    later_records = client.store.load_match_state_or_empty(GAME_ID)
+    assert later_records.process_association is not None
+    later = _associated_identity(client)
+    assert later == identity
+    client.close()
+
+
+def test_verified_launch_persists_when_release_mutex_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    _assert_persisted_launch_survives_cleanup_failure(tmp_path, "ReleaseMutex")
+
+
+def test_verified_launch_persists_when_close_handle_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    _assert_persisted_launch_survives_cleanup_failure(tmp_path, "CloseHandle")
+
+
+def test_deferred_launch_restores_key_when_cleanup_fails(tmp_path: Path) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    supervisor.machine.release_failure_operation = "CloseHandle"
+    supervisor.machine.add_scan_entry(
+        ProcessScanEntry(pid=321, executable_path=None, name="Civ4BeyondSword.exe")
+    )
+    client, _config, _exe = _local_client_after_opponent_commit(
+        tmp_path, storage, clock, supervisor
+    )
+    snap = client.tick(GAME_ID)
+    assert snap.operational_state is OperationalState.MY_TURN_DOWNLOADED
+    assert supervisor.launched == []
+    status = client.process_status(GAME_ID)
+    assert status.status is ProcessStatus.LAUNCH_SCAN_INDETERMINATE
+    assert status.cleanup_warning is not None
+    assert "CloseHandle" in status.cleanup_warning
+    records = client.store.load_match_state_or_empty(GAME_ID)
+    assert records.launch_attempt is None
+    assert records.process_association is None
+    assert snap.latest_diagnostic is not None
+    assert snap.latest_diagnostic.name == "launch_guard_cleanup_failed"
+
+    supervisor.machine.clear_extra_scan_entries()
+    supervisor.machine.release_failure_operation = None
+    launched = client.tick(GAME_ID)
+    assert launched.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor.launched) == 1
+    records_after = client.store.load_match_state_or_empty(GAME_ID)
+    assert records_after.process_association is not None
+    assert records_after.launch_attempt is not None
+    client.close()

@@ -18,9 +18,9 @@ Nothing in this module decides match ownership or advances match state.
 from __future__ import annotations
 
 import hashlib
-import os
+import ntpath
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, unique
 from typing import Protocol, runtime_checkable
 
@@ -31,9 +31,18 @@ from civ4_turn_relay.process.port import LaunchOutcome, LaunchResult, ProcessIde
 _MUTEX_NAME_PREFIX = "Local\\civ4-turn-relay-launch-"
 
 
-def _normalize_executable(path: str) -> str:
-    """Normalize an executable path for comparison only (never stored)."""
-    return os.path.normpath(path).casefold()
+def normalize_windows_executable(path: str) -> str:
+    """Normalize a Windows executable path for comparison only (never stored).
+
+    ``ntpath`` treats both ``/`` and ``\\`` as separators and collapses
+    dot-segments on every host, so Linux CI matches Windows production.
+    """
+    return ntpath.normpath(path).casefold()
+
+
+def windows_executable_basename(path: str) -> str:
+    """Case-folded basename of a Windows executable path, host-independent."""
+    return ntpath.basename(normalize_windows_executable(path))
 
 
 def launch_guard_name(executable_path: str) -> str:
@@ -44,7 +53,7 @@ def launch_guard_name(executable_path: str) -> str:
     executables get independent guards.
     """
     digest = hashlib.sha256(
-        _normalize_executable(executable_path).encode("utf-8")
+        normalize_windows_executable(executable_path).encode("utf-8")
     ).hexdigest()
     return f"{_MUTEX_NAME_PREFIX}{digest}"
 
@@ -98,12 +107,12 @@ def classify_scan_entries(
       whose full path cannot be verified fails closed as ``INDETERMINATE``:
       Relay refuses to launch rather than risk a second Civ instance.
     """
-    target = _normalize_executable(executable_path)
-    target_name = os.path.basename(target)
+    target = normalize_windows_executable(executable_path)
+    target_name = windows_executable_basename(executable_path)
     indeterminate: ProcessScanEntry | None = None
     for entry in entries:
         if entry.executable_path is not None:
-            if _normalize_executable(entry.executable_path) == target:
+            if normalize_windows_executable(entry.executable_path) == target:
                 return MachineScanResult(
                     outcome=MachineScanOutcome.EXACT_MATCH,
                     pid=entry.pid,
@@ -203,15 +212,31 @@ retry the guarded launch.
 """
 
 
+@unique
+class GuardCleanupOutcome(Enum):
+    """Result of releasing a held launch guard after scan/launch."""
+
+    RELEASED = "released"
+    RELEASE_FAILED = "release_failed"
+    CLOSE_FAILED = "close_failed"
+
+
 @dataclass(frozen=True, slots=True)
 class GuardedLaunchResult:
-    """Guarded launch outcome; identity is present on success only."""
+    """Guarded launch outcome; identity is present on success only.
+
+    ``cleanup_outcome`` is ``None`` when the guard was never held (busy or
+    unavailable). A cleanup failure never changes ``outcome`` or drops a
+    verified ``LAUNCHED`` identity.
+    """
 
     outcome: GuardedLaunchOutcome
     identity: ProcessIdentity | None = None
     message: str = ""
     existing_pid: int | None = None
     recovered_abandoned_guard: bool = False
+    cleanup_outcome: GuardCleanupOutcome | None = None
+    cleanup_message: str = ""
 
     def __post_init__(self) -> None:
         launched = self.outcome is GuardedLaunchOutcome.LAUNCHED
@@ -229,6 +254,13 @@ class GuardedLaunchResult:
     def deferred(self) -> bool:
         return self.outcome in LAUNCH_DEFERRED_OUTCOMES
 
+    @property
+    def cleanup_failed(self) -> bool:
+        return self.cleanup_outcome in {
+            GuardCleanupOutcome.RELEASE_FAILED,
+            GuardCleanupOutcome.CLOSE_FAILED,
+        }
+
 
 _LAUNCH_TO_GUARDED: dict[LaunchOutcome, GuardedLaunchOutcome] = {
     LaunchOutcome.LAUNCHED: GuardedLaunchOutcome.LAUNCHED,
@@ -237,6 +269,14 @@ _LAUNCH_TO_GUARDED: dict[LaunchOutcome, GuardedLaunchOutcome] = {
     LaunchOutcome.EXITED_IMMEDIATELY: GuardedLaunchOutcome.EXITED_IMMEDIATELY,
     LaunchOutcome.IDENTITY_UNVERIFIED: GuardedLaunchOutcome.IDENTITY_UNVERIFIED,
 }
+
+
+def _classify_cleanup_error(error: BaseException) -> tuple[GuardCleanupOutcome, str]:
+    """Map a release/close failure onto a typed cleanup outcome."""
+    operation = getattr(error, "operation", None)
+    if operation == "CloseHandle":
+        return GuardCleanupOutcome.CLOSE_FAILED, str(error)
+    return GuardCleanupOutcome.RELEASE_FAILED, str(error)
 
 
 def execute_guarded_launch(
@@ -248,12 +288,14 @@ def execute_guarded_launch(
 ) -> GuardedLaunchResult:
     """Run the atomic guarded launch: acquire, scan, spawn, verify, release.
 
-    The guard is always released — on success, blocker, indeterminate scan,
-    failed spawn, failed identity verification, and on any exception raised
-    by the scan or the launch. If the OS reports the previous guard owner
-    abandoned the guard (a crashed Relay), ownership is recovered but a
-    fresh process scan still runs before any spawn; the recovery is recorded
-    on the result as a diagnostic.
+    The primary scan/launch result is preserved before cleanup. Release runs
+    exactly once on this thread. A cleanup failure is attached to the result
+    (or chained onto a primary exception) and never retries the spawn. A
+    verified ``LAUNCHED`` identity is returned even when cleanup fails.
+
+    If the OS reports the previous guard owner abandoned the guard (a crashed
+    Relay), ownership is recovered but a fresh process scan still runs before
+    any spawn; the recovery is recorded on the result as a diagnostic.
     """
     executable = command.argv[0]
     acquisition = guard.acquire(executable)
@@ -274,7 +316,8 @@ def execute_guarded_launch(
             ),
         )
     recovered = acquisition.outcome is GuardAcquireOutcome.ACQUIRED_ABANDONED
-    try:
+
+    def scan_and_launch() -> GuardedLaunchResult:
         scan_result = scan(executable)
         if scan_result.outcome is MachineScanOutcome.EXACT_MATCH:
             return GuardedLaunchResult(
@@ -297,5 +340,37 @@ def execute_guarded_launch(
             message=result.message,
             recovered_abandoned_guard=recovered,
         )
-    finally:
+
+    primary: GuardedLaunchResult | None = None
+    primary_error: Exception | None = None
+    try:
+        primary = scan_and_launch()
+    except Exception as error:
+        primary_error = error
+
+    cleanup_outcome = GuardCleanupOutcome.RELEASED
+    cleanup_message = ""
+    try:
         guard.release(acquisition)
+    except Exception as cleanup_error:
+        cleanup_outcome, cleanup_message = _classify_cleanup_error(cleanup_error)
+        if primary_error is not None:
+            primary_error.add_note(f"launch-guard cleanup also failed: {cleanup_error}")
+            raise primary_error from cleanup_error
+        if primary is None:
+            raise
+        return replace(
+            primary,
+            cleanup_outcome=cleanup_outcome,
+            cleanup_message=cleanup_message,
+        )
+
+    if primary_error is not None:
+        raise primary_error
+    if primary is None:
+        raise RuntimeError("guarded launch produced no result")
+    return replace(
+        primary,
+        cleanup_outcome=cleanup_outcome,
+        cleanup_message=cleanup_message,
+    )
