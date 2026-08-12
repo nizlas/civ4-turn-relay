@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 import tomllib
 from pathlib import Path
 
 import pytest
 
-from civ4_turn_relay.ui.app import user_data_dir
+from civ4_turn_relay.ui.app import _find_env_example, user_data_dir
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGING = ROOT / "packaging"
@@ -55,8 +56,7 @@ def test_packaging_scripts_exist() -> None:
 def test_installer_is_per_user_and_preserves_appdata() -> None:
     text = (PACKAGING / "installer.iss").read_text(encoding="utf-8")
     assert "PrivilegesRequired=lowest" in text
-    assert "PrivilegesRequiredOverridesAllowed=none" in text
-    assert "PrivilegesRequiredOverridesAllowed=dialog" not in text
+    assert "PrivilegesRequiredOverridesAllowed=" not in text
     assert r"{localappdata}\Programs\civ4-turn-relay" in text
     assert "{userdesktop}" in text
     assert "NEVER" in text and "civ4-turn-relay" in text
@@ -83,6 +83,9 @@ def test_build_script_refuses_secrets_and_uses_project_version() -> None:
     assert "cmd.exe" not in text.lower()
     assert "/c civ" not in text.lower()
     assert "mod=Mods" not in text  # launch argv belongs in process code, not packaging
+    assert "if ($proc.HasExited)" in text
+    assert "$proc.HasExited -and" not in text
+    assert '[string]$RepoRoot = ""' in text
 
 
 def test_installer_build_wrapper_reads_version_and_requires_portable() -> None:
@@ -93,6 +96,8 @@ def test_installer_build_wrapper_reads_version_and_requires_portable() -> None:
     assert "ISCC" in text
     assert "build_windows.ps1" in text
     assert "Portable build output not found" in text or "portable" in text.lower()
+    assert '[string]$RepoRoot = ""' in text
+    assert "LOCALAPPDATA" in text
 
 
 def test_teardown_stress_script_uses_reporoot() -> None:
@@ -113,6 +118,25 @@ def test_pyinstaller_spec_excludes_tests_and_ships_env_example_only() -> None:
     assert '".env"' not in text.split(".env.example")[0] or "never" in text.lower()
     assert "collect_all" in text
     assert "PySide6" in text and "paramiko" in text
+    app_text = (ROOT / "src" / "civ4_turn_relay" / "ui" / "app.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'if __name__ == "__main__":' in app_text
+
+
+def test_frozen_app_finds_packaged_env_example(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    working = tmp_path / "working"
+    bundle = tmp_path / "bundle"
+    working.mkdir()
+    bundle.mkdir()
+    example = bundle / ".env.example"
+    example.write_text("CIV4_RELAY_SFTP_HOST=placeholder\n", encoding="utf-8")
+    monkeypatch.chdir(working)
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+
+    assert _find_env_example() == example
 
 
 def test_gitignore_keeps_scripts_ignores_artifacts_and_vcredist() -> None:
@@ -130,6 +154,6 @@ def test_release_docs_mention_manual_p7_and_unsigned_builds() -> None:
     assert "%APPDATA%\\civ4-turn-relay" in text or "%APPDATA%" in text
     assert "run_ui_teardown_stress.ps1" in text
     assert "build_installer.ps1" in text
-    assert "PrivilegesRequiredOverridesAllowed=none" in text
+    assert "PrivilegesRequiredOverridesAllowed" not in text
     assert "P7" in text and "ACTIVE" in text
     assert "0.1.0" not in text.split("## Installer build", 1)[1].split("## ", 1)[0]

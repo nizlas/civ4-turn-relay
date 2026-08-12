@@ -28,6 +28,7 @@ from civ4_turn_relay.app.relay_client import RelayClient
 from civ4_turn_relay.app.snapshot import MatchClientSnapshot
 from civ4_turn_relay.domain import DomainValidationError, MatchConfig
 from civ4_turn_relay.local.errors import LocalStoreError
+from civ4_turn_relay.protocol import InitializeResult
 from civ4_turn_relay.storage import StorageError
 
 _SHUTDOWN_WAIT_MS = 10_000
@@ -161,7 +162,18 @@ class MatchWorker(QObject):
             self.error.emit("initialize_match: expected a MatchConfig payload")
             return
         self._run_command(
-            config.game_id, lambda: self._client.initialize_or_join(config)
+            config.game_id,
+            lambda: self._client.initialize_or_join(config),
+            accept_result=lambda result: (
+                isinstance(result, InitializeResult) and result.initialized
+            ),
+            rejected_result_text=lambda result: (
+                f"{config.game_id}: remote match initialization did not "
+                f"complete ({result.outcome.value})"
+                if isinstance(result, InitializeResult)
+                else f"{config.game_id}: remote match initialization returned "
+                "an unexpected result"
+            ),
         )
 
     @Slot(str)
@@ -188,7 +200,14 @@ class MatchWorker(QObject):
     def close_civ(self, game_id: str) -> None:
         self._run_command(game_id, lambda: self._client.request_civ_close(game_id))
 
-    def _run_command(self, game_id: str, command: Callable[[], object]) -> None:
+    def _run_command(
+        self,
+        game_id: str,
+        command: Callable[[], object],
+        *,
+        accept_result: Callable[[object], bool] | None = None,
+        rejected_result_text: Callable[[object], str] | None = None,
+    ) -> None:
         if self._shutting_down:
             self.error.emit(f"{game_id}: the worker is shut down; command ignored")
             return
@@ -200,9 +219,18 @@ class MatchWorker(QObject):
             return
         self._busy.add(game_id)
         try:
-            command()
-            if game_id not in self._open_ids:
-                self._open_ids.append(game_id)
+            result = command()
+            accepted = accept_result is None or accept_result(result)
+            if accepted:
+                if game_id not in self._open_ids:
+                    self._open_ids.append(game_id)
+            else:
+                message = (
+                    rejected_result_text(result)
+                    if rejected_result_text is not None
+                    else f"{game_id}: command did not complete"
+                )
+                self.error.emit(message)
         except Exception as exc:
             self.error.emit(_safe_error_text(game_id, exc))
         finally:
@@ -210,7 +238,7 @@ class MatchWorker(QObject):
             # Finish first so the hub-side busy flag is cleared before any
             # observer reacts to the fresh snapshot (queued in-order).
             self.command_finished.emit(game_id)
-            if not self._shutting_down:
+            if not self._shutting_down and game_id in self._open_ids:
                 self._emit_snapshot(game_id)
 
     def _emit_snapshot(self, game_id: str) -> None:

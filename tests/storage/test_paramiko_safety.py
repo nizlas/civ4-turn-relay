@@ -136,6 +136,54 @@ def test_path_containment_rejects_windows_separators() -> None:
         storage._resolve(r"a\b")  # noqa: SLF001
 
 
+@pytest.mark.parametrize(
+    "operation",
+    ("mkdir", "read_file", "publish_no_replace", "atomic_replace"),
+)
+def test_first_capability_gated_operation_connects_before_check(
+    operation: str,
+) -> None:
+    """A lazy adapter must probe capabilities before reading their flags."""
+    from civ4_turn_relay.storage.port import StorageCapabilities, StorageEntryKind
+
+    storage = ParamikoStorage(_config())
+    sftp = MagicMock()
+    handle = sftp.file.return_value.__enter__.return_value
+    handle.read.return_value = b"turn"
+
+    def require_sftp() -> MagicMock:
+        storage._capabilities = StorageCapabilities(  # noqa: SLF001
+            exclusive_mkdir=True,
+            atomic_replace=True,
+            atomic_publish_no_replace=True,
+            complete_readback=True,
+        )
+        storage._capabilities_verified = True  # noqa: SLF001
+        return sftp
+
+    storage._require_sftp = require_sftp  # type: ignore[method-assign]  # noqa: SLF001
+    storage._stat_kind = lambda remote: (  # type: ignore[method-assign]  # noqa: SLF001
+        StorageEntryKind.FILE if remote.endswith("source.bin") else None
+    )
+
+    if operation == "mkdir":
+        storage.mkdir("game")
+        sftp.mkdir.assert_called_once()
+    elif operation == "read_file":
+
+        def always_file(_remote: str) -> StorageEntryKind | None:
+            return StorageEntryKind.FILE
+
+        storage._stat_kind = always_file  # type: ignore[assignment]  # noqa: SLF001
+        assert storage.read_file("source.bin") == b"turn"
+    elif operation == "publish_no_replace":
+        storage.publish_no_replace("source.bin", "destination.bin")
+        sftp.rename.assert_called_once()
+    else:
+        storage.atomic_replace("source.bin", "destination.bin")
+        sftp.posix_rename.assert_called_once()
+
+
 def test_mutating_failure_is_transport_not_silent_replay() -> None:
     storage = ParamikoStorage(_config())
     storage._capabilities_verified = True  # noqa: SLF001
