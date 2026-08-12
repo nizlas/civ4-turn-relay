@@ -33,8 +33,13 @@ dist/
 *.egg
 pip-wheel-metadata/
 
-# PyInstaller
+# PyInstaller (keep packaging/*.spec tracked)
 *.spec
+!packaging/*.spec
+
+# Optional Inno Setup redistributable (never commit the binary)
+packaging/prereq/vc_redist.x64.exe
+packaging/prereq/*.exe
 
 # IDE-local files
 .idea/

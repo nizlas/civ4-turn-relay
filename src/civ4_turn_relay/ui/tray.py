@@ -43,7 +43,7 @@ class RelayTray(QSystemTrayIcon):
     ) -> None:
         super().__init__(_generated_icon(), parent)
         self.setToolTip("Civ4 Turn Relay")
-        self._menu = QMenu()
+        self._menu: QMenu | None = QMenu()
         open_action = self._menu.addAction("Open Relay")
         open_action.triggered.connect(on_open)
         quit_action = self._menu.addAction("Quit")
@@ -51,11 +51,28 @@ class RelayTray(QSystemTrayIcon):
         self.setContextMenu(self._menu)
         self.activated.connect(self._on_activated)
         self._on_open = on_open
+        self._disposed = False
 
     @staticmethod
     def is_available() -> bool:
         return bool(QSystemTrayIcon.isSystemTrayAvailable())
 
+    def dispose(self) -> None:
+        """Detach menu and schedule Qt disposal on the GUI thread. Idempotent."""
+        if self._disposed:
+            return
+        self._disposed = True
+        self.hide()
+        # Qt accepts nullptr here; PySide stubs only declare QMenu.
+        self.setContextMenu(None)  # type: ignore[arg-type]
+        menu = self._menu
+        self._menu = None
+        if menu is not None:
+            menu.deleteLater()
+        self.deleteLater()
+
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if self._disposed:
+            return
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self._on_open()

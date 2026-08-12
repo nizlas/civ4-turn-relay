@@ -74,6 +74,8 @@ class MainWindow(QMainWindow):
     edit_match_requested = Signal(str)
     settings_requested = Signal()
     reload_requested = Signal()
+    quit_requested = Signal()
+    """Emitted when the window close would quit the application (idle, no tray)."""
 
     def __init__(
         self,
@@ -99,6 +101,11 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.quit_requested.emit)
+        file_menu.addAction(quit_action)
+
         match_menu = menu_bar.addMenu("&Match")
         add_action = QAction("Add match…", self)
         add_action.triggered.connect(self._on_add_match)
@@ -324,7 +331,7 @@ class MainWindow(QMainWindow):
     # ----- lifecycle ----------------------------------------------------
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """Hide to tray while anything is active; otherwise allow closing."""
+        """Hide to tray while active; funnel idle quit through the coordinator."""
         if self._quit_allowed:
             event.accept()
             return
@@ -332,4 +339,6 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.hide()
             return
-        event.accept()
+        # Idle without tray: do not tear down widgets before worker shutdown.
+        event.ignore()
+        self.quit_requested.emit()

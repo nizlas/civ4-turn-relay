@@ -83,6 +83,10 @@ The client shows a match list with one clearly displayed state per match, an exp
 
 Setup, turn flow, configuration, process safety, and the manual smoke-test checklist: [`docs/DESKTOP_CLIENT.md`](docs/DESKTOP_CLIENT.md).
 
+### Portable build and installer (forthcoming)
+
+Windows packaging scaffolding for a **portable ZIP** and a **per-user Inno Setup installer** lives under [`packaging/`](packaging/) with operator docs in [`docs/RELEASE.md`](docs/RELEASE.md). These are **not** published release downloads yet: P7’s real-Civ smoke test is still outstanding, and packaging artifacts must be built and checked locally before any release claim.
+
 ## Non-goals
 
 - No PitBoss.

@@ -103,9 +103,14 @@ def validate_original_filename(
 
 
 def validate_windows_local_path(value: str, *, field_path: str = "path") -> str:
-    """Structurally validate an absolute local Windows path.
+    """Structurally validate an absolute local path for the Windows client.
 
     Pure string/path checks only; the path is never resolved or accessed.
+
+    Accepts absolute Windows paths (drive letter or UNC). Also accepts absolute
+    POSIX paths so filesystem-backed tests on Linux/macOS CI can use native
+    temporary directories. Production clients remain Windows-only; relative and
+    drive-relative forms are still rejected.
     """
     if not isinstance(value, str) or not value:
         raise DomainValidationError(
@@ -121,20 +126,26 @@ def validate_windows_local_path(value: str, *, field_path: str = "path") -> str:
             'characters <>"|?* are not allowed in local paths',
             field_path=field_path,
         )
-    if ":" in value[2:] or (":" in value[:2] and value.find(":") != 1):
+    windows_absolute = PureWindowsPath(value).is_absolute()
+    posix_absolute = PurePosixPath(value).is_absolute()
+    if windows_absolute:
+        if ":" in value[2:] or (":" in value[:2] and value.find(":") != 1):
+            raise DomainValidationError(
+                "a colon is only allowed as part of the drive letter",
+                field_path=field_path,
+            )
+        components = value.replace("\\", "/").split("/")
+    elif posix_absolute:
+        components = value.split("/")
+    else:
         raise DomainValidationError(
-            "a colon is only allowed as part of the drive letter",
+            "expected an absolute Windows path (drive letter or UNC)",
             field_path=field_path,
         )
-    for component in value.replace("\\", "/").split("/"):
+    for component in components:
         if component in {".", ".."}:
             raise DomainValidationError(
                 "'.' and '..' path components are not allowed",
                 field_path=field_path,
             )
-    if not PureWindowsPath(value).is_absolute():
-        raise DomainValidationError(
-            "expected an absolute Windows path (drive letter or UNC)",
-            field_path=field_path,
-        )
     return value

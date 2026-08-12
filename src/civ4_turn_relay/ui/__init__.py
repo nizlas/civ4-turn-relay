@@ -18,7 +18,7 @@ from civ4_turn_relay.ui.presenter import (
 )
 
 if TYPE_CHECKING:
-    from civ4_turn_relay.ui.app import RelayApplication, main
+    from civ4_turn_relay.ui.app import GatedQApplication, RelayApplication, main
     from civ4_turn_relay.ui.controller import (
         MatchUiSnapshot,
         MatchWorker,
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from civ4_turn_relay.ui.tray import RelayTray
 
 __all__ = [
+    "GatedQApplication",
     "GlobalSettingsDialog",
     "MainWindow",
     "MatchEditDialog",
@@ -53,6 +54,7 @@ _LAZY_MODULES = {
     "GlobalSettingsDialog": "civ4_turn_relay.ui.settings_dialog",
     "RelayApplication": "civ4_turn_relay.ui.app",
     "RelayTray": "civ4_turn_relay.ui.tray",
+    "GatedQApplication": "civ4_turn_relay.ui.app",
     "RelayWorkerHub": "civ4_turn_relay.ui.controller",
     "main": "civ4_turn_relay.ui.app",
 }

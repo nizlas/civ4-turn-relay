@@ -169,3 +169,9 @@ def test_valid_windows_local_paths(value: str) -> None:
 def test_invalid_windows_local_paths(value: str) -> None:
     with pytest.raises(DomainValidationError):
         validate_windows_local_path(value)
+
+
+def test_posix_absolute_paths_accepted_for_ci_hosts() -> None:
+    assert validate_windows_local_path("/tmp/pbem") == "/tmp/pbem"
+    with pytest.raises(DomainValidationError):
+        validate_windows_local_path("/tmp/pbem/../escape")
