@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import threading
 from datetime import UTC, datetime
 
 import pytest
@@ -10,13 +12,19 @@ from civ4_turn_relay.process import (
     CivLaunchCommand,
     CloseRequestOutcome,
     FocusOutcome,
+    GuardAcquireOutcome,
+    GuardAcquisition,
+    GuardedLaunchOutcome,
     LaunchOutcome,
     ProbeOutcome,
     ProcessIdentity,
     ProcessInfo,
+    ProcessScanEntry,
     ProcessSupervisor,
     TerminateOutcome,
+    WindowsNamedMutexLaunchGuard,
     WindowsProcessSupervisor,
+    launch_guard_name,
 )
 
 _EXE = "C:\\Games\\Civ4\\Civ4BeyondSword.exe"
@@ -48,6 +56,8 @@ class ScriptedBackend:
         self.focus_error: Exception | None = None
         self.terminate_result = True
         self.terminate_error: Exception | None = None
+        self.scan_entries: tuple[ProcessScanEntry, ...] = ()
+        self.scan_error: Exception | None = None
 
     def spawn(self, argv: tuple[str, ...], working_directory: str | None) -> int:
         self.calls.append(("spawn", argv))
@@ -79,8 +89,36 @@ class ScriptedBackend:
             raise self.terminate_error
         return self.terminate_result
 
+    def iter_process_entries(self) -> tuple[ProcessScanEntry, ...]:
+        self.calls.append(("scan", None))
+        if self.scan_error is not None:
+            raise self.scan_error
+        return self.scan_entries
+
     def call_names(self) -> list[str]:
         return [name for name, _argument in self.calls]
+
+
+class ScriptedGuard:
+    """Recording in-process LaunchGuard double for supervisor tests."""
+
+    def __init__(
+        self, *, outcome: GuardAcquireOutcome = GuardAcquireOutcome.ACQUIRED
+    ) -> None:
+        self.outcome = outcome
+        self.acquired: list[str] = []
+        self.released: list[GuardAcquisition] = []
+
+    def acquire(self, executable_path: str) -> GuardAcquisition:
+        self.acquired.append(executable_path)
+        held = self.outcome in {
+            GuardAcquireOutcome.ACQUIRED,
+            GuardAcquireOutcome.ACQUIRED_ABANDONED,
+        }
+        return GuardAcquisition(outcome=self.outcome, handle=object() if held else None)
+
+    def release(self, acquisition: GuardAcquisition) -> None:
+        self.released.append(acquisition)
 
 
 def _supervisor(backend: ScriptedBackend) -> WindowsProcessSupervisor:
@@ -374,3 +412,174 @@ def test_other_non_windows_platforms_are_unavailable(platform: str) -> None:
         backend=ScriptedBackend(), platform=platform, sleep_fn=lambda _seconds: None
     )
     assert supervisor.availability().available is False
+
+
+# --- guarded launch through the Windows supervisor --------------------------
+
+
+def _guarded_supervisor(
+    backend: ScriptedBackend, guard: ScriptedGuard
+) -> WindowsProcessSupervisor:
+    return WindowsProcessSupervisor(
+        backend=backend, platform="win32", sleep_fn=lambda _seconds: None, guard=guard
+    )
+
+
+def test_guarded_launch_scans_then_spawns_and_releases() -> None:
+    backend = ScriptedBackend()
+    backend.info = _running_info()
+    guard = ScriptedGuard()
+    result = _guarded_supervisor(backend, guard).guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.LAUNCHED
+    assert result.identity is not None
+    assert backend.call_names() == ["scan", "spawn", "process_info"]
+    assert guard.acquired == [_EXE]
+    assert len(guard.released) == 1
+
+
+def test_guarded_launch_existing_civ_blocks_without_spawn() -> None:
+    backend = ScriptedBackend()
+    backend.scan_entries = (
+        ProcessScanEntry(pid=777, executable_path=_EXE.upper(), name=None),
+    )
+    guard = ScriptedGuard()
+    result = _guarded_supervisor(backend, guard).guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.EXISTING_CIV_DETECTED
+    assert result.existing_pid == 777
+    assert "spawn" not in backend.call_names()
+    assert len(guard.released) == 1
+
+
+def test_guarded_launch_busy_guard_defers_without_scan_or_spawn() -> None:
+    backend = ScriptedBackend()
+    guard = ScriptedGuard(outcome=GuardAcquireOutcome.BUSY)
+    result = _guarded_supervisor(backend, guard).guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.GUARD_BUSY
+    assert backend.calls == []
+    assert guard.released == []
+
+
+def test_guarded_launch_scan_failure_fails_closed_and_releases() -> None:
+    backend = ScriptedBackend()
+    backend.scan_error = RuntimeError("scan blew up")
+    guard = ScriptedGuard()
+    result = _guarded_supervisor(backend, guard).guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.SCAN_INDETERMINATE
+    assert "spawn" not in backend.call_names()
+    assert len(guard.released) == 1
+
+
+def test_guarded_launch_spawn_failure_still_releases() -> None:
+    backend = ScriptedBackend()
+    backend.spawn_error = OSError("access denied")
+    guard = ScriptedGuard()
+    result = _guarded_supervisor(backend, guard).guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.SPAWN_FAILURE
+    assert len(guard.released) == 1
+
+
+def test_guarded_launch_identity_failure_still_releases() -> None:
+    backend = ScriptedBackend()
+    backend.info = _running_info(executable_path="C:\\Other\\imposter.exe")
+    guard = ScriptedGuard()
+    result = _guarded_supervisor(backend, guard).guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.IDENTITY_UNVERIFIED
+    assert len(guard.released) == 1
+
+
+def test_guarded_launch_abandoned_owner_still_scans_before_spawn() -> None:
+    backend = ScriptedBackend()
+    backend.scan_entries = (ProcessScanEntry(pid=555, executable_path=_EXE, name=None),)
+    guard = ScriptedGuard(outcome=GuardAcquireOutcome.ACQUIRED_ABANDONED)
+    result = _guarded_supervisor(backend, guard).guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.EXISTING_CIV_DETECTED
+    assert result.recovered_abandoned_guard is True
+    assert "spawn" not in backend.call_names()
+    assert len(guard.released) == 1
+
+
+def test_guarded_launch_unavailable_off_windows() -> None:
+    backend = ScriptedBackend()
+    guard = ScriptedGuard()
+    supervisor = WindowsProcessSupervisor(
+        backend=backend, platform="linux", sleep_fn=lambda _seconds: None, guard=guard
+    )
+    result = supervisor.guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.ADAPTER_UNAVAILABLE
+    assert backend.calls == []
+    assert guard.acquired == []
+
+
+def test_guarded_launch_without_guard_is_typed_unavailable() -> None:
+    backend = ScriptedBackend()
+    supervisor = WindowsProcessSupervisor(
+        backend=backend, platform="win32", sleep_fn=lambda _seconds: None
+    )
+    supervisor._guard = None  # simulate a host without a usable guard
+    result = supervisor.guarded_launch(_COMMAND)
+    assert result.outcome is GuardedLaunchOutcome.GUARD_UNAVAILABLE
+    assert backend.calls == []
+
+
+# --- real Windows named mutex (only runs on Windows hosts) ------------------
+
+_windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="requires a real Windows named mutex"
+)
+
+
+def test_launch_guard_name_is_stable_and_per_executable() -> None:
+    name = launch_guard_name(_EXE)
+    assert name.startswith("Local\\civ4-turn-relay-launch-")
+    assert launch_guard_name(_EXE.upper()) == name
+    assert launch_guard_name("C:\\Other\\Civ4BeyondSword.exe") != name
+
+
+@_windows_only
+def test_named_mutex_acquire_release_and_reacquire() -> None:
+    guard = WindowsNamedMutexLaunchGuard(wait_timeout_ms=0)
+    first = guard.acquire(_EXE)
+    assert first.outcome is GuardAcquireOutcome.ACQUIRED
+    guard.release(first)
+    second = guard.acquire(_EXE)
+    assert second.outcome is GuardAcquireOutcome.ACQUIRED
+    guard.release(second)
+
+
+@_windows_only
+def test_named_mutex_busy_for_a_concurrent_holder() -> None:
+    guard = WindowsNamedMutexLaunchGuard(wait_timeout_ms=0)
+    held = guard.acquire(_EXE)
+    assert held.outcome is GuardAcquireOutcome.ACQUIRED
+    observed: dict[str, GuardAcquisition] = {}
+
+    def contender() -> None:
+        observed["result"] = guard.acquire(_EXE)
+
+    thread = threading.Thread(target=contender)
+    thread.start()
+    thread.join()
+    assert observed["result"].outcome is GuardAcquireOutcome.BUSY
+    guard.release(held)
+
+
+@_windows_only
+def test_named_mutex_abandoned_by_dead_holder_is_recovered() -> None:
+    # A holder whose thread dies without releasing must not leave a stale
+    # lock: the OS hands the next waiter WAIT_ABANDONED instead.
+    guard = WindowsNamedMutexLaunchGuard(wait_timeout_ms=0)
+
+    def crashing_holder() -> None:
+        acquisition = guard.acquire(_EXE)
+        assert acquisition.outcome is GuardAcquireOutcome.ACQUIRED
+        # Thread ends while owning the mutex — a simulated Relay crash.
+
+    thread = threading.Thread(target=crashing_holder)
+    thread.start()
+    thread.join()
+    # join() can return a moment before the OS thread fully terminates; a
+    # bounded wait deterministically observes WAIT_ABANDONED once it does.
+    waiting_guard = WindowsNamedMutexLaunchGuard(wait_timeout_ms=5000)
+    recovered = waiting_guard.acquire(_EXE)
+    assert recovered.outcome is GuardAcquireOutcome.ACQUIRED_ABANDONED
+    waiting_guard.release(recovered)

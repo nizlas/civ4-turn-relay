@@ -1,6 +1,20 @@
 """Process adapter: Civ launch planning, supervision port, Windows backend."""
 
-from civ4_turn_relay.process.fake import FakeProcessSupervisor
+from civ4_turn_relay.process.fake import FakeMachine, FakeProcessSupervisor
+from civ4_turn_relay.process.guard import (
+    LAUNCH_DEFERRED_OUTCOMES,
+    GuardAcquireOutcome,
+    GuardAcquisition,
+    GuardedLaunchOutcome,
+    GuardedLaunchResult,
+    LaunchGuard,
+    MachineScanOutcome,
+    MachineScanResult,
+    ProcessScanEntry,
+    classify_scan_entries,
+    execute_guarded_launch,
+    launch_guard_name,
+)
 from civ4_turn_relay.process.launch_config import (
     CivLaunchCommand,
     CivLaunchConfiguration,
@@ -28,34 +42,49 @@ from civ4_turn_relay.process.port import (
 from civ4_turn_relay.process.windows import (
     ProcessInfo,
     RealWindowsBackend,
+    WindowsNamedMutexLaunchGuard,
     WindowsProcessBackend,
     WindowsProcessSupervisor,
 )
 
 __all__ = [
+    "LAUNCH_DEFERRED_OUTCOMES",
     "CivLaunchCommand",
     "CivLaunchConfiguration",
     "CloseRequestOutcome",
     "CloseRequestResult",
+    "FakeMachine",
     "FakeProcessSupervisor",
     "FocusOutcome",
     "FocusResult",
+    "GuardAcquireOutcome",
+    "GuardAcquisition",
+    "GuardedLaunchOutcome",
+    "GuardedLaunchResult",
+    "LaunchGuard",
     "LaunchOutcome",
     "LaunchPlan",
     "LaunchPlanOutcome",
     "LaunchResult",
+    "MachineScanOutcome",
+    "MachineScanResult",
     "ProbeOutcome",
     "ProbeResult",
     "ProcessIdentity",
     "ProcessInfo",
+    "ProcessScanEntry",
     "ProcessSupervisor",
     "RealWindowsBackend",
     "SupervisorAvailability",
     "TerminateOutcome",
     "TerminateResult",
+    "WindowsNamedMutexLaunchGuard",
     "WindowsProcessBackend",
     "WindowsProcessSupervisor",
     "build_civ_command",
     "build_launch_plan",
+    "classify_scan_entries",
+    "execute_guarded_launch",
+    "launch_guard_name",
     "observation_from_identity",
 ]

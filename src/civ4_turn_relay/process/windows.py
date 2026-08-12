@@ -22,6 +22,19 @@ from typing import Protocol, runtime_checkable
 import psutil
 
 from civ4_turn_relay.domain import DomainValidationError
+from civ4_turn_relay.process.guard import (
+    GuardAcquireOutcome,
+    GuardAcquisition,
+    GuardedLaunchOutcome,
+    GuardedLaunchResult,
+    LaunchGuard,
+    MachineScanOutcome,
+    MachineScanResult,
+    ProcessScanEntry,
+    classify_scan_entries,
+    execute_guarded_launch,
+    launch_guard_name,
+)
 from civ4_turn_relay.process.launch_config import CivLaunchCommand
 from civ4_turn_relay.process.port import (
     CloseRequestOutcome,
@@ -41,6 +54,12 @@ from civ4_turn_relay.process.port import (
 _WM_CLOSE = 0x0010
 _SW_RESTORE = 9
 _UNAVAILABLE_REASON = "windows_only: process adapter requires Windows"
+
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_ABANDONED = 0x00000080
+_WAIT_TIMEOUT = 0x00000102
+_WAIT_FAILED = 0xFFFFFFFF
+_GUARD_WAIT_TIMEOUT_MS = 250
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +93,15 @@ class WindowsProcessBackend(Protocol):
 
     def terminate_process(self, pid: int) -> bool:
         """Terminate ``pid`` (graceful terminate, short wait); True if exited."""
+        ...
+
+    def iter_process_entries(self) -> tuple[ProcessScanEntry, ...]:
+        """Snapshot every visible machine process for the launch scan.
+
+        Entries whose executable could not be resolved carry ``None`` and
+        the short process name when known; processes that disappear during
+        the snapshot are simply omitted.
+        """
         ...
 
 
@@ -176,6 +204,88 @@ class RealWindowsBackend:
             return False
         return True
 
+    def iter_process_entries(self) -> tuple[ProcessScanEntry, ...]:
+        entries: list[ProcessScanEntry] = []
+        for process in psutil.process_iter(attrs=["pid", "name", "exe"]):
+            try:
+                info = process.info
+                entries.append(
+                    ProcessScanEntry(
+                        pid=int(info.get("pid") or process.pid),
+                        executable_path=info.get("exe") or None,
+                        name=info.get("name") or None,
+                    )
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                # Disappearing mid-scan is normal; inaccessible entries are
+                # classified defensively by the scan rules, not here.
+                continue
+        return tuple(entries)
+
+
+class WindowsNamedMutexLaunchGuard:
+    """OS-backed interprocess launch guard using a Windows named mutex.
+
+    The mutex name is ``Local\\civ4-turn-relay-launch-<sha256(normalized
+    executable path)>``, so the guard serializes every Relay instance in the
+    same interactive Windows session that targets the same Civ executable.
+    Windows releases the mutex automatically when a holder crashes; the next
+    waiter then observes ``WAIT_ABANDONED`` and recovers ownership, so no
+    stale lock can persist. The guard cannot serialize a user or unrelated
+    external program starting Civ outside Relay.
+
+    Only construct this class on Windows.
+    """
+
+    def __init__(self, *, wait_timeout_ms: int = _GUARD_WAIT_TIMEOUT_MS) -> None:
+        self._wait_timeout_ms = wait_timeout_ms
+
+    def acquire(self, executable_path: str) -> GuardAcquisition:
+        import ctypes
+
+        kernel32 = getattr(ctypes, "windll").kernel32
+        name = launch_guard_name(executable_path)
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return GuardAcquisition(
+                outcome=GuardAcquireOutcome.UNAVAILABLE,
+                message=f"CreateMutexW failed (error {kernel32.GetLastError()})",
+            )
+        wait = kernel32.WaitForSingleObject(handle, self._wait_timeout_ms)
+        if wait == _WAIT_OBJECT_0:
+            return GuardAcquisition(
+                outcome=GuardAcquireOutcome.ACQUIRED, handle=int(handle)
+            )
+        if wait == _WAIT_ABANDONED:
+            return GuardAcquisition(
+                outcome=GuardAcquireOutcome.ACQUIRED_ABANDONED,
+                handle=int(handle),
+                message=(
+                    "recovered a launch guard abandoned by a crashed Relay; "
+                    "a fresh process scan still runs before any launch"
+                ),
+            )
+        kernel32.CloseHandle(handle)
+        if wait == _WAIT_TIMEOUT:
+            return GuardAcquisition(
+                outcome=GuardAcquireOutcome.BUSY,
+                message=("another Relay instance is launching Civilization right now"),
+            )
+        return GuardAcquisition(
+            outcome=GuardAcquireOutcome.UNAVAILABLE,
+            message=f"WaitForSingleObject failed (status {wait})",
+        )
+
+    def release(self, acquisition: GuardAcquisition) -> None:
+        handle = acquisition.handle
+        if not acquisition.held or not isinstance(handle, int):
+            return
+        import ctypes
+
+        kernel32 = getattr(ctypes, "windll").kernel32
+        kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
+
 
 class WindowsProcessSupervisor:
     """Windows :class:`~civ4_turn_relay.process.port.ProcessSupervisor`.
@@ -191,11 +301,15 @@ class WindowsProcessSupervisor:
         platform: str | None = None,
         sleep_fn: Callable[[float], None] | None = None,
         verify_delay_seconds: float = 0.5,
+        guard: LaunchGuard | None = None,
     ) -> None:
         self._platform = platform if platform is not None else sys.platform
         if backend is None and self._platform == "win32":
             backend = RealWindowsBackend()
+        if guard is None and self._platform == "win32":
+            guard = WindowsNamedMutexLaunchGuard()
         self._backend = backend
+        self._guard = guard
         self._sleep = sleep_fn if sleep_fn is not None else time.sleep
         self._verify_delay_seconds = verify_delay_seconds
 
@@ -251,6 +365,45 @@ class WindowsProcessSupervisor:
                 outcome=LaunchOutcome.IDENTITY_UNVERIFIED, message=str(error)
             )
         return LaunchResult(outcome=LaunchOutcome.LAUNCHED, identity=identity)
+
+    def guarded_launch(self, command: CivLaunchCommand) -> GuardedLaunchResult:
+        """Serialize with other Relay instances, scan, then spawn and verify.
+
+        The named mutex, the machine scan, and the spawn+verification form
+        one protected operation; the mutex is always released afterwards
+        (success, blocker, indeterminate scan, spawn failure, verification
+        failure, or exception).
+        """
+        backend = self._usable_backend()
+        if backend is None:
+            return GuardedLaunchResult(
+                outcome=GuardedLaunchOutcome.ADAPTER_UNAVAILABLE,
+                message=_UNAVAILABLE_REASON,
+            )
+        if self._guard is None:
+            return GuardedLaunchResult(
+                outcome=GuardedLaunchOutcome.GUARD_UNAVAILABLE,
+                message="no interprocess launch guard is configured",
+            )
+
+        def scan(executable_path: str) -> MachineScanResult:
+            try:
+                entries = backend.iter_process_entries()
+            except Exception as error:
+                # Fail closed: an unreadable machine scan must never allow
+                # a second Civ instance.
+                return MachineScanResult(
+                    outcome=MachineScanOutcome.INDETERMINATE,
+                    message=f"the machine process scan failed: {error}",
+                )
+            return classify_scan_entries(entries, executable_path=executable_path)
+
+        return execute_guarded_launch(
+            guard=self._guard,
+            scan=scan,
+            launch=self.launch,
+            command=command,
+        )
 
     def _matches(self, identity: ProcessIdentity, info: ProcessInfo) -> bool:
         """Exact identity: precise creation token plus normalized executable.

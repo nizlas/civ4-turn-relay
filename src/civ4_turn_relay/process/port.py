@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from civ4_turn_relay.domain import (
     DomainValidationError,
@@ -17,6 +17,9 @@ from civ4_turn_relay.domain import (
 )
 from civ4_turn_relay.local import ProcessObservation
 from civ4_turn_relay.process.launch_config import CivLaunchCommand
+
+if TYPE_CHECKING:
+    from civ4_turn_relay.process.guard import GuardedLaunchResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +219,16 @@ class ProcessSupervisor(Protocol):
 
     def launch(self, command: CivLaunchCommand) -> LaunchResult:
         """Spawn the command and verify the resulting process identity."""
+        ...
+
+    def guarded_launch(self, command: CivLaunchCommand) -> GuardedLaunchResult:
+        """Atomically guard, scan the machine for an existing process of the
+        exact configured executable, and only then spawn and verify.
+
+        The scan and the spawn happen under one held interprocess guard so
+        two Relay instances in the same Windows session can never both pass
+        the check and both spawn. See :mod:`civ4_turn_relay.process.guard`.
+        """
         ...
 
     def probe(self, identity: ProcessIdentity) -> ProbeResult:
