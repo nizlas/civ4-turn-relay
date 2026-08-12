@@ -636,6 +636,12 @@ existing process. See [`DESKTOP_CLIENT.md`](DESKTOP_CLIENT.md) “Cross-instance
 launch guard”. Covered by deterministic two-client fake-machine tests; real
 named-mutex semantics are exercised by Windows-only tests.
 
+Implementation note (2026-08-12, follow-up): the named-mutex adapter now
+declares a pointer-sized Win32 HANDLE ABI (injectable for tests); the real
+process scan preserves AccessDenied likely-Civ entries as
+``SCAN_INDETERMINATE``; and deferred launches keep distinct process statuses
+for an existing Civ, a busy sibling guard, and an indeterminate scan.
+
 ### Goal
 
 Empirically determine and implement launch/process integration for Steam/BTS/AdvCiv: mod + save, already-running detection, exit without save (FR-010), and Fully managed close/verify behavior (FR-015).

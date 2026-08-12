@@ -34,6 +34,14 @@ _CLOSE_NOT_DONE = frozenset(
     }
 )
 
+_DEFERRED_LAUNCH = frozenset(
+    {
+        ProcessStatus.WAITING_FOR_EXISTING_CIV,
+        ProcessStatus.WAITING_FOR_LAUNCH_GUARD,
+        ProcessStatus.LAUNCH_SCAN_INDETERMINATE,
+    }
+)
+
 
 @unique
 class PrimaryActionKind(Enum):
@@ -140,8 +148,8 @@ def _map_my_turn_downloaded(
     process: ProcessStatusSnapshot | None,
 ) -> _Draft:
     draft.status_text = "Your turn — save downloaded"
-    if process is not None and process.status is ProcessStatus.WAITING_FOR_EXISTING_CIV:
-        return _map_waiting_for_existing_civ(draft, snapshot)
+    if process is not None and process.status in _DEFERRED_LAUNCH:
+        return _map_deferred_launch(draft, snapshot, process)
     if snapshot.turn_handling_mode is TurnHandlingMode.STANDARD:
         return _action(
             draft, PrimaryActionKind.START_CIV, "Start Civilization and play"
@@ -153,21 +161,44 @@ def _map_my_turn_downloaded(
     return _disabled(draft, "Starting automatically…")
 
 
-def _map_waiting_for_existing_civ(
-    draft: _Draft, snapshot: MatchClientSnapshot
+def _map_deferred_launch(
+    draft: _Draft,
+    snapshot: MatchClientSnapshot,
+    process: ProcessStatusSnapshot,
 ) -> _Draft:
-    """An existing Civilization process defers this match's launch.
+    """A guarded launch was deferred; keep the turn ready without claiming a launch.
 
     Fully Managed retries automatically on later ticks, so the button stays
     disabled; Standard mode never auto-launches, so the user may explicitly
-    retry Start once the existing Civilization has closed.
+    retry Start. The three deferred statuses must stay distinct: an existing
+    Civ, a busy sibling Relay, and an unverifiable scan are not the same.
     """
-    draft.detail_text = "Your turn is ready — waiting for Civilization to close."
+    if process.status is ProcessStatus.WAITING_FOR_EXISTING_CIV:
+        draft.detail_text = "Your turn is ready — waiting for Civilization to close."
+        waiting_label = "Waiting for Civilization to close…"
+    elif process.status is ProcessStatus.WAITING_FOR_LAUNCH_GUARD:
+        draft.detail_text = _shorten(
+            process.message
+            or (
+                "Another Relay instance is currently checking or launching "
+                "Civilization."
+            )
+        )
+        waiting_label = "Waiting for another Relay instance…"
+    else:
+        draft.detail_text = _shorten(
+            process.message
+            or (
+                "Relay cannot safely determine whether Civilization is already running."
+            )
+        )
+        draft.attention = True
+        waiting_label = "Cannot safely launch Civilization…"
     if snapshot.turn_handling_mode is TurnHandlingMode.STANDARD:
         return _action(
             draft, PrimaryActionKind.START_CIV, "Start Civilization and play"
         )
-    return _disabled(draft, "Waiting for Civilization to close…")
+    return _disabled(draft, waiting_label)
 
 
 def _map_first_save(draft: _Draft, snapshot: MatchClientSnapshot) -> _Draft:
@@ -225,12 +256,9 @@ def _map_state(
     if state is OperationalState.MY_TURN_DOWNLOADED:
         return _map_my_turn_downloaded(draft, snapshot, process)
     if state is OperationalState.WAITING_FOR_MY_FIRST_SAVE:
-        if (
-            process is not None
-            and process.status is ProcessStatus.WAITING_FOR_EXISTING_CIV
-        ):
+        if process is not None and process.status in _DEFERRED_LAUNCH:
             draft.status_text = "Waiting for your first save (sequence 0)"
-            return _map_waiting_for_existing_civ(draft, snapshot)
+            return _map_deferred_launch(draft, snapshot, process)
         return _map_first_save(draft, snapshot)
     if state is OperationalState.CIV_RUNNING:
         return _map_civ_running(draft, process)

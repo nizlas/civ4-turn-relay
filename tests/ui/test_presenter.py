@@ -138,6 +138,62 @@ def test_my_turn_standard_waiting_for_existing_civ_keeps_start_button() -> None:
     assert vm.primary_enabled is True
 
 
+def test_my_turn_fully_managed_waits_for_busy_launch_guard() -> None:
+    vm = build_view_model(
+        client_snapshot(OperationalState.MY_TURN_DOWNLOADED, mode=MANAGED),
+        process_snapshot(
+            ProcessStatus.WAITING_FOR_LAUNCH_GUARD,
+            message=(
+                "another Relay instance is currently checking or launching Civilization"
+            ),
+        ),
+    )
+    assert "another Relay instance" in vm.detail_text
+    assert "waiting for Civilization to close" not in vm.detail_text.lower()
+    assert vm.primary_action is PrimaryActionKind.NONE
+    assert vm.primary_label == "Waiting for another Relay instance…"
+    assert vm.primary_enabled is False
+
+
+def test_my_turn_standard_busy_guard_keeps_start_button() -> None:
+    vm = build_view_model(
+        client_snapshot(OperationalState.MY_TURN_DOWNLOADED, mode=STANDARD),
+        process_snapshot(ProcessStatus.WAITING_FOR_LAUNCH_GUARD, message="guard busy"),
+    )
+    assert vm.detail_text == "guard busy"
+    assert vm.primary_action is PrimaryActionKind.START_CIV
+    assert vm.primary_enabled is True
+
+
+def test_my_turn_fully_managed_indeterminate_scan_shows_diagnostic() -> None:
+    diagnostic = (
+        "a process looks like the configured Civilization executable "
+        "but its identity could not be verified; refusing to launch"
+    )
+    vm = build_view_model(
+        client_snapshot(OperationalState.MY_TURN_DOWNLOADED, mode=MANAGED),
+        process_snapshot(ProcessStatus.LAUNCH_SCAN_INDETERMINATE, message=diagnostic),
+    )
+    assert vm.detail_text == diagnostic
+    assert "waiting for Civilization to close" not in vm.detail_text.lower()
+    assert vm.attention is True
+    assert vm.primary_action is PrimaryActionKind.NONE
+    assert vm.primary_label == "Cannot safely launch Civilization…"
+
+
+def test_my_turn_standard_indeterminate_scan_keeps_start_button() -> None:
+    vm = build_view_model(
+        client_snapshot(OperationalState.MY_TURN_DOWNLOADED, mode=STANDARD),
+        process_snapshot(
+            ProcessStatus.LAUNCH_SCAN_INDETERMINATE,
+            message="cannot verify whether Civilization is running",
+        ),
+    )
+    assert vm.detail_text == "cannot verify whether Civilization is running"
+    assert vm.primary_action is PrimaryActionKind.START_CIV
+    assert vm.primary_enabled is True
+
+
 def test_first_save_fully_managed_waits_for_existing_civ() -> None:
     vm = build_view_model(
         client_snapshot(OperationalState.WAITING_FOR_MY_FIRST_SAVE, mode=MANAGED),

@@ -112,17 +112,26 @@ reports the guard was abandoned by a crashed Relay, ownership is recovered
 (the OS never leaves a stale lock) but a fresh process scan still runs before
 any spawn.
 
-A deferred launch is a typed waiting status, not a failure:
+A deferred launch is a typed waiting status, not a failure. The three
+deferral reasons stay distinct:
 
-- The UI shows **"Your turn is ready — waiting for Civilization to close."**
+- **Existing Civilization** (`WAITING_FOR_EXISTING_CIV`): the UI shows
+  **"Your turn is ready — waiting for Civilization to close."**
+- **Busy launch guard** (`WAITING_FOR_LAUNCH_GUARD`): another Relay instance
+  in this Windows session is currently checking or launching Civilization.
+- **Indeterminate scan** (`LAUNCH_SCAN_INDETERMINATE`): a process looks like
+  the configured executable but its path could not be verified. The UI shows
+  that diagnostic rather than claiming Civilization is already running.
+
+In every deferred case:
+
 - The verified downloaded turn stays ready, and the durable one-launch-per-
   turn key is not consumed — the deferral never counts as a launch.
 - **Fully managed:** Relay retries the guarded launch on later ordinary polls
-  and launches exactly once after the existing Civilization has exited — no
-  user click needed and no rapid retry loop (one attempt per poll tick).
-- **Standard:** Relay reports that Civilization is already running and never
-  schedules a silent automatic launch; press Start again after the existing
-  Civilization has closed.
+  and launches exactly once when the blocker is gone — no user click needed
+  and no rapid retry loop (one attempt per poll tick).
+- **Standard:** Relay never schedules a silent automatic launch; press Start
+  again after the blocker has cleared.
 
 Scan defensiveness: unrelated processes whose executables cannot be read
 never block a launch; a process that *looks like* the Civ executable by name

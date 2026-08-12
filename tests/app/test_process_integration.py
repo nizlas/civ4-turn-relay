@@ -15,6 +15,7 @@ from civ4_turn_relay.process import (
     LaunchPlanOutcome,
     ProbeOutcome,
     ProcessIdentity,
+    ProcessScanEntry,
 )
 from civ4_turn_relay.protocol import HandoffOutcome, InitializeOutcome
 from civ4_turn_relay.storage import FakeStorage
@@ -807,6 +808,100 @@ def test_standard_profile_blocked_start_never_surprise_launches(
     assert client_b.process_status(GAME_ID).status is ProcessStatus.RUNNING
     client_a.close()
     client_b.close()
+
+
+def test_fully_managed_retries_guard_busy_without_consuming_launch_key(
+    tmp_path: Path,
+) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    supervisor.machine.externally_held = True
+    client, _config, _exe = _local_client_after_opponent_commit(
+        tmp_path, storage, clock, supervisor
+    )
+    snap = client.tick(GAME_ID)
+    assert snap.operational_state is OperationalState.MY_TURN_DOWNLOADED
+    assert supervisor.launched == []
+    status = client.process_status(GAME_ID)
+    assert status.status is ProcessStatus.WAITING_FOR_LAUNCH_GUARD
+    assert "another Relay instance" in status.message
+    records = client.store.load_match_state_or_empty(GAME_ID)
+    assert records.launch_attempt is None
+    assert records.process_association is None
+
+    client.tick(GAME_ID)
+    assert supervisor.launched == []
+
+    supervisor.machine.externally_held = False
+    launched = client.tick(GAME_ID)
+    assert launched.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor.launched) == 1
+    client.close()
+
+
+def test_fully_managed_retries_indeterminate_scan_without_claiming_existing_civ(
+    tmp_path: Path,
+) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    supervisor.machine.add_scan_entry(
+        ProcessScanEntry(pid=321, executable_path=None, name="Civ4BeyondSword.exe")
+    )
+    client, _config, _exe = _local_client_after_opponent_commit(
+        tmp_path, storage, clock, supervisor
+    )
+    snap = client.tick(GAME_ID)
+    assert snap.operational_state is OperationalState.MY_TURN_DOWNLOADED
+    assert supervisor.launched == []
+    status = client.process_status(GAME_ID)
+    assert status.status is ProcessStatus.LAUNCH_SCAN_INDETERMINATE
+    assert "could not be verified" in status.message
+    records = client.store.load_match_state_or_empty(GAME_ID)
+    assert records.launch_attempt is None
+    assert records.process_association is None
+    assert supervisor.focus_requests == []
+    assert supervisor.close_requests == []
+    assert supervisor.terminations == []
+
+    client.tick(GAME_ID)
+    assert supervisor.launched == []
+
+    supervisor.machine.clear_extra_scan_entries()
+    launched = client.tick(GAME_ID)
+    assert launched.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor.launched) == 1
+    client.close()
+
+
+def test_standard_indeterminate_start_never_surprise_launches(tmp_path: Path) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    supervisor.machine.add_scan_entry(
+        ProcessScanEntry(pid=321, executable_path=None, name="Civ4BeyondSword.exe")
+    )
+    client, _config, _exe = _local_client_after_opponent_commit(
+        tmp_path, storage, clock, supervisor, mode=TurnHandlingMode.STANDARD
+    )
+    deferred = client.request_start(GAME_ID)
+    assert deferred.operational_state is OperationalState.MY_TURN_DOWNLOADED
+    assert supervisor.launched == []
+    assert (
+        client.process_status(GAME_ID).status is ProcessStatus.LAUNCH_SCAN_INDETERMINATE
+    )
+    assert client.store.load_match_state_or_empty(GAME_ID).launch_attempt is None
+
+    supervisor.machine.clear_extra_scan_entries()
+    client.tick(GAME_ID)
+    client.tick(GAME_ID)
+    assert supervisor.launched == []
+
+    started = client.request_start(GAME_ID)
+    assert started.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor.launched) == 1
+    client.close()
 
 
 def test_focus_verifies_identity_before_acting(tmp_path: Path) -> None:

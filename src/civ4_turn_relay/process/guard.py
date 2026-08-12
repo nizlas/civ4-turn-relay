@@ -267,7 +267,10 @@ def execute_guarded_launch(
             outcome=GuardedLaunchOutcome.GUARD_BUSY,
             message=(
                 acquisition.message
-                or "another Relay instance is launching Civilization right now"
+                or (
+                    "another Relay instance is currently checking or "
+                    "launching Civilization"
+                )
             ),
         )
     recovered = acquisition.outcome is GuardAcquireOutcome.ACQUIRED_ABANDONED

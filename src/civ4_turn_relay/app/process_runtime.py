@@ -52,6 +52,8 @@ class ProcessStatus(Enum):
     STARTING = "starting"
     RUNNING = "running"
     WAITING_FOR_EXISTING_CIV = "waiting_for_existing_civ"
+    WAITING_FOR_LAUNCH_GUARD = "waiting_for_launch_guard"
+    LAUNCH_SCAN_INDETERMINATE = "launch_scan_indeterminate"
     CLOSE_REQUESTED = "close_requested"
     CLOSE_DEADLINE_ELAPSED = "close_deadline_elapsed"
     SAFELY_CLOSED = "safely_closed"
@@ -144,6 +146,7 @@ class ProcessCoordinator:
         self._session_running = False
         self._launch_failure_message: str | None = None
         self._launch_blocked_reason: str | None = None
+        self._launch_deferred_outcome: GuardedLaunchOutcome | None = None
         self._launch_deferred_message: str | None = None
         self._mismatched_keys: set[tuple[int, int, str]] = set()
         self._mismatch_message: str | None = None
@@ -230,21 +233,25 @@ class ProcessCoordinator:
             self._session_running = True
             self._launch_failure_message = None
             self._launch_blocked_reason = None
+            self._launch_deferred_outcome = None
             self._launch_deferred_message = None
             self._close_identity = None
             self._close_deadline = None
             self._force_close_attempted = False
             self._safely_closed = False
         elif result.deferred:
+            self._launch_deferred_outcome = result.outcome
             self._launch_deferred_message = result.message or result.outcome.value
             self._launch_failure_message = None
         else:
             self._launch_failure_message = result.message or result.outcome.value
+            self._launch_deferred_outcome = None
             self._launch_deferred_message = None
         return result
 
     def clear_launch_deferral(self) -> None:
         """Forget a deferred-launch status once no launch is wanted anymore."""
+        self._launch_deferred_outcome = None
         self._launch_deferred_message = None
 
     def request_close(
@@ -389,10 +396,37 @@ class ProcessCoordinator:
                 message="launching Civilization",
                 force_close_allowed=force_close_allowed,
             )
-        if self._launch_deferred_message is not None:
+        if self._launch_deferred_outcome is GuardedLaunchOutcome.EXISTING_CIV_DETECTED:
             return ProcessStatusSnapshot(
                 status=ProcessStatus.WAITING_FOR_EXISTING_CIV,
-                message=self._launch_deferred_message,
+                message=(
+                    self._launch_deferred_message
+                    or "Your turn is ready — waiting for Civilization to close."
+                ),
+                force_close_allowed=force_close_allowed,
+            )
+        if self._launch_deferred_outcome is GuardedLaunchOutcome.GUARD_BUSY:
+            return ProcessStatusSnapshot(
+                status=ProcessStatus.WAITING_FOR_LAUNCH_GUARD,
+                message=(
+                    self._launch_deferred_message
+                    or (
+                        "another Relay instance is currently checking or "
+                        "launching Civilization"
+                    )
+                ),
+                force_close_allowed=force_close_allowed,
+            )
+        if self._launch_deferred_outcome is GuardedLaunchOutcome.SCAN_INDETERMINATE:
+            return ProcessStatusSnapshot(
+                status=ProcessStatus.LAUNCH_SCAN_INDETERMINATE,
+                message=(
+                    self._launch_deferred_message
+                    or (
+                        "Relay cannot safely determine whether Civilization "
+                        "is already running"
+                    )
+                ),
                 force_close_allowed=force_close_allowed,
             )
         if (

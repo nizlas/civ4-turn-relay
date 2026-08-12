@@ -108,6 +108,10 @@ class FakeMachine:
         """Add a scan-only entry (e.g. an inaccessible foreign process)."""
         self._extra_scan_entries.append(entry)
 
+    def clear_extra_scan_entries(self) -> None:
+        """Drop scripted scan-only entries (running processes are unchanged)."""
+        self._extra_scan_entries.clear()
+
     def scan_entries(self) -> tuple[ProcessScanEntry, ...]:
         """Machine scan: every registered process plus scripted entries."""
         entries = [
