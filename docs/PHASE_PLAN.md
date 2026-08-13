@@ -618,9 +618,11 @@ P6 closed with `ParamikoStorage` implementing the full Storage contract (path co
 Implementation note (2026-08-11): the launch port (`civ4_turn_relay/process/`),
 Windows adapter (psutil + WM_CLOSE), `RelayClient` integration, and all required
 automated tests (fake process supervisor; FR-010 and FR-015 paths) are
-implemented and passing. The exit criteria require the exact Steam/BTS/AdvCiv
-CLI behavior to be **empirically verified** on a real Windows Civ install; that
-evidence does not exist yet. The manual smoke-test checklist lives in
+implemented and passing. The exit criteria require the Steam/BTS/AdvCiv CLI
+behavior to be **empirically verified** on a real Windows Civ install. The mod
+argument was confirmed on 2026-08-13: stored ``Mods\\AdvCiv`` must be launched
+as one ``mod=\\AdvCiv`` argument. Direct ``/fxsload`` behavior and the remaining
+end-to-end lifecycle evidence are still pending. The manual smoke-test checklist lives in
 [`DESKTOP_CLIENT.md`](DESKTOP_CLIENT.md). P7 remains the sole ACTIVE phase
 until that checklist is performed and its results recorded here.
 

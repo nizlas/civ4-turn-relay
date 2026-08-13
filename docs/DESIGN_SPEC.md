@@ -549,7 +549,7 @@ Product-level principles only. Detailed protocol cases: [`SYNC_PROTOCOL.md`](SYN
 
 | Topic | Recommendation |
 |-------|----------------|
-| Exact Civ IV CLI for mod + save | Confirm empirically on BTS/AdvCiv during launch-integration phase; keep launcher behind an adapter interface now |
+| Exact Civ IV CLI for mod + save | Mod confirmed 2026-08-13: stored `Mods\\AdvCiv` translates to one `mod=\\AdvCiv` argument. Confirm direct `/fxsload` empirically; keep the launcher behind an adapter interface. |
 | Default auto-send vs manual Send | Auto-send after valid `OUTGOING_SAVE_DETECTED` when a trustworthy baseline exists (required for zero-click `fully_managed`) |
 | Default `turn_handling_mode` | `standard` ([§4.2](#42-per-match-configuration), [§8.5](#85-turn-handling-modes)); replaces standalone `auto_launch` |
 | Default `allow_force_close_after_commit` | `false`; Fully managed advanced opt-in only |

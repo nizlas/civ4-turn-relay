@@ -52,7 +52,7 @@ First-run setup:
 Relay launches Civilization with exactly this command shape and nothing else — no shell, no extra flags (built in `src/civ4_turn_relay/process/launch_config.py`):
 
 - the configured executable,
-- if a mod is configured, one single argument `mod=<mod folder token>`, where the configured value is the exact Civ-relative mod folder token (for example `Mods\AdvCiv`) passed through verbatim — no space after `mod=`, no rewriting,
+- if a mod is configured, one single argument in Civ IV's old command-line form: the configured Civ-relative folder `Mods\AdvCiv` is translated to `mod=\AdvCiv`; Civ IV supplies the `Mods` root itself,
 - if a save is being loaded, one single argument `/fxsload=<absolute save path>`.
 
 Leaving the mod value empty omits the `mod=` argument entirely, deliberately deferring to the mod configured in the Civilization INI. The token is validated before use: it must be a relative folder token — absolute paths, drive letters, traversal (`..`), quotes, control characters, and stray leading/trailing whitespace are all rejected.
@@ -60,10 +60,10 @@ Leaving the mod value empty omits the `mod=` argument entirely, deliberately def
 The dry-run preview renders the command as one Windows-quoted command line (arguments containing spaces are quoted; the `mod=` and `/fxsload=` arguments only when they contain spaces):
 
 ```text
-"C:\Games\Civ4\Beyond the Sword\Civ4BeyondSword.exe" mod=Mods\AdvCiv "/fxsload=C:\Users\you\Documents\My Games\Beyond the Sword\Saves\PBEM\turn.CivBeyondSwordSave"
+"C:\Games\Civ4\Beyond the Sword\Civ4BeyondSword.exe" mod=\AdvCiv "/fxsload=C:\Users\you\Documents\My Games\Beyond the Sword\Saves\PBEM\turn.CivBeyondSwordSave"
 ```
 
-**Honesty note:** this command shape is modeled explicitly and covered by unit tests, but the exact `/fxsload` and `mod=<mod folder>` flag behavior against a real installation is pending empirical confirmation via the [manual smoke test](#manual-windows-smoke-test-checklist) below.
+**Empirical status:** `mod=\AdvCiv` was confirmed against a real Steam/Beyond the Sword/Advanced Civ installation on 2026-08-13. Passing `mod=Mods\AdvCiv` was rejected by Civ IV as `Mods\ods\AdvCiv`, proving that the game supplies the `Mods` root itself. Direct `/fxsload` behavior remains pending confirmation through the [manual smoke test](#manual-windows-smoke-test-checklist) below.
 
 Before any launch, Relay validates the plan and refuses with an actionable reason instead of launching blind: executable not configured (`CIV4_RELAY_CIV4_EXECUTABLE`), executable not found, save not found, save resolving outside the match PBEM directory (including symlinks), or invalid configuration. In fully managed mode a refusal surfaces as the launch-failed process status ("Civilization was not launched" plus the reason) rather than a silent retry loop.
 
@@ -175,7 +175,7 @@ credentials):
 Completing this checklist on a real Windows machine with a real Civilization IV: Beyond the Sword + Advanced Civ installation is the **exit evidence for phase P7** ([`PHASE_PLAN.md`](PHASE_PLAN.md)). Every step is non-destructive: use disposable directories, copied test saves, and a disposable server — never a live match.
 
 1. **Configure a local test match and a disposable test save directory.** Add a match through Match ▸ Add match… whose PBEM save folder is a throwaway directory, and copy a test `.CivBeyondSwordSave` into place instead of using any real match data.
-2. **Use dry-run to inspect the Civ launch command.** Call `RelayClient.launch_preview(game_id)` and check `dry_run_preview()` against the documented shape above — executable first, then `mod=Mods\AdvCiv`, then `/fxsload=` with the absolute save path. A non-ready plan must instead carry an actionable refusal reason.
+2. **Use dry-run to inspect the Civ launch command.** Call `RelayClient.launch_preview(game_id)` and check `dry_run_preview()` against the documented shape above — executable first, then `mod=\AdvCiv`, then `/fxsload=` with the absolute save path. A non-ready plan must instead carry an actionable refusal reason.
 3. **Manually test launch into AdvCiv with a copied test save.** Press the match's primary Start button (or call `request_start`) and confirm Civilization starts, loads the Advanced Civ mod, and opens the save directly without visiting the multiplayer menus. This step is what empirically confirms the `/fxsload` and `mod=<mod folder>` flag behavior.
 4. **Confirm Relay records the exact process identity.** After the launch, `RelayClient.process_status(game_id)` must report `RUNNING` with the identity (PID, precise creation token, executable path, plus the diagnostic UTC start timestamp), and the match's durable state must contain the matching process association — including `process_create_time_ns` — so identity survives a Relay restart.
 5. **Simulate/perform a completed test handoff.** End the turn in Civilization (or place a distinct valid save into the test folder) and confirm Relay detects a stable candidate, uploads it, and commits it against the disposable test server.

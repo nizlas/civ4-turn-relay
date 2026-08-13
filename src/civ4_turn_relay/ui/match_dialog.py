@@ -119,9 +119,9 @@ class MatchEditDialog(QDialog):
 
         self.mod_name_edit = QLineEdit(_DEFAULT_MOD, self)
         self.mod_name_edit.setToolTip(
-            "Civ-relative mod folder token passed verbatim as mod=<token>, "
-            "for example Mods\\AdvCiv. Leave empty to launch without a mod "
-            "argument and rely on the Civilization INI configuration."
+            "Civ-relative mod folder, for example Mods\\AdvCiv. Relay "
+            "translates it to Civilization IV's mod=\\AdvCiv command-line "
+            "syntax. Leave empty to rely on the Civilization INI."
         )
         form.addRow("Mod folder (Civ-relative)", self.mod_name_edit)
 
