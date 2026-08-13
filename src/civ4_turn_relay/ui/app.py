@@ -426,7 +426,9 @@ class RelayApplication:
         """Reload global config; connection settings apply after a restart."""
 
         def _load_default() -> GlobalConfig:
-            return load_global_config(dotenv_path=self._dotenv_path)
+            return load_global_config(
+                dotenv_path=_dotenv_for_loading(self._dotenv_path)
+            )
 
         loader = self._config_loader or _load_default
         try:
@@ -500,6 +502,11 @@ def _find_env_example() -> Path | None:
     return None
 
 
+def _dotenv_for_loading(dotenv_path: Path | None) -> Path | None:
+    """Return only an existing dotenv file to the strict config loader."""
+    return dotenv_path if dotenv_path is not None and dotenv_path.is_file() else None
+
+
 def main() -> int:
     """GUI entry point (``civ4-turn-relay-ui``)."""
     app = GatedQApplication(sys.argv)
@@ -517,7 +524,7 @@ def main() -> int:
     config: GlobalConfig | None = None
     config_error: str | None = None
     try:
-        config = load_global_config(dotenv_path=dotenv_path)
+        config = load_global_config(dotenv_path=_dotenv_for_loading(dotenv_path))
     except Exception as exc:
         config_error = str(exc)
         QMessageBox.warning(

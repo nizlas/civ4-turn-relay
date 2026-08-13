@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from civ4_turn_relay.ui.app import _find_env_example, user_data_dir
+from civ4_turn_relay.ui.app import (
+    _dotenv_for_loading,
+    _find_env_example,
+    user_data_dir,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGING = ROOT / "packaging"
@@ -137,6 +141,15 @@ def test_frozen_app_finds_packaged_env_example(
     monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
 
     assert _find_env_example() == example
+
+
+def test_missing_first_run_dotenv_is_not_passed_to_strict_loader(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / ".env"
+    assert _dotenv_for_loading(target) is None
+    target.write_text("CIV4_RELAY_SFTP_HOST=placeholder\n", encoding="utf-8")
+    assert _dotenv_for_loading(target) == target
 
 
 def test_gitignore_keeps_scripts_ignores_artifacts_and_vcredist() -> None:
