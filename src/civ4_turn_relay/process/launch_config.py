@@ -3,16 +3,16 @@
 Exact documented command shape (never any other flags, never a shell):
 
 - ``argv[0]`` is the configured executable path.
-- If a mod is configured, one single argument ``mod=<mod token>`` is appended,
-  where the configured value is the exact Civ-relative mod folder token (for
-  example ``Mods\\AdvCiv``). No space is inserted after ``mod=`` and the token
-  is passed through verbatim after validation. Omitting the mod value omits
-  the argument entirely, deliberately deferring to the Civilization INI
-  configuration.
+- If a mod is configured, one single Civilization IV argument is appended.
+  The stored Civ-relative folder (for example ``Mods\\AdvCiv``) is translated
+  to Civ IV's empirically verified command-line form ``mod=\\AdvCiv``. Civ IV
+  itself supplies the ``Mods`` root; passing ``mod=Mods\\AdvCiv`` makes the
+  game incorrectly look for ``Mods\\ods\\AdvCiv``. Omitting the mod value
+  omits the argument entirely, deliberately deferring to the Civilization INI.
 - If a save is configured, one single argument ``/fxsload=<absolute save
-  path>`` is appended (direct-save-load mechanism modeled explicitly; exact
-  flag behavior is empirically confirmed via the documented manual smoke
-  test).
+  path>`` is appended. The direct-save-load mechanism is modeled explicitly;
+  its real-installation behavior still requires the documented manual smoke
+  test.
 
 Planning here is pure aside from the injectable ``is_file`` probe and path
 resolution; nothing in this module launches a process.
@@ -49,9 +49,9 @@ def _absolute_parent_directory(path: str) -> str:
 def _validate_mod_token(value: str, *, field_path: str) -> str:
     """Validate a Civ-relative mod folder token such as ``Mods\\AdvCiv``.
 
-    The token is passed to Civilization verbatim as one argument; it is never
-    invented, normalized, or rewritten. Absolute paths, traversal, quotes,
-    control characters, and stray leading/trailing whitespace are rejected.
+    The token is stored as entered and translated only when the command is
+    built. Absolute paths, traversal, quotes, control characters, and stray
+    leading/trailing whitespace are rejected.
     """
     if not isinstance(value, str) or not value:
         raise DomainValidationError(
@@ -95,7 +95,31 @@ def _validate_mod_token(value: str, *, field_path: str) -> str:
                 "folder segments must not start or end with whitespace",
                 field_path=field_path,
             )
+    if value.casefold() == "mods":
+        raise DomainValidationError(
+            "the mod token must name a folder below Mods",
+            field_path=field_path,
+        )
     return value
+
+
+def _mod_command_argument(value: str) -> str:
+    """Translate a stored Civ-relative mod folder to Civ IV's CLI syntax.
+
+    Civ IV prepends its own ``Mods`` directory and expects the command value to
+    start with a backslash. Accept both the UI's explicit ``Mods\\...`` form and
+    a path already relative to that root, while always emitting one canonical
+    argv element.
+    """
+    parts = value.split("\\")
+    if parts[0].casefold() == "mods":
+        parts = parts[1:]
+    if not parts:
+        raise DomainValidationError(
+            "the mod token must name a folder below Mods",
+            field_path="mod_name",
+        )
+    return "mod=\\" + "\\".join(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +159,7 @@ def build_civ_command(config: CivLaunchConfiguration) -> CivLaunchCommand:
     """Build the exact documented Civ4 command from validated configuration."""
     argv = [config.executable_path]
     if config.mod_name is not None:
-        argv.append(f"mod={config.mod_name}")
+        argv.append(_mod_command_argument(config.mod_name))
     if config.save_path is not None:
         argv.append(f"/fxsload={config.save_path}")
     return CivLaunchCommand(

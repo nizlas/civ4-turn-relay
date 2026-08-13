@@ -50,7 +50,7 @@ Detailed lifecycle and safety semantics: [`docs/DESIGN_SPEC.md`](docs/DESIGN_SPE
 
 ### Implementation status
 
-Protocol, local persistence, reconciliation, save detection, orchestration, the Windows process adapter (launch, identity verification, graceful close), and the PySide6 desktop client are implemented with full automated test coverage. What remains for **P7** ([`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md)) is the manual smoke test against a real Civilization installation: the exact `/fxsload` and `mod=<mod folder>` command-line behavior is modeled and unit-tested but not yet empirically confirmed. **P7 stays ACTIVE until that checklist is completed** ([`docs/DESKTOP_CLIENT.md`](docs/DESKTOP_CLIENT.md)). Until then, do not rely on Fully Managed mode for real matches.
+Protocol, local persistence, reconciliation, save detection, orchestration, the Windows process adapter (launch, identity verification, graceful close), and the PySide6 desktop client are implemented with full automated test coverage. The real-installation smoke test has confirmed Civ IV's mod argument (`Mods\AdvCiv` in match configuration becomes `mod=\AdvCiv`); direct `/fxsload` loading and the remaining **P7** checklist are still pending ([`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md), [`docs/DESKTOP_CLIENT.md`](docs/DESKTOP_CLIENT.md)). **P7 stays ACTIVE until that checklist is completed.** Until then, do not rely on Fully Managed mode for real matches.
 
 ## Standard mode
 

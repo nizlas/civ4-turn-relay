@@ -166,7 +166,7 @@ def test_fully_managed_launches_once_and_survives_restart(tmp_path: Path) -> Non
     assert records.downloaded_save is not None
     assert supervisor.launched[0].argv == (
         exe,
-        "mod=Mods\\AdvCiv",
+        "mod=\\AdvCiv",
         f"/fxsload={records.downloaded_save.local_path}",
     )
     assert records.launch_attempt is not None
@@ -202,7 +202,7 @@ def test_sequence_zero_launches_without_save_argument(tmp_path: Path) -> None:
     snap = client.tick(GAME_ID)
     assert snap.operational_state is OperationalState.CIV_RUNNING
     assert len(supervisor.launched) == 1
-    assert supervisor.launched[0].argv == (exe, "mod=Mods\\AdvCiv")
+    assert supervisor.launched[0].argv == (exe, "mod=\\AdvCiv")
     client.close()
 
 

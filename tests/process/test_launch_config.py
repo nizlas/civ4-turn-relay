@@ -31,7 +31,7 @@ def test_command_with_mod_token_is_exactly_one_argument() -> None:
     command = build_civ_command(
         CivLaunchConfiguration(executable_path=_EXE, mod_name=_MOD)
     )
-    assert command.argv == (_EXE, "mod=Mods\\AdvCiv")
+    assert command.argv == (_EXE, "mod=\\AdvCiv")
     assert sum(arg.startswith("mod=") for arg in command.argv) == 1
 
 
@@ -39,7 +39,7 @@ def test_command_with_mod_and_save_direct_load() -> None:
     command = build_civ_command(
         CivLaunchConfiguration(executable_path=_EXE, mod_name=_MOD, save_path=_SAVE)
     )
-    assert command.argv == (_EXE, "mod=Mods\\AdvCiv", f"/fxsload={_SAVE}")
+    assert command.argv == (_EXE, "mod=\\AdvCiv", f"/fxsload={_SAVE}")
 
 
 def test_omitted_mod_produces_no_mod_argument() -> None:
@@ -54,7 +54,7 @@ def test_sequence_zero_shape_is_mod_without_save() -> None:
     command = build_civ_command(
         CivLaunchConfiguration(executable_path=_EXE, mod_name=_MOD, save_path=None)
     )
-    assert command.argv == (_EXE, "mod=Mods\\AdvCiv")
+    assert command.argv == (_EXE, "mod=\\AdvCiv")
     assert not any(arg.startswith("/fxsload=") for arg in command.argv)
 
 
@@ -79,7 +79,7 @@ def test_dry_run_preview_quotes_paths_with_spaces() -> None:
     command = build_civ_command(
         CivLaunchConfiguration(executable_path=_EXE, mod_name=_MOD)
     )
-    assert command.dry_run_preview() == f'"{_EXE}" mod=Mods\\AdvCiv'
+    assert command.dry_run_preview() == f'"{_EXE}" mod=\\AdvCiv'
 
 
 def test_dry_run_preview_leaves_spaceless_arguments_unquoted() -> None:
@@ -119,11 +119,17 @@ def test_mod_token_rejects_malformed_values(mod_name: str) -> None:
     "mod_name",
     ["AdvCiv", "Mods\\AdvCiv", "Mods\\Advanced Civ", "Mods\\Sub\\AdvCiv"],
 )
-def test_mod_token_accepts_relative_folder_tokens_verbatim(mod_name: str) -> None:
+def test_mod_token_translates_relative_folder_to_civ_cli(mod_name: str) -> None:
     command = build_civ_command(
         CivLaunchConfiguration(executable_path=_EXE, mod_name=mod_name)
     )
-    assert command.argv == (_EXE, f"mod={mod_name}")
+    relative = mod_name.removeprefix("Mods\\")
+    assert command.argv == (_EXE, f"mod=\\{relative}")
+
+
+def test_bare_mods_root_is_rejected_when_building_command() -> None:
+    with pytest.raises(DomainValidationError, match="below Mods"):
+        CivLaunchConfiguration(executable_path=_EXE, mod_name="Mods")
 
 
 def test_launch_plan_invariant_requires_command_only_when_ready() -> None:
@@ -209,7 +215,7 @@ def test_plan_ready_builds_command_and_working_directory(tmp_path: Path) -> None
     assert plan.command is not None
     assert plan.command.argv == (
         str(executable),
-        "mod=Mods\\AdvCiv",
+        "mod=\\AdvCiv",
         f"/fxsload={save}",
     )
     assert plan.command.working_directory == str(tmp_path / "civ")
@@ -225,7 +231,7 @@ def test_plan_ready_without_save_skips_directory_checks() -> None:
     )
     assert plan.outcome is LaunchPlanOutcome.READY
     assert plan.command is not None
-    assert plan.command.argv == (_EXE, "mod=Mods\\AdvCiv")
+    assert plan.command.argv == (_EXE, "mod=\\AdvCiv")
 
 
 def test_plan_invalid_configuration_reports_validation_message(

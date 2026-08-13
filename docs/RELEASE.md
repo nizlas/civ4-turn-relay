@@ -121,7 +121,7 @@ whether to sign).
 - [ ] Start Menu shortcut works; optional desktop shortcut works when selected
 - [ ] Upgrade leaves `%APPDATA%\civ4-turn-relay` intact
 - [ ] Uninstall leaves `%APPDATA%\civ4-turn-relay` and PBEM saves intact
-- [ ] Civ launch remains argv-only (`mod=Mods\AdvCiv` as one argument; no shell string)
+- [ ] Civ launch remains argv-only (`mod=\AdvCiv` as one argument; no shell string)
 
 ## PySide6 teardown risk (release gate)
 
