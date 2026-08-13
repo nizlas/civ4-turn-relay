@@ -136,6 +136,56 @@ def test_path_containment_rejects_windows_separators() -> None:
         storage._resolve(r"a\b")  # noqa: SLF001
 
 
+def test_mkdir_generic_failure_rechecks_existing_directory() -> None:
+    """OpenSSH's generic Failure must still classify an existing directory."""
+    from civ4_turn_relay.storage.port import StorageCapabilities, StorageEntryKind
+
+    storage = ParamikoStorage(_config())
+    storage._capabilities_verified = True  # noqa: SLF001
+    storage._capabilities = StorageCapabilities(  # noqa: SLF001
+        exclusive_mkdir=True,
+        atomic_replace=True,
+        atomic_publish_no_replace=True,
+        complete_readback=True,
+    )
+    sftp = MagicMock()
+    sftp.mkdir.side_effect = OSError("Failure")
+    storage._sftp = sftp  # noqa: SLF001
+    storage._closed = False  # noqa: SLF001
+    def existing_directory(_remote: str) -> StorageEntryKind | None:
+        return StorageEntryKind.DIRECTORY
+
+    storage._stat_kind = existing_directory  # type: ignore[assignment]  # noqa: SLF001
+
+    with pytest.raises(StorageAlreadyExistsError):
+        storage.mkdir("existing-game")
+
+
+def test_mkdir_generic_failure_rechecks_wrong_kind_file() -> None:
+    from civ4_turn_relay.storage import StorageWrongKindError
+    from civ4_turn_relay.storage.port import StorageCapabilities, StorageEntryKind
+
+    storage = ParamikoStorage(_config())
+    storage._capabilities_verified = True  # noqa: SLF001
+    storage._capabilities = StorageCapabilities(  # noqa: SLF001
+        exclusive_mkdir=True,
+        atomic_replace=True,
+        atomic_publish_no_replace=True,
+        complete_readback=True,
+    )
+    sftp = MagicMock()
+    sftp.mkdir.side_effect = OSError("Failure")
+    storage._sftp = sftp  # noqa: SLF001
+    storage._closed = False  # noqa: SLF001
+    def existing_file(_remote: str) -> StorageEntryKind | None:
+        return StorageEntryKind.FILE
+
+    storage._stat_kind = existing_file  # type: ignore[assignment]  # noqa: SLF001
+
+    with pytest.raises(StorageWrongKindError):
+        storage.mkdir("wrong-kind")
+
+
 @pytest.mark.parametrize(
     "operation",
     ("mkdir", "read_file", "publish_no_replace", "atomic_replace"),
