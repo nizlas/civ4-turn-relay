@@ -43,7 +43,7 @@ def test_command_with_mod_and_save_direct_load() -> None:
     assert command.argv == (_EXE, f"/fxsload={_SAVE}", "mod=\\AdvCiv")
 
 
-def test_steam_launch_preserves_civ_argv_and_builds_launcher_preview() -> None:
+def test_steam_context_is_carried_without_touching_the_argv() -> None:
     command = build_civ_command(
         CivLaunchConfiguration(
             executable_path=_EXE,
@@ -54,12 +54,8 @@ def test_steam_launch_preserves_civ_argv_and_builds_launcher_preview() -> None:
         )
     )
     assert command.argv == (_EXE, f"/fxsload={_SAVE}", "mod=\\AdvCiv")
-    assert command.environment == ()
-    assert command.steam_app_id == "8800"
+    assert command.environment == (("SteamAppId", "8800"), ("SteamGameId", "8800"))
     assert command.steam_executable_path == _STEAM
-    assert command.steam_launch_preview() == (
-        f'"{_STEAM}" -applaunch 8800 /fxsload={_SAVE} mod=\\AdvCiv'
-    )
 
 
 @pytest.mark.parametrize("app_id", ["", "0", "-1", "8800 ", "steam"])
@@ -80,21 +76,6 @@ def test_steam_app_id_requires_a_steam_executable() -> None:
 def test_steam_executable_requires_an_app_id() -> None:
     with pytest.raises(DomainValidationError):
         CivLaunchConfiguration(executable_path=_EXE, steam_executable_path=_STEAM)
-
-
-def test_concrete_steam_command_requires_complete_launcher_configuration() -> None:
-    with pytest.raises(DomainValidationError):
-        CivLaunchCommand(
-            argv=(_EXE,),
-            working_directory=None,
-            steam_app_id="8800",
-        )
-    with pytest.raises(DomainValidationError):
-        CivLaunchCommand(
-            argv=(_EXE,),
-            working_directory=None,
-            steam_executable_path=_STEAM,
-        )
 
 
 def test_omitted_mod_produces_no_mod_argument() -> None:
