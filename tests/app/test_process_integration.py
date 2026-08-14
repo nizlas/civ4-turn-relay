@@ -195,7 +195,7 @@ def test_fully_managed_launches_once_and_survives_restart(tmp_path: Path) -> Non
     restarted.close()
 
 
-def test_fully_managed_launch_carries_configured_steam_launch_data(tmp_path: Path) -> None:
+def test_fully_managed_launch_carries_configured_steam_context(tmp_path: Path) -> None:
     storage = FakeStorage()
     clock = FakeClock()
     supervisor = FakeProcessSupervisor()
@@ -223,8 +223,7 @@ def test_fully_managed_launch_carries_configured_steam_launch_data(tmp_path: Pat
     assert joined.outcome is InitializeOutcome.JOINED_EXISTING
     assert client.tick(GAME_ID).operational_state is OperationalState.CIV_RUNNING
     command = supervisor.launched[0]
-    assert command.environment == ()
-    assert command.steam_app_id == "8800"
+    assert command.environment == (("SteamAppId", "8800"), ("SteamGameId", "8800"))
     assert command.steam_executable_path == str(steam)
     client.close()
 
@@ -582,12 +581,7 @@ def test_pid_reuse_after_restart_never_targets_impostor(tmp_path: Path) -> None:
     assert supervisor.close_requests == []
     assert supervisor.terminations == []
     assert supervisor.focus_requests == []
-    # A fully managed Relay start retries once. The reused PID is never
-    # adopted, but its matching executable safely blocks a second Civ spawn.
-    assert (
-        restarted.process_status(GAME_ID).status
-        is ProcessStatus.WAITING_FOR_EXISTING_CIV
-    )
+    assert restarted.process_status(GAME_ID).status is ProcessStatus.READY
     restarted.tick(GAME_ID)
     assert len(supervisor.launched) == 1
     restarted.close()
