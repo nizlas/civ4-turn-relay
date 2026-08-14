@@ -13,10 +13,12 @@ Exact documented command shape (never any other flags, never a shell):
   itself supplies the ``Mods`` root; passing ``mod=Mods\\AdvCiv`` makes the
   game incorrectly look for ``Mods\\ods\\AdvCiv``. Omitting the mod value
   omits the argument entirely, deliberately deferring to the Civilization INI.
-- When a Steam app id is configured, the command carries the two per-process
-  environment variables that let the raw BTS executable retain Steam's
-  multiplayer context: ``SteamAppId`` and ``SteamGameId``. Steam itself is
-  started separately by the Windows adapter when needed.
+- When a Steam app id is configured, the Windows adapter starts that exact
+  Steam application with ``-applaunch`` and forwards the Civ arguments in
+  their existing order.  It then identifies the BTS process Steam creates.
+  Starting the raw BTS executable with copied Steam environment variables is
+  deliberately not used: it is not equivalent to Steam's BTS launch path for
+  PBEM saves.
 
 Planning here is pure aside from the injectable ``is_file`` probe and path
 resolution; nothing in this module launches a process.
@@ -176,11 +178,57 @@ class CivLaunchCommand:
     argv: tuple[str, ...]
     working_directory: str | None
     environment: tuple[tuple[str, str], ...] = ()
+    steam_app_id: str | None = None
     steam_executable_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.steam_app_id is None) != (self.steam_executable_path is None):
+            raise DomainValidationError(
+                "Steam app id and Steam executable path must be configured together",
+                field_path=(
+                    "steam_app_id"
+                    if self.steam_app_id is None
+                    else "steam_executable_path"
+                ),
+            )
+        if self.steam_app_id is not None:
+            if not self.steam_app_id.isdecimal() or int(self.steam_app_id) <= 0:
+                raise DomainValidationError(
+                    "expected a positive decimal Steam app id",
+                    field_path="steam_app_id",
+                )
+            assert self.steam_executable_path is not None
+            validate_windows_local_path(
+                self.steam_executable_path, field_path="steam_executable_path"
+            )
 
     def dry_run_preview(self) -> str:
         """Return the Windows-quoted single command line for display only."""
         return subprocess.list2cmdline(self.argv)
+
+    def steam_launch_preview(self) -> str:
+        """Return Steam's argv-style launch command for diagnostics.
+
+        The target BTS executable remains in :attr:`argv` so the process
+        guard knows exactly which process is safe to associate and close.
+        Steam receives only the BTS arguments after ``-applaunch <app id>``.
+        """
+        steam_argv = self.steam_launch_argv()
+        if steam_argv is None:
+            return self.dry_run_preview()
+        return subprocess.list2cmdline(steam_argv)
+
+    def steam_launch_argv(self) -> tuple[str, ...] | None:
+        """Steam ``-applaunch`` argv, or ``None`` when Steam is not configured."""
+        if self.steam_app_id is None:
+            return None
+        assert self.steam_executable_path is not None
+        return (
+            self.steam_executable_path,
+            "-applaunch",
+            self.steam_app_id,
+            *self.argv[1:],
+        )
 
 
 def build_civ_command(config: CivLaunchConfiguration) -> CivLaunchCommand:
@@ -190,16 +238,10 @@ def build_civ_command(config: CivLaunchConfiguration) -> CivLaunchCommand:
         argv.append(f"/fxsload={config.save_path}")
     if config.mod_name is not None:
         argv.append(_mod_command_argument(config.mod_name))
-    environment: tuple[tuple[str, str], ...] = ()
-    if config.steam_app_id is not None:
-        environment = (
-            ("SteamAppId", config.steam_app_id),
-            ("SteamGameId", config.steam_app_id),
-        )
     return CivLaunchCommand(
         argv=tuple(argv),
         working_directory=config.working_directory,
-        environment=environment,
+        steam_app_id=config.steam_app_id,
         steam_executable_path=config.steam_executable_path,
     )
 
