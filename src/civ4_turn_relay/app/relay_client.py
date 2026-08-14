@@ -324,26 +324,19 @@ class RelayClient:
         coordinator = self._coordinator(session)
         if coordinator is not None:
             self._refresh_process_observation(session, coordinator)
-        # A newly opened *Fully Managed* Relay instance gets one automatic
-        # retry for a persisted failed/unverified launch.  Standard mode is
-        # deliberately never an implicit launch mode; its Start button stays
-        # the only retry path. Subsequent Fully Managed ticks keep the
+        # A newly opened Relay instance gets one automatic retry for a
+        # persisted failed/unverified launch. Subsequent ticks keep the
         # existing no-loop guarantee; explicit Start remains a separate retry.
-        startup_retry = (
-            session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
-            and session.startup_auto_retry_available
-        )
         result = self.reconcile(
             game_id,
             now_utc=now_utc,
-            user_requested_start=startup_retry,
+            user_requested_start=session.startup_auto_retry_available,
         )
         if any(
             intent.kind is OrchestrationIntentKind.START_CIV
             for intent in result.intents
         ):
-            if startup_retry:
-                session.startup_auto_retry_available = False
+            session.startup_auto_retry_available = False
         if (
             self._auto_execute_managed_handoff
             and session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
