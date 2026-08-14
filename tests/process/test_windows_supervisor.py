@@ -259,6 +259,7 @@ def test_steam_that_does_not_start_bts_returns_identity_unverified() -> None:
     ).launch(command)
     assert result.outcome is LaunchOutcome.EXITED_IMMEDIATELY
     assert "spawn" in backend.call_names()
+    assert "Steam did not start Civilization IV" in result.message
 
 
 def test_launch_spawn_oserror_maps_to_spawn_failure() -> None:
