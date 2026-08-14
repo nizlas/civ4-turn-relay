@@ -126,6 +126,8 @@ class RelayClient:
         enable_monitoring: bool = True,
         process_supervisor: ProcessSupervisor | None = None,
         civ4_executable: str | None = None,
+        steam_app_id: str | None = None,
+        steam_executable: str | None = None,
     ) -> None:
         if not isinstance(store, LocalStore):
             raise TypeError("store must be a LocalStore instance")
@@ -137,6 +139,14 @@ class RelayClient:
             raise TypeError("process_supervisor must satisfy ProcessSupervisor")
         if civ4_executable is not None and not isinstance(civ4_executable, str):
             raise TypeError("civ4_executable must be a string or None")
+        if steam_app_id is not None and not isinstance(steam_app_id, str):
+            raise TypeError("steam_app_id must be a string or None")
+        if steam_executable is not None and not isinstance(steam_executable, str):
+            raise TypeError("steam_executable must be a string or None")
+        if (steam_app_id is None) != (steam_executable is None):
+            raise ValueError(
+                "steam_app_id and steam_executable must be configured together"
+            )
         if isinstance(poll_interval_seconds, bool) or not isinstance(
             poll_interval_seconds, int | float
         ):
@@ -158,6 +168,8 @@ class RelayClient:
         self._enable_monitoring = enable_monitoring
         self._process_supervisor = process_supervisor
         self._civ4_executable = civ4_executable
+        self._steam_app_id = steam_app_id
+        self._steam_executable = steam_executable
         self._sessions: dict[str, _MatchSession] = {}
         self._closed = False
         # Ensure installation identity exists without inventing remote state.
@@ -798,6 +810,8 @@ class RelayClient:
             mod_name=config.mod_name,
             save_path=save_path,
             pbem_save_directory=config.pbem_save_directory,
+            steam_app_id=self._steam_app_id,
+            steam_executable_path=self._steam_executable,
         )
 
     def _persist_process_association(

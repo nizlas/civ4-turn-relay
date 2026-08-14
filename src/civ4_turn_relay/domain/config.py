@@ -51,6 +51,8 @@ _ENV_KEYS = frozenset(
         "LOG_LEVEL",
         "POLL_INTERVAL_SECONDS",
         "CIV4_EXECUTABLE",
+        "STEAM_APP_ID",
+        "STEAM_EXECUTABLE",
         "SFTP_HOST",
         "SFTP_PORT",
         "SFTP_USERNAME",
@@ -125,6 +127,8 @@ class GlobalConfig:
     log_level: str = DEFAULT_LOG_LEVEL
     poll_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     civ4_executable: str | None = None
+    steam_app_id: str | None = None
+    steam_executable: str | None = None
     sftp_private_key_path: str | None = field(default=None, repr=False)
     sftp_private_key_passphrase: str | None = field(default=None, repr=False)
     sftp_password: str | None = field(default=None, repr=False)
@@ -175,6 +179,29 @@ class GlobalConfig:
         object.__setattr__(self, "civ4_executable", civ4_executable)
         if civ4_executable is not None:
             validate_windows_local_path(civ4_executable, field_path="civ4_executable")
+        steam_app_id = require_optional_string(
+            self.steam_app_id, field_path="steam_app_id"
+        )
+        object.__setattr__(self, "steam_app_id", steam_app_id)
+        if steam_app_id is not None and (
+            not steam_app_id.isdecimal() or int(steam_app_id) <= 0
+        ):
+            raise DomainValidationError(
+                "expected a positive decimal Steam app id", field_path="steam_app_id"
+            )
+        steam_executable = require_optional_string(
+            self.steam_executable, field_path="steam_executable"
+        )
+        object.__setattr__(self, "steam_executable", steam_executable)
+        if steam_executable is not None:
+            validate_windows_local_path(steam_executable, field_path="steam_executable")
+        if (steam_app_id is None) != (steam_executable is None):
+            raise DomainValidationError(
+                "steam_app_id and steam_executable must be configured together",
+                field_path=(
+                    "steam_app_id" if steam_app_id is None else "steam_executable"
+                ),
+            )
         private_key_path = require_optional_string(
             self.sftp_private_key_path, field_path="sftp_private_key_path"
         )
@@ -265,6 +292,8 @@ class GlobalConfig:
             ),
             "sftp_remote_root": self.sftp_remote_root,
             "sftp_username": self.sftp_username,
+            "steam_app_id": self.steam_app_id,
+            "steam_executable": self.steam_executable,
         }
 
 
@@ -329,6 +358,8 @@ def global_config_from_env_mapping(env: Mapping[str, str]) -> GlobalConfig:
         log_level=value_of("LOG_LEVEL") or DEFAULT_LOG_LEVEL,
         poll_interval_seconds=poll_interval,
         civ4_executable=value_of("CIV4_EXECUTABLE"),
+        steam_app_id=value_of("STEAM_APP_ID"),
+        steam_executable=value_of("STEAM_EXECUTABLE"),
         sftp_private_key_path=value_of("SFTP_PRIVATE_KEY_PATH"),
         sftp_private_key_passphrase=value_of("SFTP_PRIVATE_KEY_PASSPHRASE"),
         sftp_password=value_of("SFTP_PASSWORD"),

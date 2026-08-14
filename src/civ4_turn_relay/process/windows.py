@@ -10,6 +10,7 @@ match ownership.
 from __future__ import annotations
 
 import math
+import os
 import subprocess
 import sys
 import time
@@ -75,8 +76,21 @@ class ProcessInfo:
 class WindowsProcessBackend(Protocol):
     """The only layer touching real OS calls; everything above is pure."""
 
-    def spawn(self, argv: tuple[str, ...], working_directory: str | None) -> int:
+    def spawn(
+        self,
+        argv: tuple[str, ...],
+        working_directory: str | None,
+        environment: tuple[tuple[str, str], ...] = (),
+    ) -> int:
         """Spawn ``argv`` without a shell; return the pid. Raises OSError."""
+        ...
+
+    def steam_client_running(self, executable_path: str) -> bool:
+        """Return whether the configured Steam client executable is running."""
+        ...
+
+    def start_steam_client(self, executable_path: str) -> None:
+        """Start Steam without launching an app. Raises OSError on failure."""
         ...
 
     def process_info(self, pid: int) -> ProcessInfo | None:
@@ -167,10 +181,40 @@ class RealWindowsBackend:
             process_iter if process_iter is not None else psutil.process_iter
         )
 
-    def spawn(self, argv: tuple[str, ...], working_directory: str | None) -> int:
+    def spawn(
+        self,
+        argv: tuple[str, ...],
+        working_directory: str | None,
+        environment: tuple[tuple[str, str], ...] = (),
+    ) -> int:
         # An argv list, never a shell.
-        process = subprocess.Popen(list(argv), cwd=working_directory, close_fds=True)
+        child_environment = os.environ.copy()
+        child_environment.update(dict(environment))
+        process = subprocess.Popen(
+            list(argv),
+            cwd=working_directory,
+            close_fds=True,
+            env=child_environment,
+        )
         return process.pid
+
+    def steam_client_running(self, executable_path: str) -> bool:
+        expected = _normalize_executable(executable_path)
+        for process in psutil.process_iter(attrs=["exe"], ad_value=None):
+            try:
+                info = getattr(process, "info", None)
+                exe = info.get("exe") if isinstance(info, dict) else None
+                if isinstance(exe, str) and _normalize_executable(exe) == expected:
+                    return True
+            except psutil.NoSuchProcess:
+                continue
+        return False
+
+    def start_steam_client(self, executable_path: str) -> None:
+        # This deliberately starts the client only. Steam receives the Civ
+        # context through the child's environment; ``-applaunch`` drops the
+        # legacy BTS arguments we need for PBEM direct loading.
+        subprocess.Popen([executable_path], close_fds=True)
 
     def process_info(self, pid: int) -> ProcessInfo | None:
         try:
@@ -459,6 +503,7 @@ class WindowsProcessSupervisor:
         platform: str | None = None,
         sleep_fn: Callable[[float], None] | None = None,
         verify_delay_seconds: float = 0.5,
+        verify_attempts: int = 20,
         guard: LaunchGuard | None = None,
     ) -> None:
         self._platform = platform if platform is not None else sys.platform
@@ -470,6 +515,9 @@ class WindowsProcessSupervisor:
         self._guard = guard
         self._sleep = sleep_fn if sleep_fn is not None else time.sleep
         self._verify_delay_seconds = verify_delay_seconds
+        if verify_attempts < 1:
+            raise ValueError("verify_attempts must be positive")
+        self._verify_attempts = verify_attempts
 
     def availability(self) -> SupervisorAvailability:
         if self._platform != "win32":
@@ -488,21 +536,56 @@ class WindowsProcessSupervisor:
                 outcome=LaunchOutcome.ADAPTER_UNAVAILABLE,
                 message=_UNAVAILABLE_REASON,
             )
+        if command.steam_executable_path is not None:
+            try:
+                if not backend.steam_client_running(command.steam_executable_path):
+                    backend.start_steam_client(command.steam_executable_path)
+                    # Give a freshly spawned client up to the same bounded
+                    # verification window to register. Steam login, updates,
+                    # and Steam Guard remain user-visible rather than guessed.
+                    for _attempt in range(self._verify_attempts):
+                        self._sleep(self._verify_delay_seconds)
+                        if backend.steam_client_running(command.steam_executable_path):
+                            break
+                    else:
+                        return LaunchResult(
+                            outcome=LaunchOutcome.SPAWN_FAILURE,
+                            message=(
+                                "Steam was started but did not become a running "
+                                "client before Civilization could launch"
+                            ),
+                        )
+            except Exception as error:
+                return LaunchResult(
+                    outcome=LaunchOutcome.SPAWN_FAILURE,
+                    message=f"Steam could not be started: {error}",
+                )
         try:
-            pid = backend.spawn(command.argv, command.working_directory)
+            pid = backend.spawn(
+                command.argv, command.working_directory, command.environment
+            )
         except Exception as error:
             return LaunchResult(outcome=LaunchOutcome.SPAWN_FAILURE, message=str(error))
-        self._sleep(self._verify_delay_seconds)
-        try:
-            info = backend.process_info(pid)
-        except Exception as error:
-            return LaunchResult(
-                outcome=LaunchOutcome.IDENTITY_UNVERIFIED, message=str(error)
-            )
+        info: ProcessInfo | None = None
+        for attempt in range(self._verify_attempts):
+            self._sleep(self._verify_delay_seconds)
+            try:
+                info = backend.process_info(pid)
+            except Exception as error:
+                return LaunchResult(
+                    outcome=LaunchOutcome.IDENTITY_UNVERIFIED, message=str(error)
+                )
+            if info is not None:
+                break
+            if attempt + 1 == self._verify_attempts:
+                break
         if info is None:
             return LaunchResult(
                 outcome=LaunchOutcome.EXITED_IMMEDIATELY,
-                message="the spawned process exited before verification",
+                message=(
+                    "the spawned process did not remain available for identity "
+                    "verification"
+                ),
             )
         if _normalize_executable(info.executable_path) != _normalize_executable(
             command.argv[0]
