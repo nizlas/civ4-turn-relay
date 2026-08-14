@@ -107,6 +107,9 @@ class _MatchSession:
     last_outgoing_bytes: bytes | None = None
     last_outgoing_filename: str | None = None
     coordinator: ProcessCoordinator | None = None
+    # A persisted failed launch must not create a retry loop, but a newly
+    # started Relay is allowed one fresh automatic attempt for this session.
+    startup_auto_retry_available: bool = True
 
 
 class RelayClient:
@@ -321,7 +324,19 @@ class RelayClient:
         coordinator = self._coordinator(session)
         if coordinator is not None:
             self._refresh_process_observation(session, coordinator)
-        result = self.reconcile(game_id, now_utc=now_utc)
+        # A newly opened Relay instance gets one automatic retry for a
+        # persisted failed/unverified launch. Subsequent ticks keep the
+        # existing no-loop guarantee; explicit Start remains a separate retry.
+        result = self.reconcile(
+            game_id,
+            now_utc=now_utc,
+            user_requested_start=session.startup_auto_retry_available,
+        )
+        if any(
+            intent.kind is OrchestrationIntentKind.START_CIV
+            for intent in result.intents
+        ):
+            session.startup_auto_retry_available = False
         if (
             self._auto_execute_managed_handoff
             and session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED

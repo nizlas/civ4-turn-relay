@@ -610,6 +610,38 @@ def test_exit_without_outgoing_save_requires_explicit_start(
     client.close()
 
 
+def test_fully_managed_retries_once_when_relay_restarts_after_civ_exit(
+    tmp_path: Path,
+) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    client, config, exe = _local_client_after_opponent_commit(
+        tmp_path, storage, clock, supervisor
+    )
+    client.tick(GAME_ID)
+    first_identity = _associated_identity(client)
+    supervisor.mark_exited(first_identity)
+    client.tick(GAME_ID)
+    client.close()
+
+    restarted = _make_process_client(
+        tmp_path / "local", storage, clock, supervisor, civ4_executable=exe
+    )
+    restarted.open_match(config)
+    retried = restarted.tick(GAME_ID)
+
+    assert retried.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor.launched) == 2
+
+    # A failed launch can be retried once per Relay startup, never on every
+    # periodic tick.
+    restarted.tick(GAME_ID)
+    restarted.tick(GAME_ID)
+    assert len(supervisor.launched) == 2
+    restarted.close()
+
+
 def test_launch_preview_is_a_dry_run(tmp_path: Path) -> None:
     storage = FakeStorage()
     clock = FakeClock()
