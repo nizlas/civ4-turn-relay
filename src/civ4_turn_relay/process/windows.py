@@ -572,12 +572,18 @@ class WindowsProcessSupervisor:
             if attempt + 1 == verify_attempts:
                 break
         if info is None:
-            return LaunchResult(
-                outcome=LaunchOutcome.EXITED_IMMEDIATELY,
-                message=(
+            message = (
+                "Steam did not start Civilization IV: Beyond the Sword before "
+                "Relay's verification timeout"
+                if steam_argv is not None
+                else (
                     "the spawned process did not remain available for identity "
                     "verification"
-                ),
+                )
+            )
+            return LaunchResult(
+                outcome=LaunchOutcome.EXITED_IMMEDIATELY,
+                message=message,
             )
         if _normalize_executable(info.executable_path) != _normalize_executable(
             command.argv[0]
