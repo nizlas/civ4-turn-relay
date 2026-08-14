@@ -536,54 +536,56 @@ class WindowsProcessSupervisor:
                 outcome=LaunchOutcome.ADAPTER_UNAVAILABLE,
                 message=_UNAVAILABLE_REASON,
             )
-        steam_argv = command.steam_launch_argv()
-        if steam_argv is not None:
-            # Steam is the launcher of record for the supported BTS build.
-            # The raw executable can reach its main menu with copied Steam
-            # environment variables but does not reliably honour a PBEM
-            # ``/fxsload``.  Keep the Civ args save-first/mod-second and let
-            # Steam start BTS, then identify the actual target process below.
-            spawn_argv = steam_argv
-            spawn_working_directory = None
-            spawn_environment: tuple[tuple[str, str], ...] = ()
-        else:
-            spawn_argv = command.argv
-            spawn_working_directory = command.working_directory
-            spawn_environment = command.environment
+        if command.steam_executable_path is not None:
+            try:
+                if not backend.steam_client_running(command.steam_executable_path):
+                    backend.start_steam_client(command.steam_executable_path)
+                    # Give a freshly spawned client up to the same bounded
+                    # verification window to register. Steam login, updates,
+                    # and Steam Guard remain user-visible rather than guessed.
+                    for _attempt in range(self._verify_attempts):
+                        self._sleep(self._verify_delay_seconds)
+                        if backend.steam_client_running(command.steam_executable_path):
+                            break
+                    else:
+                        return LaunchResult(
+                            outcome=LaunchOutcome.SPAWN_FAILURE,
+                            message=(
+                                "Steam was started but did not become a running "
+                                "client before Civilization could launch"
+                            ),
+                        )
+            except Exception as error:
+                return LaunchResult(
+                    outcome=LaunchOutcome.SPAWN_FAILURE,
+                    message=f"Steam could not be started: {error}",
+                )
         try:
-            pid = backend.spawn(spawn_argv, spawn_working_directory, spawn_environment)
+            pid = backend.spawn(
+                command.argv, command.working_directory, command.environment
+            )
         except Exception as error:
             return LaunchResult(outcome=LaunchOutcome.SPAWN_FAILURE, message=str(error))
         info: ProcessInfo | None = None
-        verify_attempts = self._verify_attempts * (3 if steam_argv is not None else 1)
-        for attempt in range(verify_attempts):
+        for attempt in range(self._verify_attempts):
             self._sleep(self._verify_delay_seconds)
             try:
-                if steam_argv is not None:
-                    info = self._find_steam_launched_civ(backend, command.argv[0])
-                else:
-                    info = backend.process_info(pid)
+                info = backend.process_info(pid)
             except Exception as error:
                 return LaunchResult(
                     outcome=LaunchOutcome.IDENTITY_UNVERIFIED, message=str(error)
                 )
             if info is not None:
                 break
-            if attempt + 1 == verify_attempts:
+            if attempt + 1 == self._verify_attempts:
                 break
         if info is None:
-            message = (
-                "Steam did not start Civilization IV: Beyond the Sword before "
-                "Relay's verification timeout"
-                if steam_argv is not None
-                else (
-                    "the spawned process did not remain available for identity "
-                    "verification"
-                )
-            )
             return LaunchResult(
                 outcome=LaunchOutcome.EXITED_IMMEDIATELY,
-                message=message,
+                message=(
+                    "the spawned process did not remain available for identity "
+                    "verification"
+                ),
             )
         if _normalize_executable(info.executable_path) != _normalize_executable(
             command.argv[0]
@@ -604,30 +606,6 @@ class WindowsProcessSupervisor:
                 outcome=LaunchOutcome.IDENTITY_UNVERIFIED, message=str(error)
             )
         return LaunchResult(outcome=LaunchOutcome.LAUNCHED, identity=identity)
-
-    @staticmethod
-    def _find_steam_launched_civ(
-        backend: WindowsProcessBackend, executable_path: str
-    ) -> ProcessInfo | None:
-        """Find the exact BTS executable that Steam has just launched.
-
-        ``guarded_launch`` has already scanned under the per-installation
-        mutex and refused an existing Civ process.  Therefore a matching
-        executable observed here is the new BTS child to verify and
-        associate; Steam's own PID is intentionally never associated with a
-        match or later closed by Relay.
-        """
-        expected = _normalize_executable(executable_path)
-        for entry in backend.iter_process_entries():
-            if (
-                entry.executable_path is None
-                or _normalize_executable(entry.executable_path) != expected
-            ):
-                continue
-            info = backend.process_info(entry.pid)
-            if info is not None and _normalize_executable(info.executable_path) == expected:
-                return info
-        return None
 
     def guarded_launch(self, command: CivLaunchCommand) -> GuardedLaunchResult:
         """Serialize with other Relay instances, scan, then spawn and verify.
