@@ -563,6 +563,8 @@ def main() -> int:
         ),
         process_supervisor=WindowsProcessSupervisor(),
         civ4_executable=config.civ4_executable if config is not None else None,
+        steam_app_id=config.steam_app_id if config is not None else None,
+        steam_executable=config.steam_executable if config is not None else None,
         owns_storage=True,
     )
 

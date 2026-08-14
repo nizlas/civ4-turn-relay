@@ -34,6 +34,8 @@ def env_mapping() -> dict[str, str]:
         "CIV4_RELAY_LOG_LEVEL": "DEBUG",
         "CIV4_RELAY_POLL_INTERVAL_SECONDS": "5",
         "CIV4_RELAY_CIV4_EXECUTABLE": "C:\\Placeholder\\Civ4BeyondSword.exe",
+        "CIV4_RELAY_STEAM_APP_ID": "8800",
+        "CIV4_RELAY_STEAM_EXECUTABLE": "C:\\Placeholder\\Steam\\steam.exe",
         "CIV4_RELAY_SFTP_HOST": "sftp.example.invalid",
         "CIV4_RELAY_SFTP_PORT": "2222",
         "CIV4_RELAY_SFTP_USERNAME": "placeholder-user",
@@ -75,6 +77,8 @@ class TestGlobalConfig:
         assert config.log_level == "DEBUG"
         assert config.poll_interval_seconds == 5
         assert config.civ4_executable == "C:\\Placeholder\\Civ4BeyondSword.exe"
+        assert config.steam_app_id == "8800"
+        assert config.steam_executable == "C:\\Placeholder\\Steam\\steam.exe"
         assert config.sftp_host == "sftp.example.invalid"
         assert config.sftp_port == 2222
         assert config.sftp_username == "placeholder-user"
@@ -87,6 +91,8 @@ class TestGlobalConfig:
         del env["CIV4_RELAY_LOG_LEVEL"]
         del env["CIV4_RELAY_POLL_INTERVAL_SECONDS"]
         del env["CIV4_RELAY_CIV4_EXECUTABLE"]
+        del env["CIV4_RELAY_STEAM_APP_ID"]
+        del env["CIV4_RELAY_STEAM_EXECUTABLE"]
         del env["CIV4_RELAY_SFTP_CONNECT_TIMEOUT_SECONDS"]
         env["CIV4_RELAY_SFTP_PRIVATE_KEY_PATH"] = FAKE_PRIVATE_KEY_PATH
         del env["CIV4_RELAY_SFTP_PASSWORD"]
@@ -94,8 +100,26 @@ class TestGlobalConfig:
         assert config.log_level == DEFAULT_LOG_LEVEL
         assert config.poll_interval_seconds == DEFAULT_POLL_INTERVAL_SECONDS
         assert config.civ4_executable is None
+        assert config.steam_app_id is None
+        assert config.steam_executable is None
         assert config.sftp_password is None
         assert config.sftp_connect_timeout_seconds == 30
+
+    @pytest.mark.parametrize(
+        ("removed", "field_path"),
+        [
+            ("CIV4_RELAY_STEAM_APP_ID", "steam_app_id"),
+            ("CIV4_RELAY_STEAM_EXECUTABLE", "steam_executable"),
+        ],
+    )
+    def test_steam_context_requires_app_id_and_client_path_together(
+        self, removed: str, field_path: str
+    ) -> None:
+        env = env_mapping()
+        del env[removed]
+        with pytest.raises(DomainValidationError) as exc_info:
+            global_config_from_env_mapping(env)
+        assert exc_info.value.field_path == field_path
 
     def test_unrelated_env_keys_ignored(self) -> None:
         env = env_mapping() | {"PATH": "/usr/bin", "HOME": "/home/placeholder"}
@@ -394,6 +418,8 @@ class TestConfigSeparation:
             "log_level",
             "poll_interval_seconds",
             "civ4_executable",
+            "steam_app_id",
+            "steam_executable",
             "sftp_host",
             "sftp_port",
             "sftp_username",

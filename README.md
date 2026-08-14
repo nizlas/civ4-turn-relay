@@ -50,7 +50,7 @@ Detailed lifecycle and safety semantics: [`docs/DESIGN_SPEC.md`](docs/DESIGN_SPE
 
 ### Implementation status
 
-Protocol, local persistence, reconciliation, save detection, orchestration, the Windows process adapter (launch, identity verification, graceful close), and the PySide6 desktop client are implemented with full automated test coverage. The real-installation smoke test has confirmed Civ IV's mod argument (`Mods\AdvCiv` in match configuration becomes `mod=\AdvCiv`); direct `/fxsload` loading and the remaining **P7** checklist are still pending ([`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md), [`docs/DESKTOP_CLIENT.md`](docs/DESKTOP_CLIENT.md)). **P7 stays ACTIVE until that checklist is completed.** Until then, do not rely on Fully Managed mode for real matches.
+Protocol, local persistence, reconciliation, save detection, orchestration, the Windows process adapter (launch, identity verification, graceful close), and the PySide6 desktop client are implemented with full automated test coverage. The real-installation smoke test has confirmed Steam BTS/AdvCiv direct loading: Relay starts raw BTS with Steam context, `/fxsload` before final `mod=\AdvCiv`, and opens the received PBEM turn. The remaining **P7** lifecycle checklist is still pending ([`docs/PHASE_PLAN.md`](docs/PHASE_PLAN.md), [`docs/DESKTOP_CLIENT.md`](docs/DESKTOP_CLIENT.md)). **P7 stays ACTIVE until that checklist is completed.** Until then, do not rely on Fully Managed mode for real matches.
 
 ## Standard mode
 

@@ -29,6 +29,7 @@ from civ4_turn_relay.process import (
 
 _EXE = "C:\\Games\\Civ4\\Civ4BeyondSword.exe"
 _COMMAND = CivLaunchCommand(argv=(_EXE, "mod=Mods\\AdvCiv"), working_directory=None)
+_STEAM = "C:\\Program Files (x86)\\Steam\\steam.exe"
 _START_UTC = "2026-08-11T12:00:00Z"
 _START_EPOCH = datetime(2026, 8, 11, 12, 0, 0, tzinfo=UTC).timestamp()
 _LAUNCH_OFFSET = 0.25
@@ -58,12 +59,29 @@ class ScriptedBackend:
         self.terminate_error: Exception | None = None
         self.scan_entries: tuple[ProcessScanEntry, ...] = ()
         self.scan_error: Exception | None = None
+        self.steam_is_running = True
+        self.steam_start_error: Exception | None = None
 
-    def spawn(self, argv: tuple[str, ...], working_directory: str | None) -> int:
-        self.calls.append(("spawn", argv))
+    def spawn(
+        self,
+        argv: tuple[str, ...],
+        working_directory: str | None,
+        environment: tuple[tuple[str, str], ...] = (),
+    ) -> int:
+        self.calls.append(("spawn", (argv, environment)))
         if self.spawn_error is not None:
             raise self.spawn_error
         return self.spawn_pid
+
+    def steam_client_running(self, executable_path: str) -> bool:
+        self.calls.append(("steam_running", executable_path))
+        return self.steam_is_running
+
+    def start_steam_client(self, executable_path: str) -> None:
+        self.calls.append(("start_steam", executable_path))
+        if self.steam_start_error is not None:
+            raise self.steam_start_error
+        self.steam_is_running = True
 
     def process_info(self, pid: int) -> ProcessInfo | None:
         self.calls.append(("process_info", pid))
@@ -123,7 +141,10 @@ class ScriptedGuard:
 
 def _supervisor(backend: ScriptedBackend) -> WindowsProcessSupervisor:
     return WindowsProcessSupervisor(
-        backend=backend, platform="win32", sleep_fn=lambda _seconds: None
+        backend=backend,
+        platform="win32",
+        sleep_fn=lambda _seconds: None,
+        guard=ScriptedGuard(),
     )
 
 
@@ -166,9 +187,71 @@ def test_launch_sleeps_for_the_verify_delay() -> None:
         platform="win32",
         sleep_fn=sleeps.append,
         verify_delay_seconds=0.25,
+        guard=ScriptedGuard(),
     )
     supervisor.launch(_COMMAND)
     assert sleeps == [0.25]
+
+
+def test_steam_context_starts_client_then_passes_environment_to_raw_bts() -> None:
+    backend = ScriptedBackend()
+    backend.steam_is_running = False
+    backend.info = _running_info()
+    command = CivLaunchCommand(
+        argv=(_EXE, "/fxsload=C:\\Saves\\turn.CivBeyondSwordSave", "mod=\\AdvCiv"),
+        working_directory="C:\\Games\\Civ4",
+        environment=(("SteamAppId", "8800"), ("SteamGameId", "8800")),
+        steam_executable_path=_STEAM,
+    )
+    result = _supervisor(backend).launch(command)
+    assert result.outcome is LaunchOutcome.LAUNCHED
+    assert backend.call_names() == [
+        "steam_running",
+        "start_steam",
+        "steam_running",
+        "spawn",
+        "process_info",
+    ]
+    assert backend.calls[3] == ("spawn", (command.argv, command.environment))
+
+
+def test_steam_start_failure_refuses_to_spawn_civilization() -> None:
+    backend = ScriptedBackend()
+    backend.steam_is_running = False
+    backend.steam_start_error = OSError("Steam update required")
+    command = CivLaunchCommand(
+        argv=(_EXE,),
+        working_directory=None,
+        environment=(("SteamAppId", "8800"), ("SteamGameId", "8800")),
+        steam_executable_path=_STEAM,
+    )
+    result = _supervisor(backend).launch(command)
+    assert result.outcome is LaunchOutcome.SPAWN_FAILURE
+    assert "Steam could not be started" in result.message
+    assert "spawn" not in backend.call_names()
+
+
+def test_steam_that_never_registers_refuses_to_spawn_civilization() -> None:
+    backend = ScriptedBackend()
+    backend.steam_is_running = False
+    command = CivLaunchCommand(
+        argv=(_EXE,),
+        working_directory=None,
+        environment=(("SteamAppId", "8800"), ("SteamGameId", "8800")),
+        steam_executable_path=_STEAM,
+    )
+    # Keep Steam absent despite the scripted start call.
+    backend.start_steam_client = lambda _path: None  # type: ignore[method-assign]
+    result = WindowsProcessSupervisor(
+        backend=backend,
+        platform="win32",
+        sleep_fn=lambda _seconds: None,
+        verify_attempts=2,
+        guard=ScriptedGuard(),
+    ).launch(command)
+    assert result.outcome is LaunchOutcome.SPAWN_FAILURE
+    assert "did not become" in result.message
+    assert "spawn" not in backend.call_names()
 
 
 def test_launch_spawn_oserror_maps_to_spawn_failure() -> None:
@@ -513,7 +596,10 @@ def test_guarded_launch_unavailable_off_windows() -> None:
 def test_guarded_launch_without_guard_is_typed_unavailable() -> None:
     backend = ScriptedBackend()
     supervisor = WindowsProcessSupervisor(
-        backend=backend, platform="win32", sleep_fn=lambda _seconds: None
+        backend=backend,
+        platform="win32",
+        sleep_fn=lambda _seconds: None,
+        guard=ScriptedGuard(),
     )
     supervisor._guard = None  # simulate a host without a usable guard
     result = supervisor.guarded_launch(_COMMAND)

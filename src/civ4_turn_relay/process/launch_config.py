@@ -3,16 +3,20 @@
 Exact documented command shape (never any other flags, never a shell):
 
 - ``argv[0]`` is the configured executable path.
+- If a save is configured, one single argument ``/fxsload=<absolute save
+  path>`` is appended **before** the mod argument. This ordering is required
+  by the legacy Civilization IV parser: its ``mod=`` handler consumes later
+  text as part of the directory name.
 - If a mod is configured, one single Civilization IV argument is appended.
   The stored Civ-relative folder (for example ``Mods\\AdvCiv``) is translated
   to Civ IV's empirically verified command-line form ``mod=\\AdvCiv``. Civ IV
   itself supplies the ``Mods`` root; passing ``mod=Mods\\AdvCiv`` makes the
   game incorrectly look for ``Mods\\ods\\AdvCiv``. Omitting the mod value
   omits the argument entirely, deliberately deferring to the Civilization INI.
-- If a save is configured, one single argument ``/fxsload=<absolute save
-  path>`` is appended. The direct-save-load mechanism is modeled explicitly;
-  its real-installation behavior still requires the documented manual smoke
-  test.
+- When a Steam app id is configured, the command carries the two per-process
+  environment variables that let the raw BTS executable retain Steam's
+  multiplayer context: ``SteamAppId`` and ``SteamGameId``. Steam itself is
+  started separately by the Windows adapter when needed.
 
 Planning here is pure aside from the injectable ``is_file`` probe and path
 resolution; nothing in this module launches a process.
@@ -130,6 +134,8 @@ class CivLaunchConfiguration:
     mod_name: str | None = None
     save_path: str | None = None
     working_directory: str | None = None
+    steam_app_id: str | None = None
+    steam_executable_path: str | None = None
 
     def __post_init__(self) -> None:
         validate_windows_local_path(self.executable_path, field_path="executable_path")
@@ -141,6 +147,26 @@ class CivLaunchConfiguration:
             validate_windows_local_path(
                 self.working_directory, field_path="working_directory"
             )
+        if self.steam_app_id is not None:
+            if not self.steam_app_id.isdecimal() or int(self.steam_app_id) <= 0:
+                raise DomainValidationError(
+                    "expected a positive decimal Steam app id",
+                    field_path="steam_app_id",
+                )
+            if self.steam_executable_path is None:
+                raise DomainValidationError(
+                    "a Steam executable path is required when a Steam app id is set",
+                    field_path="steam_executable_path",
+                )
+        if self.steam_executable_path is not None:
+            validate_windows_local_path(
+                self.steam_executable_path, field_path="steam_executable_path"
+            )
+            if self.steam_app_id is None:
+                raise DomainValidationError(
+                    "a Steam app id is required when a Steam executable path is set",
+                    field_path="steam_app_id",
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +175,8 @@ class CivLaunchCommand:
 
     argv: tuple[str, ...]
     working_directory: str | None
+    environment: tuple[tuple[str, str], ...] = ()
+    steam_executable_path: str | None = None
 
     def dry_run_preview(self) -> str:
         """Return the Windows-quoted single command line for display only."""
@@ -158,12 +186,21 @@ class CivLaunchCommand:
 def build_civ_command(config: CivLaunchConfiguration) -> CivLaunchCommand:
     """Build the exact documented Civ4 command from validated configuration."""
     argv = [config.executable_path]
-    if config.mod_name is not None:
-        argv.append(_mod_command_argument(config.mod_name))
     if config.save_path is not None:
         argv.append(f"/fxsload={config.save_path}")
+    if config.mod_name is not None:
+        argv.append(_mod_command_argument(config.mod_name))
+    environment: tuple[tuple[str, str], ...] = ()
+    if config.steam_app_id is not None:
+        environment = (
+            ("SteamAppId", config.steam_app_id),
+            ("SteamGameId", config.steam_app_id),
+        )
     return CivLaunchCommand(
-        argv=tuple(argv), working_directory=config.working_directory
+        argv=tuple(argv),
+        working_directory=config.working_directory,
+        environment=environment,
+        steam_executable_path=config.steam_executable_path,
     )
 
 
@@ -174,6 +211,8 @@ class LaunchPlanOutcome(Enum):
     READY = "ready"
     EXECUTABLE_NOT_CONFIGURED = "executable_not_configured"
     EXECUTABLE_NOT_FOUND = "executable_not_found"
+    STEAM_EXECUTABLE_NOT_CONFIGURED = "steam_executable_not_configured"
+    STEAM_EXECUTABLE_NOT_FOUND = "steam_executable_not_found"
     SAVE_NOT_FOUND = "save_not_found"
     SAVE_OUTSIDE_PBEM_DIRECTORY = "save_outside_pbem_directory"
     INVALID_CONFIGURATION = "invalid_configuration"
@@ -209,6 +248,8 @@ def build_launch_plan(
     mod_name: str | None,
     save_path: str | None,
     pbem_save_directory: str,
+    steam_app_id: str | None = None,
+    steam_executable_path: str | None = None,
     is_file: Callable[[str], bool] | None = None,
 ) -> LaunchPlan:
     """Decide whether a launch is possible and build the command if so.
@@ -230,6 +271,20 @@ def build_launch_plan(
             outcome=LaunchPlanOutcome.EXECUTABLE_NOT_FOUND,
             reason="the configured Civilization IV executable is not a file",
         )
+    if steam_app_id is not None:
+        if steam_executable_path is None or not steam_executable_path:
+            return LaunchPlan(
+                outcome=LaunchPlanOutcome.STEAM_EXECUTABLE_NOT_CONFIGURED,
+                reason=(
+                    "a Steam app id is configured but no Steam executable is set; "
+                    "set steam_executable in the global configuration"
+                ),
+            )
+        if not probe(steam_executable_path):
+            return LaunchPlan(
+                outcome=LaunchPlanOutcome.STEAM_EXECUTABLE_NOT_FOUND,
+                reason="the configured Steam executable is not a file",
+            )
     if save_path is not None:
         if not probe(save_path):
             return LaunchPlan(
@@ -256,6 +311,8 @@ def build_launch_plan(
             mod_name=mod_name,
             save_path=save_path,
             working_directory=_absolute_parent_directory(executable_path),
+            steam_app_id=steam_app_id,
+            steam_executable_path=steam_executable_path,
         )
     except DomainValidationError as error:
         return LaunchPlan(

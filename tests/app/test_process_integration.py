@@ -50,6 +50,8 @@ def _make_process_client(
     supervisor: FakeProcessSupervisor,
     *,
     civ4_executable: str | None,
+    steam_app_id: str | None = None,
+    steam_executable: str | None = None,
     client_uuid: uuid.UUID | None = None,
 ) -> RelayClient:
     store = LocalStore(root)
@@ -64,6 +66,8 @@ def _make_process_client(
         operation_id_factory=lambda: str(uuid.uuid4()),
         process_supervisor=supervisor,
         civ4_executable=civ4_executable,
+        steam_app_id=steam_app_id,
+        steam_executable=steam_executable,
     )
 
 
@@ -166,8 +170,8 @@ def test_fully_managed_launches_once_and_survives_restart(tmp_path: Path) -> Non
     assert records.downloaded_save is not None
     assert supervisor.launched[0].argv == (
         exe,
-        "mod=\\AdvCiv",
         f"/fxsload={records.downloaded_save.local_path}",
+        "mod=\\AdvCiv",
     )
     assert records.launch_attempt is not None
     assert records.process_association is not None
@@ -189,6 +193,39 @@ def test_fully_managed_launches_once_and_survives_restart(tmp_path: Path) -> Non
     assert status.status is ProcessStatus.RUNNING
     assert status.identity == _associated_identity(restarted)
     restarted.close()
+
+
+def test_fully_managed_launch_carries_configured_steam_context(tmp_path: Path) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    _opponent_commits_first_save(tmp_path, storage, clock)
+    exe = _exe_path(tmp_path)
+    steam = tmp_path / "steam.exe"
+    steam.write_bytes(b"placeholder-steam")
+    root = tmp_path / "local-steam"
+    client = _make_process_client(
+        root,
+        storage,
+        clock,
+        supervisor,
+        civ4_executable=exe,
+        steam_app_id="8800",
+        steam_executable=str(steam),
+    )
+    config = match_config(
+        root,
+        local_player_id="player_b",
+        mode=TurnHandlingMode.FULLY_MANAGED,
+        pbem_name="pbem-steam",
+    )
+    joined = client.initialize_or_join(config, operation_id=str(uuid.uuid4()))
+    assert joined.outcome is InitializeOutcome.JOINED_EXISTING
+    assert client.tick(GAME_ID).operational_state is OperationalState.CIV_RUNNING
+    command = supervisor.launched[0]
+    assert command.environment == (("SteamAppId", "8800"), ("SteamGameId", "8800"))
+    assert command.steam_executable_path == str(steam)
+    client.close()
 
 
 def test_sequence_zero_launches_without_save_argument(tmp_path: Path) -> None:
