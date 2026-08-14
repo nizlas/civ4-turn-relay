@@ -1111,5 +1111,16 @@ def _pending_action(
     if OrchestrationIntentKind.WAIT in kinds:
         return PendingUserAction.WAIT
     if OrchestrationIntentKind.REQUIRE_USER_ACTION in kinds:
+        for intent in intents:
+            if (
+                intent.kind is OrchestrationIntentKind.REQUIRE_USER_ACTION
+                and intent.payload is not None
+                and intent.payload.get("reason") == "civ_exited_without_outgoing"
+            ):
+                # A prior Civ launch exited (or an earlier Relay version
+                # recorded an unverified attempt). Fully Managed must not
+                # relaunch in a loop, but the user needs an explicit,
+                # visible Start / Resume action.
+                return PendingUserAction.START_OR_RESUME
         return PendingUserAction.OTHER
     return PendingUserAction.NONE

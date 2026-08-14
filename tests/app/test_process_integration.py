@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
-from civ4_turn_relay.app import ProcessStatus, RelayClient
+from civ4_turn_relay.app import PendingUserAction, ProcessStatus, RelayClient
 from civ4_turn_relay.domain import MatchConfig, OperationalState, TurnHandlingMode
 from civ4_turn_relay.local import FakeClock, LocalStore
 from civ4_turn_relay.process import (
@@ -603,6 +603,7 @@ def test_exit_without_outgoing_save_requires_explicit_start(
     supervisor.mark_exited(identity)
     after = client.tick(GAME_ID)
     assert after.operational_state is OperationalState.MY_TURN_DOWNLOADED
+    assert after.pending_user_action is PendingUserAction.START_OR_RESUME
     client.tick(GAME_ID)
     client.tick(GAME_ID)
     assert len(supervisor.launched) == 1
