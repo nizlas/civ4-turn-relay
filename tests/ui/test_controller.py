@@ -97,6 +97,23 @@ def test_open_match_and_poll_emit_snapshots(env: _Env, qtbot: QtBot) -> None:
     assert polled_payload.game_id == GAME_ID
 
 
+
+def test_open_match_reconciles_immediately(
+    env: _Env, qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    original_tick = env.client.tick
+
+    def recording_tick(game_id: str, **kwargs: object) -> object:
+        calls.append(game_id)
+        return original_tick(game_id, **kwargs)
+
+    monkeypatch.setattr(env.client, "tick", recording_tick)
+    with qtbot.waitSignal(env.hub.snapshot_ready, timeout=TIMEOUT_MS):
+        env.hub.open_match(env.configs[GAME_ID])
+
+    assert calls == [GAME_ID]
+
 def test_polling_timer_emits_snapshots(env: _Env, qtbot: QtBot) -> None:
     _open(env, qtbot, GAME_ID)
     with qtbot.waitSignal(env.hub.snapshot_ready, timeout=TIMEOUT_MS):
