@@ -104,9 +104,18 @@ def test_open_match_reconciles_immediately(
     calls: list[str] = []
     original_tick = env.client.tick
 
-    def recording_tick(game_id: str, **kwargs: object) -> object:
+    def recording_tick(
+        game_id: str,
+        *,
+        now_utc: str | None = None,
+        auto_handoff_operation_id: str | None = None,
+    ):
         calls.append(game_id)
-        return original_tick(game_id, **kwargs)
+        return original_tick(
+            game_id,
+            now_utc=now_utc,
+            auto_handoff_operation_id=auto_handoff_operation_id,
+        )
 
     monkeypatch.setattr(env.client, "tick", recording_tick)
     with qtbot.waitSignal(env.hub.snapshot_ready, timeout=TIMEOUT_MS):
