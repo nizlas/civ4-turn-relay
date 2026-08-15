@@ -61,15 +61,15 @@ Relay starts Steam first when it is not already running. Steam normally retains 
 Relay then launches the raw BTS executable with exactly this command shape and nothing else — no shell, no extra flags (built in `src/civ4_turn_relay/process/launch_config.py`):
 
 - the configured executable,
-- if a save is being loaded, one single argument `/fxsload=<absolute save path>`, **first**,
+- if a save is being loaded, the legacy raw Windows form `/fxsload="<absolute save path>"`, **first**. The quotes deliberately sit inside the value after `=`; BTS distinguishes this from quoting the whole argument,
 - if a mod is configured, one single argument in Civ IV's old command-line form: the configured Civ-relative folder `Mods\AdvCiv` is translated to `mod=\AdvCiv`; Civ IV supplies the `Mods` root itself. It must be **last**, because Civ IV's legacy `mod=` parser consumes later text as part of the mod path.
 
 Leaving the mod value empty omits the `mod=` argument entirely, deliberately deferring to the mod configured in the Civilization INI. The token is validated before use: it must be a relative folder token — absolute paths, drive letters, traversal (`..`), quotes, control characters, and stray leading/trailing whitespace are all rejected.
 
-The dry-run preview renders the command as one Windows-quoted command line (arguments containing spaces are quoted; the `mod=` and `/fxsload=` arguments only when they contain spaces):
+The dry-run preview renders the exact raw Windows command line used for legacy BTS direct loading:
 
 ```text
-"C:\Games\Civ4\Beyond the Sword\Civ4BeyondSword.exe" "/fxsload=C:\Users\you\Documents\My Games\Beyond the Sword\Saves\PBEM\turn.CivBeyondSwordSave" mod=\AdvCiv
+"C:\Games\Civ4\Beyond the Sword\Civ4BeyondSword.exe" /fxsload="C:\Users\you\Documents\My Games\Beyond the Sword\Saves\PBEM\turn.CivBeyondSwordSave" mod=\AdvCiv
 ```
 
 **Empirical status:** tested against Steam/Beyond the Sword/Advanced Civ on 2026-08-14. `SteamAppId=8800` plus `SteamGameId=8800`, a raw BTS launch from its own directory, and `/fxsload=…` before `mod=\AdvCiv` opened the received PBEM turn directly. Passing `mod=Mods\AdvCiv` was rejected by Civ IV as `Mods\ods\AdvCiv`, proving that the game supplies the `Mods` root itself. Steam `-applaunch` does not preserve both legacy arguments and is intentionally not used.
