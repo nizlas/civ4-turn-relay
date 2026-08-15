@@ -107,9 +107,11 @@ class _MatchSession:
     last_outgoing_bytes: bytes | None = None
     last_outgoing_filename: str | None = None
     coordinator: ProcessCoordinator | None = None
-    # A persisted failed launch must not create a retry loop, but a newly
-    # started Relay is allowed one fresh automatic attempt for this session.
-    startup_auto_retry_available: bool = True
+    # Fully Managed gets one automatic launch attempt per received turn in
+    # this Relay session. The key is deliberately session-local: after a
+    # Relay restart, the currently pending turn gets one fresh attempt, while
+    # periodic polling never retries a failed spawn in a loop.
+    auto_launch_attempted_key: tuple[int, str | None] | None = None
 
 
 class RelayClient:
@@ -324,26 +326,50 @@ class RelayClient:
         coordinator = self._coordinator(session)
         if coordinator is not None:
             self._refresh_process_observation(session, coordinator)
-        # A newly opened *Fully Managed* Relay instance gets one automatic
-        # retry for a persisted failed/unverified launch.  Standard mode is
-        # deliberately never an implicit launch mode; its Start button stays
-        # the only retry path. Subsequent Fully Managed ticks keep the
-        # existing no-loop guarantee; explicit Start remains a separate retry.
-        startup_retry = (
-            session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
-            and session.startup_auto_retry_available
+        # First reconcile from the authoritative manifest. A Fully Managed
+        # profile then gets exactly one automatic attempt for each *new*
+        # (sequence, accepted-hash) turn in this Relay session. The old
+        # boolean retry flag was consumed by the first-ever turn and could
+        # therefore leave a later received turn permanently displaying
+        # "Starting automatically…" without a launch attempt.
+        result = self.reconcile(game_id, now_utc=now_utc)
+        verified = result.records.verified_remote
+        launch_key = (
+            None
+            if verified is None
+            else (verified.protocol_sequence, verified.accepted_sha256)
         )
-        result = self.reconcile(
-            game_id,
-            now_utc=now_utc,
-            user_requested_start=startup_retry,
-        )
-        if any(
+        launch_states = {
+            OperationalState.WAITING_FOR_MY_FIRST_SAVE,
+            OperationalState.MY_TURN_DOWNLOADED,
+        }
+        has_start_intent = any(
             intent.kind is OrchestrationIntentKind.START_CIV
             for intent in result.intents
-        ):
-            if startup_retry:
-                session.startup_auto_retry_available = False
+        )
+        needs_one_auto_attempt = (
+            session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
+            and result.operational_state in launch_states
+            and launch_key is not None
+            and session.auto_launch_attempted_key != launch_key
+            and not has_start_intent
+        )
+        if needs_one_auto_attempt:
+            # This is not a UI click: it grants the normal Fully Managed
+            # intent decision one fresh per-turn attempt. It still honours
+            # all safety checks (baseline, candidate detection, launch guard,
+            # exact process identity).
+            result = self.reconcile(
+                game_id,
+                now_utc=now_utc,
+                user_requested_start=True,
+            )
+            has_start_intent = any(
+                intent.kind is OrchestrationIntentKind.START_CIV
+                for intent in result.intents
+            )
+        if has_start_intent and launch_key is not None:
+            session.auto_launch_attempted_key = launch_key
         if (
             self._auto_execute_managed_handoff
             and session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
