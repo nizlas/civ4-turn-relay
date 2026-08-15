@@ -35,6 +35,31 @@ from civ4_turn_relay.domain import DomainValidationError, validate_windows_local
 _MOD_TOKEN_FORBIDDEN_CHARS = frozenset("/\"':")
 
 
+def render_legacy_civ4_command_line(argv: tuple[str, ...]) -> str:
+    """Render Civ IV's required raw Windows command-line shape.
+
+    BTS distinguishes a whole quoted argument from quotes inside the
+    /fxsload value. The latter is the empirically verified form for loading
+    a PBEM save directly. Other arguments retain normal Windows escaping;
+    no command shell is involved.
+    """
+    if not argv:
+        raise DomainValidationError("argv: at least the executable is required")
+
+    rendered = [f'"{argv[0]}"']
+    for argument in argv[1:]:
+        if argument.startswith("/fxsload="):
+            save_path = argument.removeprefix("/fxsload=")
+            if not save_path or '"' in save_path:
+                raise DomainValidationError(
+                    "/fxsload: save path must be non-empty and quote-free"
+                )
+            rendered.append(f'/fxsload="{save_path}"')
+        else:
+            rendered.append(subprocess.list2cmdline((argument,)))
+    return " ".join(rendered)
+
+
 def _absolute_parent_directory(path: str) -> str:
     """Parent directory of an absolute Windows or POSIX path string.
 
@@ -179,8 +204,8 @@ class CivLaunchCommand:
     steam_executable_path: str | None = None
 
     def dry_run_preview(self) -> str:
-        """Return the Windows-quoted single command line for display only."""
-        return subprocess.list2cmdline(self.argv)
+        """Return the exact raw Windows command line used for BTS launch."""
+        return render_legacy_civ4_command_line(self.argv)
 
 
 def build_civ_command(config: CivLaunchConfiguration) -> CivLaunchCommand:
