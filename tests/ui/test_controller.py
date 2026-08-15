@@ -124,6 +124,7 @@ def test_open_match_reconciles_immediately(
 
     assert calls == [GAME_ID]
 
+
 def test_polling_timer_emits_snapshots(env: _Env, qtbot: QtBot) -> None:
     _open(env, qtbot, GAME_ID)
     with qtbot.waitSignal(env.hub.snapshot_ready, timeout=TIMEOUT_MS):
