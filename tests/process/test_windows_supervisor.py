@@ -26,6 +26,8 @@ from civ4_turn_relay.process import (
     WindowsProcessSupervisor,
     launch_guard_name,
 )
+from civ4_turn_relay.process.launch_config import render_legacy_civ4_command_line
+from civ4_turn_relay.process.windows import RealWindowsBackend
 
 _EXE = "C:\\Games\\Civ4\\Civ4BeyondSword.exe"
 _COMMAND = CivLaunchCommand(argv=(_EXE, "mod=Mods\\AdvCiv"), working_directory=None)
@@ -161,6 +163,47 @@ def _running_info(
 def test_satisfies_the_supervisor_protocol() -> None:
     assert isinstance(_supervisor(ScriptedBackend()), ProcessSupervisor)
 
+
+
+def test_legacy_command_line_keeps_quotes_inside_fxsload_value() -> None:
+    save_path = (
+        "C:\\Users\\nicla\\Documents\\My Games\\Beyond the Sword\\Saves\\pbem\\"
+        "Two-profile smoke test\\turn.CivBeyondSwordSave"
+    )
+
+    assert render_legacy_civ4_command_line(
+        (_EXE, f"/fxsload={save_path}", "mod=\\AdvCiv")
+    ) == f'"{_EXE}" /fxsload="{save_path}" mod=\\AdvCiv'
+
+
+def test_real_backend_passes_exact_legacy_command_line_without_a_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class SpawnedProcess:
+        pid = 9876
+
+    def fake_popen(command: object, **kwargs: object) -> SpawnedProcess:
+        captured["command"] = command
+        captured.update(kwargs)
+        return SpawnedProcess()
+
+    monkeypatch.setattr(
+        "civ4_turn_relay.process.windows.subprocess.Popen", fake_popen
+    )
+    save_path = "C:\\Relay Test\\turn.CivBeyondSwordSave"
+
+    assert RealWindowsBackend().spawn(
+        (_EXE, f"/fxsload={save_path}", "mod=\\AdvCiv"),
+        "C:\\Games\\Civ4",
+        (("SteamAppId", "8800"), ("SteamGameId", "8800")),
+    ) == 9876
+    assert captured["command"] == (
+        f'"{_EXE}" /fxsload="{save_path}" mod=\\AdvCiv'
+    )
+    assert captured["executable"] == _EXE
+    assert captured["shell"] is False
 
 def test_launch_builds_identity_from_observed_info() -> None:
     backend = ScriptedBackend()
