@@ -14,6 +14,7 @@ from enum import Enum, unique
 from civ4_turn_relay.app.process_runtime import ProcessStatus, ProcessStatusSnapshot
 from civ4_turn_relay.app.snapshot import MatchClientSnapshot, PendingUserAction
 from civ4_turn_relay.domain import OperationalState, TurnHandlingMode
+from civ4_turn_relay.local import OrchestrationIntentKind
 
 _DETAIL_MAX_CHARS = 120
 
@@ -95,6 +96,23 @@ def _start_resume_pending(snapshot: MatchClientSnapshot) -> bool:
     return snapshot.pending_user_action is PendingUserAction.START_OR_RESUME
 
 
+def _start_civ_scheduled(snapshot: MatchClientSnapshot) -> bool:
+    """True only when this reconcile actually scheduled an automatic launch."""
+    return any(
+        intent.kind is OrchestrationIntentKind.START_CIV for intent in snapshot.intents
+    )
+
+
+def _waiting_for_save_activity(snapshot: MatchClientSnapshot) -> bool:
+    """True when the automatic launch is held back by outgoing save activity."""
+    return any(
+        intent.kind is OrchestrationIntentKind.WAIT
+        and intent.payload is not None
+        and intent.payload.get("reason") == "outgoing_save_activity"
+        for intent in snapshot.intents
+    )
+
+
 @dataclass(slots=True)
 class _Draft:
     """Mutable working copy assembled by the state mapping."""
@@ -154,11 +172,20 @@ def _map_my_turn_downloaded(
         return _action(
             draft, PrimaryActionKind.START_CIV, "Start Civilization and play"
         )
-    if _start_resume_pending(snapshot):
-        return _action(
-            draft, PrimaryActionKind.START_CIV, "Start / Resume Civilization"
+    # Fully Managed: "starting" claims require evidence — a launch actually
+    # in flight or an automatic launch scheduled by this reconcile. When no
+    # launch occurred, the button must be a real, enabled Start action.
+    if process is not None and process.status is ProcessStatus.STARTING:
+        return _disabled(draft, "Starting Civilization…")
+    if _start_civ_scheduled(snapshot):
+        return _disabled(draft, "Starting automatically…")
+    if _waiting_for_save_activity(snapshot):
+        draft.detail_text = _shorten(
+            "Waiting for save activity in the PBEM folder to settle "
+            "before starting Civilization."
         )
-    return _disabled(draft, "Starting automatically…")
+        return _disabled(draft, "Waiting for save activity to settle…")
+    return _action(draft, PrimaryActionKind.START_CIV, "Start / Resume Civilization")
 
 
 def _map_deferred_launch(

@@ -8,6 +8,7 @@ from civ4_turn_relay.domain import (
     DomainValidationError,
     MatchConfig,
     OperationalState,
+    TurnHandlingMode,
     validate_client_id,
 )
 from civ4_turn_relay.local.baseline import capture_play_session_baseline
@@ -107,6 +108,52 @@ def _launch_key_from_verified(
     if verified is None:
         return None
     return (verified.protocol_sequence, verified.accepted_sha256)
+
+
+_LAUNCH_STATES = frozenset(
+    {
+        OperationalState.WAITING_FOR_MY_FIRST_SAVE,
+        OperationalState.MY_TURN_DOWNLOADED,
+    }
+)
+
+_SUPPRESSION_MESSAGES = {
+    "outgoing_save_activity": (
+        "automatic launch is waiting for save activity to settle"
+    ),
+    "launch_already_attempted": (
+        "this turn's launch was already attempted; use Start / Resume to retry"
+    ),
+    "civ_already_running": "Civilization is already running for this match",
+    "missing_baseline": "cannot auto-launch without a play-session baseline",
+    "baseline_capture_failed": "cannot auto-launch without baseline",
+    "no_start_intent": "no automatic launch was scheduled",
+}
+
+
+def _auto_launch_suppression_reason(
+    intents: tuple[OrchestrationIntent, ...],
+    *,
+    baseline_capture_failed: bool,
+) -> str:
+    """Classify why Fully Managed emitted no START_CIV in a launch state."""
+    if baseline_capture_failed:
+        return "baseline_capture_failed"
+    for intent in intents:
+        payload = intent.payload or {}
+        if (
+            intent.kind is OrchestrationIntentKind.WAIT
+            and payload.get("reason") == "outgoing_save_activity"
+        ):
+            return "outgoing_save_activity"
+        if intent.kind is OrchestrationIntentKind.REQUIRE_USER_ACTION:
+            if payload.get("reason") == "civ_exited_without_outgoing":
+                return "launch_already_attempted"
+            if payload.get("reason") == "missing_baseline":
+                return "missing_baseline"
+        if intent.kind is OrchestrationIntentKind.RESUME_OR_FOCUS_CIV:
+            return "civ_already_running"
+    return "no_start_intent"
 
 
 def _apply_detection(
@@ -605,6 +652,7 @@ def reconcile_match(
     start_requested = any(
         intent.kind is OrchestrationIntentKind.START_CIV for intent in intents
     )
+    baseline_capture_failed = False
     if start_requested:
         key = _launch_key_from_verified(records.verified_remote)
         try:
@@ -619,6 +667,7 @@ def reconcile_match(
         except DomainValidationError:
             baseline = None
         if baseline is None:
+            baseline_capture_failed = True
             intents = tuple(
                 intent
                 for intent in intents
@@ -660,6 +709,42 @@ def reconcile_match(
             message="reconciliation finished",
         )
     )
+    if (
+        config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
+        and state in _LAUNCH_STATES
+        and not any(
+            intent.kind is OrchestrationIntentKind.START_CIV for intent in intents
+        )
+    ):
+        # An automatic launch was possible in principle but not scheduled.
+        # Never leave that silent: emit the typed reason last so snapshots
+        # surface it as the latest diagnostic.
+        reason = _auto_launch_suppression_reason(
+            intents, baseline_capture_failed=baseline_capture_failed
+        )
+        verified_record = records.verified_remote
+        diagnostics.append(
+            emit_diagnostic(
+                "auto_launch_suppressed",
+                fields={
+                    "reason": reason,
+                    "operational_state": state.value,
+                    "protocol_sequence": manifest.protocol_sequence,
+                    "accepted_sha256": (
+                        verified_record.accepted_sha256
+                        if verified_record is not None
+                        else None
+                    ),
+                    "detection_outcome": (
+                        detection.outcome.value if detection is not None else None
+                    ),
+                    "detection_reason": (
+                        detection.reason if detection is not None else None
+                    ),
+                },
+                message=_SUPPRESSION_MESSAGES[reason],
+            )
+        )
 
     return ReconcileResult(
         operational_state=state,

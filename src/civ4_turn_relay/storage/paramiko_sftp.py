@@ -148,9 +148,7 @@ class ParamikoStorage:
                     "directory already exists", path=path
                 ) from error
             if kind is StorageEntryKind.FILE:
-                raise StorageWrongKindError(
-                    "path is a file", path=path
-                ) from error
+                raise StorageWrongKindError("path is a file", path=path) from error
             self._raise_mapped(error, path=path, creating=True)
 
     def write_file(self, path: str, data: bytes, *, overwrite: bool = False) -> None:

@@ -152,6 +152,7 @@ def test_mkdir_generic_failure_rechecks_existing_directory() -> None:
     sftp.mkdir.side_effect = OSError("Failure")
     storage._sftp = sftp  # noqa: SLF001
     storage._closed = False  # noqa: SLF001
+
     def existing_directory(_remote: str) -> StorageEntryKind | None:
         return StorageEntryKind.DIRECTORY
 
@@ -177,6 +178,7 @@ def test_mkdir_generic_failure_rechecks_wrong_kind_file() -> None:
     sftp.mkdir.side_effect = OSError("Failure")
     storage._sftp = sftp  # noqa: SLF001
     storage._closed = False  # noqa: SLF001
+
     def existing_file(_remote: str) -> StorageEntryKind | None:
         return StorageEntryKind.FILE
 

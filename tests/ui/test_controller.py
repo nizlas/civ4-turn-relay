@@ -98,7 +98,6 @@ def test_open_match_and_poll_emit_snapshots(env: _Env, qtbot: QtBot) -> None:
     assert polled_payload.game_id == GAME_ID
 
 
-
 def test_open_match_reconciles_immediately(
     env: _Env, qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 from civ4_turn_relay.app import PendingUserAction, ProcessStatus, RelayClient
+from civ4_turn_relay.app.relay_client import LAUNCH_LOG_FILENAME
 from civ4_turn_relay.domain import MatchConfig, OperationalState, TurnHandlingMode
 from civ4_turn_relay.local import FakeClock, LocalStore
 from civ4_turn_relay.process import (
@@ -581,9 +582,29 @@ def test_pid_reuse_after_restart_never_targets_impostor(tmp_path: Path) -> None:
     assert supervisor.close_requests == []
     assert supervisor.terminations == []
     assert supervisor.focus_requests == []
-    assert restarted.process_status(GAME_ID).status is ProcessStatus.READY
+    # The startup retry schedules a fresh guarded launch; the pre-launch scan
+    # sees the impostor Civ and safely defers instead of spawning, adopting,
+    # or targeting it.
+    assert (
+        restarted.process_status(GAME_ID).status
+        is ProcessStatus.WAITING_FOR_EXISTING_CIV
+    )
     restarted.tick(GAME_ID)
     assert len(supervisor.launched) == 1
+    assert supervisor.close_requests == []
+    assert supervisor.terminations == []
+
+    # Once the impostor exits, the deferred launch proceeds with a brand-new
+    # identity; the stale association is never adopted.
+    supervisor.mark_exited(impostor)
+    resolved = restarted.tick(GAME_ID)
+    assert resolved.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor.launched) == 2
+    fresh = _associated_identity(restarted)
+    assert fresh != identity
+    assert fresh != impostor
+    assert supervisor.close_requests == []
+    assert supervisor.terminations == []
     restarted.close()
 
 
@@ -841,7 +862,6 @@ def test_second_profile_waits_for_existing_civ_then_launches_once(
     client_b.close()
 
 
-
 def test_fully_managed_auto_launches_a_later_turn_in_the_same_session(
     tmp_path: Path,
 ) -> None:
@@ -883,6 +903,7 @@ def test_fully_managed_auto_launches_a_later_turn_in_the_same_session(
     assert len(supervisor_a.launched) == 2
     client_a.close()
     client_b.close()
+
 
 def test_standard_profile_blocked_start_never_surprise_launches(
     tmp_path: Path,
@@ -1131,4 +1152,148 @@ def test_deferred_launch_restores_key_when_cleanup_fails(tmp_path: Path) -> None
     records_after = client.store.load_match_state_or_empty(GAME_ID)
     assert records_after.process_association is not None
     assert records_after.launch_attempt is not None
+    client.close()
+
+
+def _opponent_commits_followup_save(
+    tmp_path: Path,
+    storage: FakeStorage,
+    clock: FakeClock,
+    *,
+    operation_id: str,
+    data: bytes,
+    filename: str,
+) -> None:
+    """The opponent plays their downloaded turn and commits the next save."""
+    root = tmp_path / "opponent"
+    opponent = make_client(root, storage, clock, client_uuid=OPPONENT_UUID)
+    config = match_config(root, local_player_id="player_a", pbem_name="pbem-opponent")
+    opponent.open_match(config)
+    handoff = opponent.execute_handoff(
+        GAME_ID,
+        operation_id=operation_id,
+        outgoing_bytes=data,
+        original_filename=filename,
+    )
+    assert handoff.outcome is HandoffOutcome.COMMITTED
+    opponent.close()
+
+
+def _read_launch_log_lines(client: RelayClient) -> list[str]:
+    log = client.store.root / LAUNCH_LOG_FILENAME
+    if not log.exists():
+        return []
+    return log.read_text(encoding="utf-8").splitlines()
+
+
+def test_next_turn_launches_despite_prior_outgoing_in_pbem_folder(
+    tmp_path: Path,
+) -> None:
+    """Regression (field failure): after a full turn cycle, the previous
+    outgoing save still sits in the PBEM folder while the persisted session
+    baseline predates it. The next verified turn must auto-launch instead of
+    being held in a perpetual STABILIZING detection that silently suppressed
+    every launch."""
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    client, config, _exe = _local_client_after_opponent_commit(
+        tmp_path, storage, clock, supervisor
+    )
+    assert client.tick(GAME_ID).operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor.launched) == 1
+
+    write_stable_save(
+        Path(config.pbem_save_directory),
+        SAVE_NAME_B,
+        SAVE_B,
+        clock,
+        client,
+        GAME_ID,
+    )
+    committed = client.tick(
+        GAME_ID, auto_handoff_operation_id="d1d1d1d1-d1d1-4d1d-8d1d-d1d1d1d1d1d1"
+    )
+    assert committed.protocol_sequence == 2
+    closed = client.tick(GAME_ID)
+    assert closed.operational_state is OperationalState.WAITING_FOR_OTHER_PLAYER
+
+    _opponent_commits_followup_save(
+        tmp_path,
+        storage,
+        clock,
+        operation_id="d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2",
+        data=SAVE_A + b"-turn-3",
+        filename="E2E_PlayerA_Turn2.CivBeyondSwordSave",
+    )
+    # The already-sent outgoing save is still in the folder and is absent
+    # from the persisted (stale) session baseline.
+    assert (Path(config.pbem_save_directory) / SAVE_NAME_B).exists()
+
+    snap = client.tick(GAME_ID)
+    assert snap.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor.launched) == 2
+    client.close()
+
+
+def test_launch_diagnostics_log_records_real_attempt_once(tmp_path: Path) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    client, _config, _exe = _local_client_after_opponent_commit(
+        tmp_path, storage, clock, supervisor
+    )
+    assert client.tick(GAME_ID).operational_state is OperationalState.CIV_RUNNING
+
+    lines = _read_launch_log_lines(client)
+    attempts = [line for line in lines if " launch_attempted " in line]
+    assert len(attempts) == 1
+    assert '"plan_outcome": "ready"' in attempts[0]
+    assert '"guarded_outcome": "launched"' in attempts[0]
+    assert '"identity_persisted": true' in attempts[0]
+    assert "/fxsload=" in attempts[0]
+
+    # Healthy running ticks add nothing: no per-poll spam.
+    client.tick(GAME_ID)
+    client.tick(GAME_ID)
+    assert _read_launch_log_lines(client) == lines
+    client.close()
+
+
+def test_suppressed_launch_logged_once_until_a_real_attempt(tmp_path: Path) -> None:
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    supervisor.exit_immediately = True
+    exe = _exe_path(tmp_path)
+    client, _config = _opener_client(
+        tmp_path, storage, clock, supervisor, civ4_executable=exe
+    )
+
+    client.tick(GAME_ID)
+    assert len(supervisor.launched) == 1
+    lines = _read_launch_log_lines(client)
+    assert len([line for line in lines if " launch_attempted " in line]) == 1
+
+    # Repeated polls while the launch stays suppressed log exactly one
+    # deduplicated suppression entry, not one per interval.
+    client.tick(GAME_ID)
+    client.tick(GAME_ID)
+    client.tick(GAME_ID)
+    suppressed = [
+        line
+        for line in _read_launch_log_lines(client)
+        if " auto_launch_suppressed " in line
+    ]
+    assert len(suppressed) == 1
+    assert '"reason": "launch_already_attempted"' in suppressed[0]
+
+    # An explicit user Start is a real attempt and is always logged.
+    supervisor.exit_immediately = False
+    result = client.request_start(GAME_ID)
+    assert result.operational_state is OperationalState.CIV_RUNNING
+    attempts = [
+        line for line in _read_launch_log_lines(client) if " launch_attempted " in line
+    ]
+    assert len(attempts) == 2
     client.close()

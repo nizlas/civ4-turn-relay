@@ -6,6 +6,7 @@ from civ4_turn_relay.app.process_runtime import ProcessStatus, ProcessStatusSnap
 from civ4_turn_relay.app.snapshot import MatchClientSnapshot, PendingUserAction
 from civ4_turn_relay.domain import OperationalState, TurnHandlingMode
 from civ4_turn_relay.local.diagnostics import DiagnosticEvent
+from civ4_turn_relay.local.intents import OrchestrationIntent
 
 GAME_ID = "ui-match-01"
 GAME_ID_B = "ui-match-02"
@@ -23,6 +24,7 @@ def client_snapshot(
     retry_required: bool = False,
     diagnostic_message: str | None = None,
     primary_status: str = "some_status",
+    intents: tuple[OrchestrationIntent, ...] = (),
 ) -> MatchClientSnapshot:
     diagnostic: DiagnosticEvent | None = None
     if diagnostic_message is not None:
@@ -39,7 +41,7 @@ def client_snapshot(
         turn_handling_mode=mode,
         primary_status=primary_status,
         pending_user_action=pending,
-        intents=(),
+        intents=intents,
         latest_diagnostic=diagnostic,
         monitoring_available=True,
         storage_available=storage_available,

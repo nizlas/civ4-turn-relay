@@ -153,6 +153,7 @@ class MatchWorker(QObject):
         if not isinstance(config, MatchConfig):
             self.error.emit("open_match: expected a MatchConfig payload")
             return
+
         def open_and_reconcile() -> None:
             # A stored profile otherwise first renders only its last durable
             # snapshot and waits one full polling interval before it has even

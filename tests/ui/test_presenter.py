@@ -10,6 +10,7 @@ from civ4_turn_relay.app.process_runtime import (
 )
 from civ4_turn_relay.app.snapshot import PendingUserAction
 from civ4_turn_relay.domain import OperationalState, TurnHandlingMode
+from civ4_turn_relay.local import OrchestrationIntent, OrchestrationIntentKind
 from civ4_turn_relay.ui.presenter import (
     MatchViewModel,
     PrimaryActionKind,
@@ -105,14 +106,71 @@ def test_my_turn_fully_managed_explicit_start_after_exit() -> None:
     assert vm.primary_label == "Start / Resume Civilization"
 
 
-def test_my_turn_fully_managed_automatic_launch_disables_button() -> None:
+def test_my_turn_fully_managed_scheduled_launch_disables_button() -> None:
+    """'Starting automatically…' requires a scheduled START_CIV intent."""
     vm = build_view_model(
-        client_snapshot(OperationalState.MY_TURN_DOWNLOADED, mode=MANAGED),
+        client_snapshot(
+            OperationalState.MY_TURN_DOWNLOADED,
+            mode=MANAGED,
+            intents=(OrchestrationIntent(OrchestrationIntentKind.START_CIV),),
+        ),
         None,
     )
     assert vm.primary_action is PrimaryActionKind.NONE
     assert vm.primary_label == "Starting automatically…"
     assert vm.primary_enabled is False
+
+
+def test_my_turn_fully_managed_no_launch_keeps_start_enabled() -> None:
+    """Regression: with no launch scheduled or in flight, the UI must not
+    claim 'Starting automatically…'; it must offer a real Start action."""
+    vm = build_view_model(
+        client_snapshot(OperationalState.MY_TURN_DOWNLOADED, mode=MANAGED),
+        None,
+    )
+    assert vm.primary_action is PrimaryActionKind.START_CIV
+    assert vm.primary_label == "Start / Resume Civilization"
+    assert vm.primary_enabled is True
+
+
+def test_my_turn_fully_managed_ready_process_without_launch_keeps_start() -> None:
+    vm = build_view_model(
+        client_snapshot(OperationalState.MY_TURN_DOWNLOADED, mode=MANAGED),
+        process_snapshot(ProcessStatus.READY),
+    )
+    assert vm.primary_action is PrimaryActionKind.START_CIV
+    assert vm.primary_enabled is True
+    assert vm.primary_label != "Starting automatically…"
+
+
+def test_my_turn_fully_managed_starting_process_shows_in_flight_launch() -> None:
+    vm = build_view_model(
+        client_snapshot(OperationalState.MY_TURN_DOWNLOADED, mode=MANAGED),
+        process_snapshot(ProcessStatus.STARTING, message="launching Civilization"),
+    )
+    assert vm.primary_action is PrimaryActionKind.NONE
+    assert vm.primary_label == "Starting Civilization…"
+    assert vm.primary_enabled is False
+
+
+def test_my_turn_fully_managed_outgoing_activity_shows_waiting_reason() -> None:
+    vm = build_view_model(
+        client_snapshot(
+            OperationalState.MY_TURN_DOWNLOADED,
+            mode=MANAGED,
+            pending=PendingUserAction.WAIT,
+            intents=(
+                OrchestrationIntent(
+                    OrchestrationIntentKind.WAIT,
+                    payload={"reason": "outgoing_save_activity"},
+                ),
+            ),
+        ),
+        None,
+    )
+    assert vm.primary_action is PrimaryActionKind.NONE
+    assert vm.primary_label == "Waiting for save activity to settle…"
+    assert "save activity" in vm.detail_text
 
 
 def test_my_turn_fully_managed_waits_for_existing_civ() -> None:

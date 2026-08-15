@@ -281,22 +281,32 @@ def observe_outgoing_candidates(
 
         local_path = validate_windows_local_path(str(contained), field_path="path")
         baseline_hash_at_path = baseline_by_path.get(local_path)
-        if baseline_hash_at_path is not None:
-            try:
-                data = contained.read_bytes()
-            except OSError:
-                return DetectionResult(
-                    DetectionOutcome.IO_FAILURE,
-                    reason="read_failed",
-                )
-            digest = sha256_hex(data)
-            if digest == baseline_hash_at_path and len(data) == size:
-                continue
-            if digest in excluded:
-                continue
-            saw_potential = True
-        else:
-            saw_potential = True
+        try:
+            data = contained.read_bytes()
+        except OSError:
+            return DetectionResult(
+                DetectionOutcome.IO_FAILURE,
+                reason="read_failed",
+            )
+        digest = sha256_hex(data)
+        if (
+            baseline_hash_at_path is not None
+            and digest == baseline_hash_at_path
+            and len(data) == size
+        ):
+            continue
+        # Hash exclusion must be decided before a file counts as potential
+        # outgoing activity. An already-processed outgoing save or the
+        # downloaded incoming save is known content regardless of whether
+        # the session baseline recorded its path; treating it as potential
+        # would hold detection in a perpetual STABILIZING state and block
+        # the Fully Managed automatic launch. A file mid-write hashes to
+        # an unknown digest and still counts as potential.
+        if digest in excluded:
+            continue
+        if baseline_hash_at_path is None and digest in baseline_hashes:
+            continue
+        saw_potential = True
 
         observations = _merge_observations(
             observations,

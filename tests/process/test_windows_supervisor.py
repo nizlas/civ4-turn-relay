@@ -63,6 +63,8 @@ class ScriptedBackend:
         self.scan_error: Exception | None = None
         self.steam_is_running = True
         self.steam_start_error: Exception | None = None
+        # When False, a scripted start call never registers Steam as running.
+        self.steam_start_registers = True
 
     def spawn(
         self,
@@ -83,7 +85,8 @@ class ScriptedBackend:
         self.calls.append(("start_steam", executable_path))
         if self.steam_start_error is not None:
             raise self.steam_start_error
-        self.steam_is_running = True
+        if self.steam_start_registers:
+            self.steam_is_running = True
 
     def process_info(self, pid: int) -> ProcessInfo | None:
         self.calls.append(("process_info", pid))
@@ -164,16 +167,16 @@ def test_satisfies_the_supervisor_protocol() -> None:
     assert isinstance(_supervisor(ScriptedBackend()), ProcessSupervisor)
 
 
-
 def test_legacy_command_line_keeps_quotes_inside_fxsload_value() -> None:
     save_path = (
         "C:\\Users\\nicla\\Documents\\My Games\\Beyond the Sword\\Saves\\pbem\\"
         "Two-profile smoke test\\turn.CivBeyondSwordSave"
     )
 
-    assert render_legacy_civ4_command_line(
-        (_EXE, f"/fxsload={save_path}", "mod=\\AdvCiv")
-    ) == f'"{_EXE}" /fxsload="{save_path}" mod=\\AdvCiv'
+    assert (
+        render_legacy_civ4_command_line((_EXE, f"/fxsload={save_path}", "mod=\\AdvCiv"))
+        == f'"{_EXE}" /fxsload="{save_path}" mod=\\AdvCiv'
+    )
 
 
 def test_real_backend_passes_exact_legacy_command_line_without_a_shell(
@@ -189,21 +192,21 @@ def test_real_backend_passes_exact_legacy_command_line_without_a_shell(
         captured.update(kwargs)
         return SpawnedProcess()
 
-    monkeypatch.setattr(
-        "civ4_turn_relay.process.windows.subprocess.Popen", fake_popen
-    )
+    monkeypatch.setattr("civ4_turn_relay.process.windows.subprocess.Popen", fake_popen)
     save_path = "C:\\Relay Test\\turn.CivBeyondSwordSave"
 
-    assert RealWindowsBackend().spawn(
-        (_EXE, f"/fxsload={save_path}", "mod=\\AdvCiv"),
-        "C:\\Games\\Civ4",
-        (("SteamAppId", "8800"), ("SteamGameId", "8800")),
-    ) == 9876
-    assert captured["command"] == (
-        f'"{_EXE}" /fxsload="{save_path}" mod=\\AdvCiv'
+    assert (
+        RealWindowsBackend().spawn(
+            (_EXE, f"/fxsload={save_path}", "mod=\\AdvCiv"),
+            "C:\\Games\\Civ4",
+            (("SteamAppId", "8800"), ("SteamGameId", "8800")),
+        )
+        == 9876
     )
+    assert captured["command"] == (f'"{_EXE}" /fxsload="{save_path}" mod=\\AdvCiv')
     assert captured["executable"] == _EXE
     assert captured["shell"] is False
+
 
 def test_launch_builds_identity_from_observed_info() -> None:
     backend = ScriptedBackend()
@@ -284,7 +287,7 @@ def test_steam_that_never_registers_refuses_to_spawn_civilization() -> None:
         steam_executable_path=_STEAM,
     )
     # Keep Steam absent despite the scripted start call.
-    backend.start_steam_client = lambda _path: None  # type: ignore[method-assign]
+    backend.steam_start_registers = False
     result = WindowsProcessSupervisor(
         backend=backend,
         platform="win32",

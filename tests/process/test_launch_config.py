@@ -126,8 +126,12 @@ def test_dry_run_preview_quotes_paths_with_spaces() -> None:
 
 
 def test_dry_run_preview_leaves_spaceless_arguments_unquoted() -> None:
-    command = CivLaunchCommand(argv=("C:\\Civ4\\civ4.exe",), working_directory=None)
-    assert command.dry_run_preview() == "C:\\Civ4\\civ4.exe"
+    """The executable is always quoted (Civ IV's verified legacy form);
+    spaceless non-executable arguments stay unquoted."""
+    command = CivLaunchCommand(
+        argv=("C:\\Civ4\\civ4.exe", "mod=\\AdvCiv"), working_directory=None
+    )
+    assert command.dry_run_preview() == '"C:\\Civ4\\civ4.exe" mod=\\AdvCiv'
 
 
 @pytest.mark.parametrize(

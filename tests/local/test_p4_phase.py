@@ -608,6 +608,141 @@ def test_pt21_path_overwrite_new_hash_eligible(tmp_path: Path) -> None:
     assert second.candidates[0].sha256 == sha256_hex(SAVE_B)
 
 
+def test_hash_excluded_files_never_hold_stabilizing(tmp_path: Path) -> None:
+    """Regression (field failure): files with excluded hashes that appeared
+    after a stale session baseline must yield NO_CANDIDATE, not a perpetual
+    STABILIZING that suppresses the automatic launch forever."""
+    pbem = _pbem_dir(tmp_path)
+    # Baseline captured while the folder was empty (stale, sequence 0).
+    records = _records_with_baseline(
+        "example-match", pbem, protocol_sequence=0, accepted_sha256=None
+    )
+    # Both files appear afterwards: an already-sent outgoing save and the
+    # downloaded incoming save; both hashes are excluded.
+    _write_save(pbem, "AlreadySent.CivBeyondSwordSave", SAVE_A)
+    _write_save(pbem, "Downloaded.CivBeyondSwordSave", SAVE_B)
+    excluded = (sha256_hex(SAVE_A), sha256_hex(SAVE_B))
+    clock = FakeClock()
+
+    first = observe_outgoing_candidates(
+        str(pbem),
+        SaveMatchingRules(filename_glob=GLOB),
+        records,
+        excluded,
+        clock=clock,
+        max_save_bytes=10_000_000,
+    )
+    assert first.outcome is DetectionOutcome.NO_CANDIDATE
+
+    # The loop stays broken: repeated observation never flips to STABILIZING.
+    clock.advance(STABILITY_INTERVAL_SECONDS)
+    second = observe_outgoing_candidates(
+        str(pbem),
+        SaveMatchingRules(filename_glob=GLOB),
+        replace(records, stability_observations=first.observations),
+        excluded,
+        clock=clock,
+        max_save_bytes=10_000_000,
+    )
+    assert second.outcome is DetectionOutcome.NO_CANDIDATE
+
+
+def test_unknown_content_still_stabilizes_despite_exclusions(tmp_path: Path) -> None:
+    """Unknown new content must still count as potential outgoing activity."""
+    pbem = _pbem_dir(tmp_path)
+    records = _records_with_baseline(
+        "example-match", pbem, protocol_sequence=0, accepted_sha256=None
+    )
+    _write_save(pbem, "Fresh.CivBeyondSwordSave", SAVE_B)
+    clock = FakeClock()
+
+    detection = observe_outgoing_candidates(
+        str(pbem),
+        SaveMatchingRules(filename_glob=GLOB),
+        records,
+        (sha256_hex(SAVE_A),),
+        clock=clock,
+        max_save_bytes=10_000_000,
+    )
+
+    assert detection.outcome is DetectionOutcome.STABILIZING
+
+
+def test_outgoing_activity_emits_typed_wait_not_silence(tmp_path: Path) -> None:
+    """Suppressing the automatic launch must produce a typed WAIT intent."""
+    pbem = _pbem_dir(tmp_path)
+    records = _records_with_baseline("example-match", pbem)
+    _write_save(pbem, "Fresh.CivBeyondSwordSave", SAVE_B)
+    clock = FakeClock()
+    detection = observe_outgoing_candidates(
+        str(pbem),
+        SaveMatchingRules(filename_glob=GLOB),
+        records,
+        (),
+        clock=clock,
+        max_save_bytes=10_000_000,
+    )
+    assert detection.outcome is DetectionOutcome.STABILIZING
+
+    intents = decide_intents(
+        TurnHandlingMode.FULLY_MANAGED,
+        False,
+        OperationalState.MY_TURN_DOWNLOADED,
+        records,
+        detection,
+        None,
+        None,
+        False,
+    )
+
+    waits = [i for i in intents if i.kind is OrchestrationIntentKind.WAIT]
+    assert waits and waits[0].payload == {"reason": "outgoing_save_activity"}
+    assert OrchestrationIntentKind.START_CIV not in {i.kind for i in intents}
+
+
+def test_excluded_files_do_not_block_user_requested_start(tmp_path: Path) -> None:
+    """Regression: the downloaded turn sitting in the PBEM folder must not
+    suppress an explicit Start after the baseline went stale."""
+    storage = FakeStorage()
+    _commit_player_a_turn(storage)
+    store = _local_store(tmp_path)
+    config = _match_config(tmp_path, local_player_id="player_b")
+    store.write_match_config(config)
+    pbem = _pbem_dir(tmp_path)
+
+    first = _reconcile(storage, store, config)
+    assert any(i.kind is OrchestrationIntentKind.START_CIV for i in first.intents)
+
+    # After the baseline capture, the accepted save appears in the folder
+    # (its hash is in the manifest's accepted hashes and the downloaded
+    # record). Previously this held detection in STABILIZING and silently
+    # suppressed every launch, including explicit user Starts.
+    _write_save(pbem, "Incoming.CivBeyondSwordSave", SAVE_A)
+
+    retry = _reconcile(storage, store, config, user_requested_start=True)
+
+    assert any(i.kind is OrchestrationIntentKind.START_CIV for i in retry.intents)
+
+
+def test_suppressed_auto_launch_emits_latest_diagnostic(tmp_path: Path) -> None:
+    """A Fully Managed reconcile that schedules no launch in a launch state
+    must say why, as the latest diagnostic."""
+    storage = FakeStorage()
+    _commit_player_a_turn(storage)
+    store = _local_store(tmp_path)
+    config = _match_config(tmp_path, local_player_id="player_b")
+    store.write_match_config(config)
+
+    first = _reconcile(storage, store, config)
+    assert any(i.kind is OrchestrationIntentKind.START_CIV for i in first.intents)
+
+    second = _reconcile(storage, store, config)
+
+    assert not any(i.kind is OrchestrationIntentKind.START_CIV for i in second.intents)
+    assert second.diagnostics[-1].name == "auto_launch_suppressed"
+    assert second.diagnostics[-1].fields["reason"] == "launch_already_attempted"
+
+
 @pytest.mark.pt("PT-22")
 def test_pt22_baseline_survives_restart_while_civ_running(tmp_path: Path) -> None:
     storage = FakeStorage()
@@ -960,6 +1095,48 @@ def test_process_association_suppresses_relaunch(tmp_path: Path) -> None:
     )
     assert OrchestrationIntentKind.RESUME_OR_FOCUS_CIV in {
         intent.kind for intent in resumed.intents
+    }
+
+
+def test_verified_exited_association_allows_relaunch(tmp_path: Path) -> None:
+    """Regression: a probe that verified the exact associated process exited
+    is positive evidence; the stale association must not keep suppressing
+    the automatic launch for the pending turn."""
+    storage = FakeStorage()
+    game_id, digest = _commit_player_a_turn(storage)
+    del game_id
+    store = _local_store(tmp_path)
+    standard = _match_config(
+        tmp_path,
+        local_player_id="player_b",
+        turn_handling_mode=TurnHandlingMode.STANDARD,
+    )
+    store.write_match_config(standard)
+    downloaded = _reconcile(storage, store, standard)
+    assert downloaded.records.launch_attempt is None
+
+    associated = replace(
+        downloaded.records,
+        process_association=ProcessAssociationRecord(
+            protocol_sequence=1,
+            accepted_sha256=digest,
+            pid=4242,
+            process_start_time_utc=NOW_UTC,
+            process_create_time_ns=CREATE_NS,
+            executable_path=r"C:\Games\Civ4\BeyondSword.exe",
+            associated_at=NOW_UTC,
+        ),
+    )
+    store.write_match_state(associated)
+    managed = _match_config(tmp_path, local_player_id="player_b")
+    store.write_match_config(managed)
+
+    exited = _reconcile(
+        storage, store, managed, process_observation=_process_obs(running=False)
+    )
+
+    assert OrchestrationIntentKind.START_CIV in {
+        intent.kind for intent in exited.intents
     }
 
 

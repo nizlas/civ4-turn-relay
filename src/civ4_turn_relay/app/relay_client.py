@@ -7,6 +7,7 @@ mutations go through the P3 protocol APIs.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -88,6 +89,9 @@ def _default_now_utc() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+LAUNCH_LOG_FILENAME = "launch_diagnostics.log"
+
+
 @dataclass
 class _MatchSession:
     """Per-match runtime session (never shared across matches)."""
@@ -112,6 +116,10 @@ class _MatchSession:
     # Relay restart, the currently pending turn gets one fresh attempt, while
     # periodic polling never retries a failed spawn in a loop.
     auto_launch_attempted_key: tuple[int, str | None] | None = None
+    # Dedup key for the durable launch diagnostics log: an entry is written
+    # only when (game_id, protocol_sequence, accepted_sha256, event/reason)
+    # changes or a real launch attempt occurs — never once per poll.
+    last_launch_log_key: tuple[str, str, str, str] | None = None
 
 
 class RelayClient:
@@ -901,6 +909,16 @@ class RelayClient:
 
         self._store.update_match_state(game_id, mutate)
 
+    def _append_session_diagnostic(
+        self, session: _MatchSession, diagnostic: DiagnosticEvent
+    ) -> None:
+        """Attach a diagnostic to the latest reconcile result for snapshots."""
+        if session.last_reconcile is not None:
+            session.last_reconcile = replace(
+                session.last_reconcile,
+                diagnostics=(*session.last_reconcile.diagnostics, diagnostic),
+            )
+
     def _note_guard_cleanup_failure(
         self, session: _MatchSession, launch: GuardedLaunchResult
     ) -> None:
@@ -919,11 +937,124 @@ class RelayClient:
             },
             message=launch.cleanup_message or "launch-guard cleanup failed",
         )
-        if session.last_reconcile is not None:
-            session.last_reconcile = replace(
-                session.last_reconcile,
-                diagnostics=(*session.last_reconcile.diagnostics, diagnostic),
+        self._append_session_diagnostic(session, diagnostic)
+
+    def _record_launch_event(
+        self,
+        session: _MatchSession,
+        event: DiagnosticEvent,
+        *,
+        dedup_key: tuple[str, str, str, str],
+        force: bool,
+        now_utc: str | None,
+    ) -> None:
+        """Append one line to the durable, deduplicated launch diagnostics log.
+
+        The log lives at ``<app-data root>/launch_diagnostics.log`` with one
+        event per line: ``<utc> <event-name> <sorted-json-fields> | <message>``.
+        A line is written only when ``dedup_key`` changes or ``force`` is set
+        (a real launch attempt) — never once per polling interval. Fields are
+        already secret-free and hash-shortened by ``emit_diagnostic``.
+        """
+        if not force and session.last_launch_log_key == dedup_key:
+            return
+        session.last_launch_log_key = dedup_key
+        stamp = now_utc if now_utc is not None else self._now_utc_fn()
+        line = f"{stamp} {event.name} " + json.dumps(
+            event.fields, sort_keys=True, default=str
+        )
+        if event.message:
+            line += f" | {event.message}"
+        try:
+            path = self._store.root / LAUNCH_LOG_FILENAME
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            # Diagnostics must never affect orchestration or launching.
+            pass
+
+    def _note_launch_attempt(
+        self,
+        session: _MatchSession,
+        records: MatchLocalRecords,
+        plan: LaunchPlan,
+        launch: GuardedLaunchResult | None,
+        now_utc: str | None,
+    ) -> None:
+        """Record a real launch attempt (or its local refusal) durably."""
+        verified = records.verified_remote
+        sequence = 0 if verified is None else verified.protocol_sequence
+        accepted = None if verified is None else verified.accepted_sha256
+        if launch is None:
+            guarded = "refused_locally"
+            message = plan.reason or "launch already in flight or process running"
+            identity_persisted = False
+        else:
+            guarded = launch.outcome.value
+            message = launch.message
+            identity_persisted = (
+                launch.outcome is GuardedLaunchOutcome.LAUNCHED
+                and launch.identity is not None
             )
+        fields: dict[str, object] = {
+            "game_id": session.config.game_id,
+            "protocol_sequence": sequence,
+            "accepted_sha256": accepted,
+            "plan_outcome": plan.outcome.value,
+            "plan_reason": plan.reason or None,
+            "guarded_outcome": guarded,
+            "identity_persisted": identity_persisted,
+        }
+        if plan.command is not None:
+            fields["command"] = plan.command.dry_run_preview()
+        event = emit_diagnostic("launch_attempted", fields=fields, message=message)
+        self._append_session_diagnostic(session, event)
+        self._record_launch_event(
+            session,
+            event,
+            dedup_key=(
+                session.config.game_id,
+                str(sequence),
+                str(accepted),
+                f"attempt:{guarded}",
+            ),
+            force=launch is not None,
+            now_utc=now_utc,
+        )
+
+    def _note_launch_suppression(
+        self,
+        session: _MatchSession,
+        result: ReconcileResult,
+        now_utc: str | None,
+    ) -> None:
+        """Durably log why no automatic launch happened, deduplicated."""
+        suppression = next(
+            (
+                diagnostic
+                for diagnostic in reversed(result.diagnostics)
+                if diagnostic.name == "auto_launch_suppressed"
+            ),
+            None,
+        )
+        if suppression is None:
+            return
+        verified = result.records.verified_remote
+        sequence = 0 if verified is None else verified.protocol_sequence
+        accepted = None if verified is None else verified.accepted_sha256
+        reason = suppression.fields.get("reason", "unknown")
+        self._record_launch_event(
+            session,
+            suppression,
+            dedup_key=(
+                session.config.game_id,
+                str(sequence),
+                str(accepted),
+                f"suppressed:{reason}",
+            ),
+            force=False,
+            now_utc=now_utc,
+        )
 
     def _act_on_process_intents(
         self,
@@ -960,14 +1091,17 @@ class RelayClient:
                     # never counts as a consumed launch and a later ordinary
                     # tick (or explicit Start) retries the guarded launch.
                     self._clear_launch_attempt(game_id)
+                self._note_launch_attempt(session, records, plan, launch, now_utc)
                 if launch is not None:
                     self._note_guard_cleanup_failure(session, launch)
-        elif result.operational_state not in {
-            OperationalState.WAITING_FOR_MY_FIRST_SAVE,
-            OperationalState.MY_TURN_DOWNLOADED,
-        }:
-            # No launch is wanted anymore; drop any stale waiting status.
-            coordinator.clear_launch_deferral()
+        else:
+            if result.operational_state not in {
+                OperationalState.WAITING_FOR_MY_FIRST_SAVE,
+                OperationalState.MY_TURN_DOWNLOADED,
+            }:
+                # No launch is wanted anymore; drop any stale waiting status.
+                coordinator.clear_launch_deferral()
+            self._note_launch_suppression(session, result, now_utc)
         close_intent = next(
             (
                 intent

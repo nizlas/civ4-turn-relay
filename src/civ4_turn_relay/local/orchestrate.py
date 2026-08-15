@@ -128,6 +128,28 @@ def _matched_running_process(
     )
 
 
+def _matched_exited_process(
+    records: MatchLocalRecords, observation: ProcessObservation | None
+) -> bool:
+    """True when a fresh probe verified the associated process has exited.
+
+    Only exact-identity evidence counts; without an observation the
+    association stays uncertain and keeps suppressing automatic launches.
+    """
+    association = records.process_association
+    if association is None or observation is None:
+        return False
+    return (
+        observation_matches_association(
+            observation,
+            pid=association.pid,
+            process_create_time_ns=association.process_create_time_ns,
+            executable_path=association.executable_path,
+        )
+        and not observation.running
+    )
+
+
 def _post_commit_outcome(handoff: HandoffEvidence | None) -> bool:
     if handoff is None:
         return False
@@ -267,7 +289,15 @@ def decide_intents(
                     OrchestrationIntent(OrchestrationIntentKind.RESUME_OR_FOCUS_CIV)
                 )
             elif has_outgoing:
-                pass
+                # An outgoing candidate (or one still stabilizing) suppresses
+                # the automatic launch, but never silently: the typed WAIT
+                # intent lets the UI and diagnostics say why nothing launched.
+                intents.append(
+                    OrchestrationIntent(
+                        OrchestrationIntentKind.WAIT,
+                        payload={"reason": "outgoing_save_activity"},
+                    )
+                )
             elif _launch_already_attempted(records) and not user_requested_start:
                 intents.append(
                     OrchestrationIntent(
@@ -278,11 +308,13 @@ def decide_intents(
             elif user_requested_start:
                 intents.append(OrchestrationIntent(OrchestrationIntentKind.START_CIV))
             elif not _launch_already_attempted(records):
-                if records.process_association is not None and matched_running:
-                    intents.append(
-                        OrchestrationIntent(OrchestrationIntentKind.RESUME_OR_FOCUS_CIV)
-                    )
-                elif records.process_association is None:
+                # A stale association from an earlier session suppresses the
+                # launch only while the process state is uncertain; a probe
+                # that verified the exact associated identity exited is
+                # positive evidence that launching is safe.
+                if records.process_association is None or _matched_exited_process(
+                    records, process_observation
+                ):
                     intents.append(
                         OrchestrationIntent(OrchestrationIntentKind.START_CIV)
                     )
