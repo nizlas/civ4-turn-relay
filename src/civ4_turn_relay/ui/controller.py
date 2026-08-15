@@ -153,7 +153,17 @@ class MatchWorker(QObject):
         if not isinstance(config, MatchConfig):
             self.error.emit("open_match: expected a MatchConfig payload")
             return
-        self._run_command(config.game_id, lambda: self._client.open_match(config))
+        def open_and_reconcile() -> None:
+            # A stored profile otherwise first renders only its last durable
+            # snapshot and waits one full polling interval before it has even
+            # checked the server. In Fully Managed mode that misleadingly
+            # looks like an automatic launch is already in progress. Reconcile
+            # immediately so the first visible status is authoritative and a
+            # ready turn can launch now.
+            self._client.open_match(config)
+            self._client.tick(config.game_id)
+
+        self._run_command(config.game_id, open_and_reconcile)
 
     @Slot(object)
     def initialize_match(self, config: object) -> None:
