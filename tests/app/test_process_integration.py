@@ -841,6 +841,49 @@ def test_second_profile_waits_for_existing_civ_then_launches_once(
     client_b.close()
 
 
+
+def test_fully_managed_auto_launches_a_later_turn_in_the_same_session(
+    tmp_path: Path,
+) -> None:
+    """A successful first turn must not consume auto-launch for all later turns."""
+    storage = FakeStorage()
+    clock = FakeClock()
+    machine = FakeMachine()
+    client_a, client_b, supervisor_a, supervisor_b, identity_a = _two_profile_setup(
+        tmp_path, storage, clock, machine
+    )
+
+    # B takes sequence 1 after A's first Civ instance has closed.
+    supervisor_a.mark_exited(identity_a)
+    client_b.tick(GAME_ID)
+    identity_b = _associated_identity(client_b)
+    assert len(supervisor_b.launched) == 1
+
+    # B commits sequence 1, making sequence 2 A's turn again.
+    config_b = client_b.store.load_match_config(GAME_ID)
+    write_stable_save(
+        Path(config_b.pbem_save_directory),
+        SAVE_NAME_B,
+        SAVE_B,
+        clock,
+        client_b,
+        GAME_ID,
+    )
+    committed = client_b.tick(
+        GAME_ID, auto_handoff_operation_id="f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1"
+    )
+    assert committed.protocol_sequence == 2
+    supervisor_b.mark_exited(identity_b)
+
+    # A is still the same RelayClient session that already auto-launched its
+    # sequence-0 game. The received sequence-2 turn must nevertheless get
+    # one automatic launch attempt.
+    resumed = client_a.tick(GAME_ID)
+    assert resumed.operational_state is OperationalState.CIV_RUNNING
+    assert len(supervisor_a.launched) == 2
+    client_a.close()
+    client_b.close()
+
 def test_standard_profile_blocked_start_never_surprise_launches(
     tmp_path: Path,
 ) -> None:
