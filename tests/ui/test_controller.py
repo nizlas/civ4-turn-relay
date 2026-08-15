@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 from pytestqt.qtbot import QtBot
 
 from civ4_turn_relay.app import RelayClient
+from civ4_turn_relay.app.snapshot import MatchClientSnapshot
 from civ4_turn_relay.domain import MatchConfig
 from civ4_turn_relay.local import FakeClock, LocalStore
 from civ4_turn_relay.process import FakeProcessSupervisor
@@ -109,7 +110,7 @@ def test_open_match_reconciles_immediately(
         *,
         now_utc: str | None = None,
         auto_handoff_operation_id: str | None = None,
-    ):
+    ) -> MatchClientSnapshot:
         calls.append(game_id)
         return original_tick(
             game_id,
