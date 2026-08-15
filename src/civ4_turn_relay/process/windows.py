@@ -36,7 +36,10 @@ from civ4_turn_relay.process.guard import (
     launch_guard_name,
     normalize_windows_executable,
 )
-from civ4_turn_relay.process.launch_config import CivLaunchCommand
+from civ4_turn_relay.process.launch_config import (
+    CivLaunchCommand,
+    render_legacy_civ4_command_line,
+)
 from civ4_turn_relay.process.port import (
     CloseRequestOutcome,
     CloseRequestResult,
@@ -187,14 +190,19 @@ class RealWindowsBackend:
         working_directory: str | None,
         environment: tuple[tuple[str, str], ...] = (),
     ) -> int:
-        # An argv list, never a shell.
+        # Civ IV reads the raw Windows command line. It needs the /fxsload
+        # value to retain its own quotes after the equals sign. This remains
+        # a direct CreateProcess launch: never a command shell.
         child_environment = os.environ.copy()
         child_environment.update(dict(environment))
+        command_line = render_legacy_civ4_command_line(argv)
         process = subprocess.Popen(
-            list(argv),
+            command_line,
+            executable=argv[0],
             cwd=working_directory,
             close_fds=True,
             env=child_environment,
+            shell=False,
         )
         return process.pid
 
