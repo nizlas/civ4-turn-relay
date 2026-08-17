@@ -192,7 +192,6 @@ def _close_target(
 
 def decide_intents(
     turn_handling_mode: TurnHandlingMode,
-    allow_force_close_after_commit: bool,
     state: OperationalState,
     records: MatchLocalRecords,
     detection: DetectionResult | None,
@@ -201,8 +200,6 @@ def decide_intents(
     user_requested_start: bool,
 ) -> tuple[OrchestrationIntent, ...]:
     """Return orchestration intents without performing side effects."""
-    del allow_force_close_after_commit  # never creates terminate intents
-
     intents: list[OrchestrationIntent] = []
     matched_running = _matched_running_process(records, process_observation)
 
@@ -226,7 +223,7 @@ def decide_intents(
         ):
             intents.append(
                 OrchestrationIntent(
-                    OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE,
+                    OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT,
                     payload={
                         "pid": close_target.pid,
                         "process_start_time_utc": close_target.process_start_time_utc,

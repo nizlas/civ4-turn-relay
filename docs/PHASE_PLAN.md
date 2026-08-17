@@ -429,7 +429,7 @@ P3 complete.
 - Per-match durable store (sequence/hash, incoming path, baseline, journal, processed outgoings, launch-attempt/process-association records)
 - Reconcile → local operational states ([§6](DESIGN_SPEC.md#6-local-operational-states))
 - Baseline record before “launch” command boundary (launch itself stubbed/fake process handle)
-- Pure managed-mode orchestration/intents for `turn_handling_mode` / `allow_force_close_after_commit` ([DESIGN_SPEC §8.5](DESIGN_SPEC.md#85-turn-handling-modes)): duplicate-launch suppression, auto-send trigger when safe, and close intent only after committed/idempotent evidence — **no real process calls**
+- Pure managed-mode orchestration/intents for `turn_handling_mode` ([DESIGN_SPEC §8.5](DESIGN_SPEC.md#85-turn-handling-modes)): duplicate-launch suppression, auto-send trigger when safe, and close intent only after committed/idempotent evidence — **no real process calls**
 - Outgoing detection rules; multi-candidate error; missing baseline disables auto-send
 - Watchdog adapter behind a port + polling fallback
 - Multi-match local config selection isolation (FR-011 foundation)
@@ -627,6 +627,18 @@ evidence is still pending. The manual smoke-test checklist lives in
 [`DESKTOP_CLIENT.md`](DESKTOP_CLIENT.md). P7 remains the sole ACTIVE phase
 until that checklist is performed and its results recorded here.
 
+Implementation note (2026-08-15): the manual two-profile test proved that
+Civ IV always shows a modal PBEM confirmation after Next Turn, which blocks
+WM_CLOSE; a graceful close can therefore never complete a Fully Managed
+handoff. The post-commit close is now a direct termination of the exactly
+re-verified Relay-owned process (durable entitlement + fresh probe
+immediately before acting), at most once per handoff operation per session,
+with restart recovery re-attempting once against the re-verified identity.
+The graceful-close deadline, force-close eligibility statuses, and the
+`allow_force_close_after_commit` opt-in are removed; legacy configs
+containing that key load safely and drop it. Standard mode is unchanged and
+never closes Civ automatically. See [DESIGN_SPEC §8.5](DESIGN_SPEC.md#85-turn-handling-modes).
+
 Implementation note (2026-08-12): every Civ launch now runs as one guarded
 launch at the process boundary — an OS-backed interprocess guard (Windows
 named mutex derived from a SHA-256 digest of the normalized executable path)
@@ -676,7 +688,7 @@ P6 complete.
 - Already-running / unrelated process warnings and protection
 - Wire launch to baseline recording and durable process-association evidence from P4
 - Real Windows launch; PID / precise-creation-token / executable verification
-- Graceful close request, 15s wait, and optional post-commit forced termination when `allow_force_close_after_commit` is enabled
+- Fully managed post-commit close: direct termination of the exactly re-verified Relay-owned process after commit/idempotent-ack proof (no graceful-close deadline; see [DESIGN_SPEC §8.5](DESIGN_SPEC.md#85-turn-handling-modes))
 - BTS/AdvCiv verification paths; never close an unrelated/manually launched process by executable name alone
 - Defer auto-launch when no interactive/unlocked desktop is available
 
@@ -694,7 +706,7 @@ P6 complete.
 
 - Unit tests with fake process supervisor (no real Civ binary required in CI)
 - FR-010 state transitions with fake process exit
-- FR-015 process-identity verification, graceful-close timeout path, and force-close only after commit proof (fake supervisor)
+- FR-015 process-identity verification and direct post-commit termination only after commit proof (fake supervisor)
 
 ### Applicable PT IDs
 
@@ -703,7 +715,7 @@ None new; supports PT-22 behavior with real process optional manually.
 ### Manual verification
 
 - On a Windows machine with BTS/AdvCiv: launch mod+save, confirm load; exit without Next Turn → correct relay state
-- Fully managed: one auto-launch, auto-send after Next Turn, graceful close after proven commit; unrelated Civ left alone
+- Fully managed: one auto-launch, auto-send after Next Turn, automatic close (direct termination) after proven commit; unrelated Civ left alone
 - Record resolved CLI in phase close-out notes / code comments without copying prior PBEM manager
 
 ### Exit criteria
@@ -726,8 +738,8 @@ None new; supports PT-22 behavior with real process optional manually.
 Implementation note (2026-08-11): the PySide6 desktop client (`civ4_turn_relay/
 ui/`), worker/controller threading, tray integration, settings and match
 editors, and the required automated UI tests (headless offscreen, pytest-qt)
-are implemented and passing, including redaction, mode-selector/force-close
-consent, and close-failure-is-not-protocol-failure presentation. P8's
+are implemented and passing, including redaction, the mode selector, and
+close-failure-is-not-protocol-failure presentation. P8's
 prerequisite is "P7 complete", so this phase cannot be marked COMPLETE until
 the P7 manual Windows smoke test is performed. P7 stays the sole ACTIVE phase.
 
@@ -765,7 +777,7 @@ P7 complete.
 
 - Main window per §7; primary button table; DIN TUR / YOUR TURN
 - Global settings + per-match editors (no server settings duplicated per match)
-- Turn handling mode selector (`standard` / `fully_managed`); advanced force-close consent with warning when Fully managed
+- Turn handling mode selector (`standard` / `fully_managed`) with truthful Fully managed close-policy text (the force-close consent is retired)
 - Statuses that distinguish committed turn from Civ-still-open; Start/Resume/Focus/Close fallbacks
 - Diagnostics export redaction
 - Explicit repair previews (abandoned lock, incomplete init)
@@ -787,7 +799,7 @@ P7 complete.
 - UI tests: state presentation; buttons invoke commands only; no direct storage/protocol mutation from widgets
 - Redaction tests on diagnostics export (FR-012)
 - Repair confirmation required for foreign lock removal (FR-014)
-- Mode selector / force-close consent presentation; close-failure status does not imply protocol failure (FR-015 UX)
+- Mode selector presentation; close-failure status does not imply protocol failure (FR-015 UX)
 
 ### Applicable PT IDs
 
@@ -797,7 +809,7 @@ None exclusively; exercises PT-11 / PT-23 paths via UI commands.
 
 - Walk examples in [`DESIGN_SPEC` §7.2](DESIGN_SPEC.md#72-examples)
 - Confirm errors include safety/retry/next-step fields (§7.4)
-- Fully managed: mode + force-close warning; Focus/Close when Civ remains after commit
+- Fully managed: mode + close-policy text; Focus/Close when Civ remains after commit
 
 ### Exit criteria
 

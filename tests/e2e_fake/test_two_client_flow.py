@@ -218,7 +218,6 @@ def test_fully_managed_auto_launch_and_close(tmp_path: Path) -> None:
     config = match_config(
         root,
         mode=TurnHandlingMode.FULLY_MANAGED,
-        allow_force_close=True,
     )
     client.initialize_or_join(
         config, operation_id="66666666-6666-4666-8666-666666666666"
@@ -254,7 +253,7 @@ def test_fully_managed_auto_launch_and_close(tmp_path: Path) -> None:
     close_intents = [
         intent
         for intent in snap.intents
-        if intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+        if intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
     ]
     assert len(close_intents) == 1
     close_payload = close_intents[0].payload
@@ -268,13 +267,13 @@ def test_fully_managed_auto_launch_and_close(tmp_path: Path) -> None:
     # Close is not re-emitted after acknowledgment; mismatched PID never closes.
     again = client.reconcile(GAME_ID)
     assert not any(
-        intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+        intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
         for intent in again.intents
     )
     client.set_process_observation(GAME_ID, running_process(9999))
     stale = client.reconcile(GAME_ID)
     assert not any(
-        intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+        intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
         for intent in stale.intents
     )
 
@@ -464,7 +463,7 @@ def test_standard_never_emits_close_or_auto_launch(tmp_path: Path) -> None:
     client.set_process_observation(GAME_ID, running_process())
     after = client.reconcile(GAME_ID)
     assert not any(
-        intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+        intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
         for intent in after.intents
     )
 

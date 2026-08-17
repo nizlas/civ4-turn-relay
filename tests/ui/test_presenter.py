@@ -58,18 +58,23 @@ def test_waiting_close_requested_detail() -> None:
     assert vm.secondary_actions == ()
 
 
-@pytest.mark.parametrize(
-    "status",
-    [ProcessStatus.CLOSE_DEADLINE_ELAPSED, ProcessStatus.FORCE_CLOSE_ELIGIBLE],
-)
-def test_waiting_close_not_done_offers_focus_and_close(
-    status: ProcessStatus,
-) -> None:
+def test_waiting_closing_after_commit_shows_transient_status() -> None:
+    """The direct post-commit termination is announced truthfully while the
+    process is still being probed; never claimed closed prematurely."""
     vm = build_view_model(
         client_snapshot(OperationalState.WAITING_FOR_OTHER_PLAYER),
-        process_snapshot(status),
+        process_snapshot(ProcessStatus.CLOSING_AFTER_COMMIT),
     )
-    assert vm.detail_text == "Turn safely sent, but Civilization did not close."
+    assert vm.detail_text == "Turn safely sent — closing Civilization…"
+    assert vm.secondary_actions == ()
+
+
+def test_waiting_close_failed_offers_focus_and_close() -> None:
+    vm = build_view_model(
+        client_snapshot(OperationalState.WAITING_FOR_OTHER_PLAYER),
+        process_snapshot(ProcessStatus.CLOSE_FAILED),
+    )
+    assert vm.detail_text == "Turn safely sent, but Civilization could not be closed."
     assert vm.secondary_actions == (
         SecondaryActionKind.FOCUS_CIV,
         SecondaryActionKind.CLOSE_CIV,

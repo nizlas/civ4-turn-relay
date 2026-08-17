@@ -10,7 +10,6 @@ from __future__ import annotations
 from collections.abc import Collection
 
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -44,10 +43,10 @@ _FIRST_TURN_TEXT = (
     "and send it. Relay cannot generate a Civ save."
 )
 
-_FORCE_CLOSE_WARNING = (
-    "Advanced: allow Relay to force-close Civilization, only after a turn "
-    "was safely committed and only when a graceful close did not work. "
-    "Disabled by default."
+_MANAGED_CLOSE_POLICY = (
+    "Fully managed: Relay starts Civilization for your turn and, once your "
+    "sent turn is verified on the server, automatically closes the exact "
+    "Civilization process it launched. Standard never closes Civilization."
 )
 
 
@@ -137,18 +136,9 @@ class MatchEditDialog(QDialog):
         mode_row.addStretch(1)
         form.addRow("Turn handling", mode_row)
 
-        self.force_close_checkbox = QCheckBox(
-            "Allow force close after a committed turn", self
-        )
-        self.force_close_checkbox.setChecked(False)
-        self.force_close_checkbox.setEnabled(False)
-        form.addRow("", self.force_close_checkbox)
-        warning = QLabel(_FORCE_CLOSE_WARNING, self)
-        warning.setWordWrap(True)
-        form.addRow("", warning)
-
-        self.standard_radio.toggled.connect(self._on_mode_changed)
-        self.managed_radio.toggled.connect(self._on_mode_changed)
+        self.close_policy_label = QLabel(_MANAGED_CLOSE_POLICY, self)
+        self.close_policy_label.setWordWrap(True)
+        form.addRow("", self.close_policy_label)
 
         layout.addLayout(form)
 
@@ -180,7 +170,6 @@ class MatchEditDialog(QDialog):
             self.managed_radio.setChecked(True)
         else:
             self.standard_radio.setChecked(True)
-        self.force_close_checkbox.setChecked(config.allow_force_close_after_commit)
         self._select_local_player(config.local_player_id)
 
     def _select_local_player(self, player_id: str) -> None:
@@ -214,12 +203,6 @@ class MatchEditDialog(QDialog):
             )
         else:
             self.first_turn_label.setText(_FIRST_TURN_TEXT)
-
-    def _on_mode_changed(self) -> None:
-        managed = self.managed_radio.isChecked()
-        self.force_close_checkbox.setEnabled(managed)
-        if not managed:
-            self.force_close_checkbox.setChecked(False)
 
     def _on_browse(self) -> None:
         directory = QFileDialog.getExistingDirectory(
@@ -257,7 +240,6 @@ class MatchEditDialog(QDialog):
                     filename_glob=self.glob_edit.text().strip() or _DEFAULT_GLOB
                 ),
                 turn_handling_mode=self.selected_mode(),
-                allow_force_close_after_commit=(self.force_close_checkbox.isChecked()),
             )
         except DomainValidationError as error:
             QMessageBox.warning(self, "Invalid match configuration", str(error))

@@ -8,10 +8,11 @@ alone is never treated as evidence.
 
 Restart recovery: all durable process state lives in the match records
 (``launch_attempt``, ``process_association``, ``pending_post_commit_close``).
-The graceful-close deadline epoch is deliberately not durable (timers are
-not authoritative): when a persisted close request is found after a Relay
-restart and the exact entitled process still runs, the 15-second deadline
-is re-armed once from the current clock.
+The Fully Managed post-commit close terminates the exact entitled process
+directly (Civ's modal PBEM confirmation blocks a graceful close); the
+at-most-once guard for that termination is deliberately session-local, so a
+Relay restart after a committed handoff allows exactly one fresh attempt
+against the re-verified entitled identity.
 """
 
 from __future__ import annotations
@@ -36,11 +37,10 @@ from civ4_turn_relay.process import (
     ProcessIdentity,
     ProcessSupervisor,
     SupervisorAvailability,
+    TerminateOutcome,
     TerminateResult,
     normalize_windows_executable,
 )
-
-GRACEFUL_CLOSE_DEADLINE_SECONDS: float = 15.0
 
 
 @unique
@@ -55,9 +55,9 @@ class ProcessStatus(Enum):
     WAITING_FOR_LAUNCH_GUARD = "waiting_for_launch_guard"
     LAUNCH_SCAN_INDETERMINATE = "launch_scan_indeterminate"
     CLOSE_REQUESTED = "close_requested"
-    CLOSE_DEADLINE_ELAPSED = "close_deadline_elapsed"
+    CLOSING_AFTER_COMMIT = "closing_after_commit"
+    CLOSE_FAILED = "close_failed"
     SAFELY_CLOSED = "safely_closed"
-    FORCE_CLOSE_ELIGIBLE = "force_close_eligible"
     LAUNCH_FAILED = "launch_failed"
 
 
@@ -69,8 +69,6 @@ class ProcessStatusSnapshot:
     message: str = ""
     identity: ProcessIdentity | None = None
     launch_blocked_reason: str | None = None
-    force_close_allowed: bool = False
-    close_deadline_remaining_seconds: float | None = None
     cleanup_warning: str | None = None
 
 
@@ -122,12 +120,12 @@ def close_payload_matches_record(
 class ProcessCoordinator:
     """Per-match runtime state and guarded operations over the supervisor.
 
-    Session state (in-flight launch guard, close deadline, force-close
-    attempt flag, remembered identity mismatches) lives here; durable state
-    stays in the match records. Every operation that could touch a process
-    re-verifies the exact identity through :meth:`probe` first and, for
-    force termination, against the durable post-commit entitlement supplied
-    by the caller.
+    Session state (in-flight launch guard, close progress, the at-most-once
+    post-commit termination guard, remembered identity mismatches) lives
+    here; durable state stays in the match records. Every operation that
+    could touch a process re-verifies the exact identity through
+    :meth:`probe` first and, for post-commit termination, against the
+    durable entitlement supplied by the caller.
     """
 
     def __init__(
@@ -153,8 +151,9 @@ class ProcessCoordinator:
         self._mismatch_message: str | None = None
         self._close_identity: ProcessIdentity | None = None
         self._close_operation_id: str | None = None
-        self._close_deadline: float | None = None
-        self._force_close_attempted = False
+        self._closing_after_commit = False
+        self._close_failure_message: str | None = None
+        self._terminate_acted_operation_id: str | None = None
         self._safely_closed = False
         self._cleanup_warning: str | None = None
 
@@ -238,8 +237,8 @@ class ProcessCoordinator:
             self._launch_deferred_outcome = None
             self._launch_deferred_message = None
             self._close_identity = None
-            self._close_deadline = None
-            self._force_close_attempted = False
+            self._closing_after_commit = False
+            self._close_failure_message = None
             self._safely_closed = False
         elif result.deferred:
             self._launch_deferred_outcome = result.outcome
@@ -273,9 +272,10 @@ class ProcessCoordinator:
     ) -> CloseRequestResult | None:
         """Request a verified graceful close; ``None`` means refused locally.
 
-        Refusals: the operation was already acted on (unless
-        ``allow_repeat``), the identity is a remembered mismatch, or a
-        fresh probe did not return an exact running match.
+        This is the manual, user-initiated close path (Standard mode keeps
+        graceful semantics). Refusals: the operation was already acted on
+        (unless ``allow_repeat``), the identity is a remembered mismatch,
+        or a fresh probe did not return an exact running match.
         """
         if not allow_repeat and operation_id == self._close_operation_id:
             return None
@@ -288,70 +288,93 @@ class ProcessCoordinator:
         if result.outcome is CloseRequestOutcome.REQUESTED:
             self._close_identity = identity
             self._close_operation_id = operation_id
-            self._close_deadline = self._clock.now() + GRACEFUL_CLOSE_DEADLINE_SECONDS
-            self._force_close_attempted = False
+            self._closing_after_commit = False
+            self._close_failure_message = None
             self._safely_closed = False
         return result
 
-    def rearm_close_after_restart(self, pending: PostCommitCloseRecord) -> None:
-        """Re-arm the graceful deadline once for a persisted close request.
-
-        The deadline epoch is not durable; after a Relay restart the
-        15-second window restarts from the current clock (recorded design
-        choice — timers are never authoritative). No second WM_CLOSE is
-        sent; only tracking resumes.
-        """
-        if pending.operation_id == self._close_operation_id:
-            return
-        self._close_identity = identity_from_close_record(pending)
-        self._close_operation_id = pending.operation_id
-        self._close_deadline = self._clock.now() + GRACEFUL_CLOSE_DEADLINE_SECONDS
-        self._force_close_attempted = False
-        self._safely_closed = False
-
-    def close_deadline_elapsed(self) -> bool:
-        return (
-            self._close_deadline is not None
-            and self._clock.now() >= self._close_deadline
-        )
-
     def note_safely_closed(self) -> None:
-        """Record that the entitled process exited after the close request."""
+        """Record that the entitled process exited after the close action."""
         self._safely_closed = True
-        self._close_deadline = None
+        self._close_failure_message = None
         self._session_running = False
 
     def drop_close_attempt(self, message: str) -> None:
         """Abandon the close attempt after an identity mismatch."""
         self._close_identity = None
-        self._close_deadline = None
+        self._closing_after_commit = False
+        self._close_failure_message = None
         self._mismatch_message = message
 
-    def terminate_entitled(
-        self, identity: ProcessIdentity, pending: PostCommitCloseRecord
+    def terminate_after_commit(
+        self,
+        identity: ProcessIdentity,
+        pending: PostCommitCloseRecord,
+        *,
+        user_requested: bool = False,
     ) -> TerminateResult | None:
-        """Force-terminate at most once, after full re-verification.
+        """Directly terminate the exact entitled process after a handoff.
 
-        Requires: no prior attempt, elapsed graceful deadline, a persisted
-        close request whose operation matches the one acted on, an exact
-        identity match against the durable entitlement, and a fresh probe
-        returning ``RUNNING_MATCH``. ``None`` means refused locally.
+        Verified handoff first, then direct termination: the caller supplies
+        the durable post-commit entitlement (written only for COMMITTED or
+        exactly attributed IDEMPOTENT_ACK evidence). No graceful close is
+        attempted and there is no waiting period — Civ's modal PBEM
+        confirmation blocks WM_CLOSE, so a normal close can never succeed.
+
+        Safety: the identity must match the entitlement exactly (pid,
+        precise creation token, normalized executable path) and a fresh
+        probe immediately before the call must return ``RUNNING_MATCH``.
+        The termination fires at most once per operation per session unless
+        ``user_requested`` explicitly retries. ``None`` means refused
+        locally without touching any process.
         """
-        if self._force_close_attempted or not self.close_deadline_elapsed():
-            return None
-        if not pending.close_requested:
-            return None
-        if pending.operation_id != self._close_operation_id:
+        if (
+            not user_requested
+            and pending.operation_id == self._terminate_acted_operation_id
+        ):
             return None
         if not identity_matches_close_record(identity, pending):
             return None
         if self.is_mismatched(identity):
             return None
         probe = self.probe(identity)
+        if probe.outcome is ProbeOutcome.NOT_RUNNING:
+            # The entitled process is already gone: the close is complete
+            # without any termination call.
+            self._close_identity = identity
+            self._close_operation_id = pending.operation_id
+            self._closing_after_commit = True
+            self.note_safely_closed()
+            return TerminateResult(outcome=TerminateOutcome.NOT_RUNNING)
+        if probe.outcome is ProbeOutcome.RUNNING_MISMATCH:
+            self.drop_close_attempt(probe.message or "identity could not be verified")
+            return TerminateResult(
+                outcome=TerminateOutcome.IDENTITY_MISMATCH, message=probe.message
+            )
         if probe.outcome is not ProbeOutcome.RUNNING_MATCH:
-            return None
-        self._force_close_attempted = True
-        return self._supervisor.terminate(identity)
+            return TerminateResult(
+                outcome=TerminateOutcome.ADAPTER_UNAVAILABLE, message=probe.message
+            )
+        self._terminate_acted_operation_id = pending.operation_id
+        self._close_identity = identity
+        self._close_operation_id = pending.operation_id
+        self._closing_after_commit = True
+        self._close_failure_message = None
+        self._safely_closed = False
+        result = self._supervisor.terminate(identity)
+        if result.outcome is TerminateOutcome.TERMINATED:
+            # Never claim closed on the terminate result alone; only a
+            # probe that no longer finds the process confirms the close.
+            verify = self.probe(identity)
+            if verify.outcome is ProbeOutcome.NOT_RUNNING:
+                self.note_safely_closed()
+        elif result.outcome is TerminateOutcome.NOT_RUNNING:
+            self.note_safely_closed()
+        elif result.outcome is TerminateOutcome.IDENTITY_MISMATCH:
+            self.drop_close_attempt(result.message or "identity could not be verified")
+        else:
+            self._close_failure_message = result.message or result.outcome.value
+        return result
 
     def focus(self, identity: ProcessIdentity) -> FocusResult:
         """Focus after probe verification; never touches a mismatched pid."""
@@ -374,50 +397,38 @@ class ProcessCoordinator:
         return self._supervisor.focus(identity)
 
     def status_snapshot(
-        self,
-        *,
-        association: ProcessIdentity | None,
-        force_close_allowed: bool,
+        self, *, association: ProcessIdentity | None
     ) -> ProcessStatusSnapshot:
         """Compute the typed status; probes here are read-only fact checks."""
-        snapshot = self._status_snapshot(
-            association=association, force_close_allowed=force_close_allowed
-        )
+        snapshot = self._status_snapshot(association=association)
         if self._cleanup_warning:
             return replace(snapshot, cleanup_warning=self._cleanup_warning)
         return snapshot
 
     def _status_snapshot(
-        self,
-        *,
-        association: ProcessIdentity | None,
-        force_close_allowed: bool,
+        self, *, association: ProcessIdentity | None
     ) -> ProcessStatusSnapshot:
         availability = self._supervisor.availability()
         if not availability.available:
             return ProcessStatusSnapshot(
                 status=ProcessStatus.UNAVAILABLE,
                 message=availability.reason,
-                force_close_allowed=force_close_allowed,
             )
         if self._launch_blocked_reason is not None:
             return ProcessStatusSnapshot(
                 status=ProcessStatus.LAUNCH_FAILED,
                 message="Civilization was not launched",
                 launch_blocked_reason=self._launch_blocked_reason,
-                force_close_allowed=force_close_allowed,
             )
         if self._launch_failure_message is not None:
             return ProcessStatusSnapshot(
                 status=ProcessStatus.LAUNCH_FAILED,
                 message=self._launch_failure_message,
-                force_close_allowed=force_close_allowed,
             )
         if self._launch_in_flight:
             return ProcessStatusSnapshot(
                 status=ProcessStatus.STARTING,
                 message="launching Civilization",
-                force_close_allowed=force_close_allowed,
             )
         if self._launch_deferred_outcome is GuardedLaunchOutcome.EXISTING_CIV_DETECTED:
             return ProcessStatusSnapshot(
@@ -426,7 +437,6 @@ class ProcessCoordinator:
                     self._launch_deferred_message
                     or "Your turn is ready — waiting for Civilization to close."
                 ),
-                force_close_allowed=force_close_allowed,
             )
         if self._launch_deferred_outcome is GuardedLaunchOutcome.GUARD_BUSY:
             return ProcessStatusSnapshot(
@@ -438,7 +448,6 @@ class ProcessCoordinator:
                         "launching Civilization"
                     )
                 ),
-                force_close_allowed=force_close_allowed,
             )
         if self._launch_deferred_outcome is GuardedLaunchOutcome.SCAN_INDETERMINATE:
             return ProcessStatusSnapshot(
@@ -450,21 +459,13 @@ class ProcessCoordinator:
                         "is already running"
                     )
                 ),
-                force_close_allowed=force_close_allowed,
             )
-        if (
-            self._close_identity is not None
-            and self._close_deadline is not None
-            and not self._safely_closed
-        ):
-            return self._close_status(
-                self._close_identity, self._close_deadline, force_close_allowed
-            )
+        if self._close_identity is not None and not self._safely_closed:
+            return self._close_status(self._close_identity)
         if self._safely_closed:
             return ProcessStatusSnapshot(
                 status=ProcessStatus.SAFELY_CLOSED,
                 message="Civilization closed after the committed turn",
-                force_close_allowed=force_close_allowed,
             )
         identity = association if association is not None else self._session_identity
         if identity is not None and not self.is_mismatched(identity):
@@ -474,7 +475,6 @@ class ProcessCoordinator:
                     status=ProcessStatus.RUNNING,
                     message="Civilization is running",
                     identity=identity,
-                    force_close_allowed=force_close_allowed,
                 )
             if probe.outcome in {
                 ProbeOutcome.ADAPTER_UNAVAILABLE,
@@ -483,7 +483,6 @@ class ProcessCoordinator:
                 return ProcessStatusSnapshot(
                     status=ProcessStatus.UNAVAILABLE,
                     message=probe.message or "the process adapter is unavailable",
-                    force_close_allowed=force_close_allowed,
                 )
         message = "ready to launch Civilization"
         if identity is not None and self.is_mismatched(identity):
@@ -494,15 +493,9 @@ class ProcessCoordinator:
         return ProcessStatusSnapshot(
             status=ProcessStatus.READY,
             message=message,
-            force_close_allowed=force_close_allowed,
         )
 
-    def _close_status(
-        self,
-        identity: ProcessIdentity,
-        deadline: float,
-        force_close_allowed: bool,
-    ) -> ProcessStatusSnapshot:
+    def _close_status(self, identity: ProcessIdentity) -> ProcessStatusSnapshot:
         probe = self.probe(identity)
         if probe.outcome is ProbeOutcome.NOT_RUNNING:
             self.note_safely_closed()
@@ -510,7 +503,6 @@ class ProcessCoordinator:
                 status=ProcessStatus.SAFELY_CLOSED,
                 message="Civilization closed after the committed turn",
                 identity=identity,
-                force_close_allowed=force_close_allowed,
             )
         if probe.outcome is ProbeOutcome.RUNNING_MISMATCH:
             self.drop_close_attempt(probe.message or "identity could not be verified")
@@ -520,41 +512,29 @@ class ProcessCoordinator:
                     "the Relay-launched process is no longer running; another "
                     "process reuses its pid and will never be touched"
                 ),
-                force_close_allowed=force_close_allowed,
             )
         if probe.outcome is not ProbeOutcome.RUNNING_MATCH:
             return ProcessStatusSnapshot(
                 status=ProcessStatus.UNAVAILABLE,
                 message=probe.message or "the process adapter is unavailable",
-                force_close_allowed=force_close_allowed,
             )
-        remaining = max(0.0, deadline - self._clock.now())
-        if remaining > 0.0:
+        if self._close_failure_message is not None:
             return ProcessStatusSnapshot(
-                status=ProcessStatus.CLOSE_REQUESTED,
-                message="waiting for Civilization to close the committed turn",
-                identity=identity,
-                force_close_allowed=force_close_allowed,
-                close_deadline_remaining_seconds=remaining,
-            )
-        if force_close_allowed:
-            return ProcessStatusSnapshot(
-                status=ProcessStatus.FORCE_CLOSE_ELIGIBLE,
+                status=ProcessStatus.CLOSE_FAILED,
                 message=(
-                    "Civilization did not close within the graceful deadline; "
-                    "force close is permitted for this match"
+                    "the turn is safely sent, but Civilization could not be "
+                    f"closed: {self._close_failure_message}"
                 ),
                 identity=identity,
-                force_close_allowed=True,
-                close_deadline_remaining_seconds=0.0,
+            )
+        if self._closing_after_commit:
+            return ProcessStatusSnapshot(
+                status=ProcessStatus.CLOSING_AFTER_COMMIT,
+                message="the turn is safely sent — closing Civilization",
+                identity=identity,
             )
         return ProcessStatusSnapshot(
-            status=ProcessStatus.CLOSE_DEADLINE_ELAPSED,
-            message=(
-                "Civilization did not close within the graceful deadline; "
-                "close it manually when convenient"
-            ),
+            status=ProcessStatus.CLOSE_REQUESTED,
+            message="waiting for Civilization to close the committed turn",
             identity=identity,
-            force_close_allowed=False,
-            close_deadline_remaining_seconds=0.0,
         )

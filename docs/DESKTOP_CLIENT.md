@@ -14,7 +14,7 @@ The per-match **Turn handling** setting selects how much of the local lifecycle 
 |----------|--------------------|---------------|
 | Who starts Civilization | You, via Relay's primary button | Relay, automatically — exactly once per accepted turn |
 | Who sends the outgoing save | Relay auto-sends when safe; manual **Send** otherwise | Relay, automatically |
-| Does Relay ever close Civilization | Never | Yes — graceful close of the exact Relay-launched process, only after the turn is authoritatively committed |
+| Does Relay ever close Civilization | Never | Yes — direct termination of the exact Relay-launched process, only after the turn is authoritatively committed |
 | What requires clicks | Start each turn; occasionally confirm a send | Normally nothing — you just play and press Next Turn |
 
 Fully managed mode only works while Relay stays running, so keep it in the system tray between turns (see [Tray and background behavior](#tray-and-background-behavior)). Neither mode weakens the authority model: only the manifest commit algorithm advances a turn ([`DESIGN_SPEC.md` §8.5](DESIGN_SPEC.md#85-turn-handling-modes)).
@@ -28,7 +28,7 @@ Civilization IV has no in-game cloud turn support: every PBEM turn is a save fil
 3. Relay records a durable play-session baseline and launches Civilization directly into the verified save with the configured mod (see [Direct save loading](#direct-save-loading-fxsload-prerequisites-and-dry-run)).
 4. You play the turn and press **Next Turn** inside Civilization.
 5. Relay detects the new outgoing save, waits until it is stable, verifies it, uploads it, and atomically commits the handoff.
-6. Only after the commit is authoritatively proven does Relay request a graceful close of the exact Civilization process it launched (fully managed only).
+6. Only after the commit is authoritatively proven does Relay close the exact Civilization process it launched (fully managed only). The close is a direct termination: after Next Turn, Civilization shows a modal "save has been placed in your PBEM folder" dialog that blocks a normal window close, and the already committed handoff makes that dialog irrelevant — no click is needed.
 7. Relay returns to waiting for the next player.
 
 Standard mode runs the same pipeline, except you press the primary button to launch Civilization and Relay never closes it.
@@ -38,7 +38,7 @@ Standard mode runs the same pipeline, except you press the primary button to lau
 Configuration is split in two places; each fact lives in exactly one of them ([`DESIGN_SPEC.md` §4](DESIGN_SPEC.md#4-configuration-model)):
 
 - **Global `.env`** — server and installation settings shared by all matches: SFTP host/port/username/remote root, authentication (password and/or private key), mandatory host-key trust (`known_hosts` file or `SHA256:` fingerprint pin), poll interval, log level, the Civilization executable path (`CIV4_RELAY_CIV4_EXECUTABLE`), and—on Steam—the Steam app id and client path. Placeholder shape: [`.env.example`](../.env.example); adapter details: [`SFTP_ADAPTER.md`](SFTP_ADAPTER.md).
-- **Per-match settings** (Match ▸ Add/Edit match in the UI) — game ID, display name, ordered human players and which one is you, PBEM save folder and filename pattern, mod name (default `AdvCiv`), turn handling mode, and the advanced force-close opt-in.
+- **Per-match settings** (Match ▸ Add/Edit match in the UI) — game ID, display name, ordered human players and which one is you, PBEM save folder and filename pattern, mod name (default `AdvCiv`), and turn handling mode.
 
 First-run setup:
 
@@ -83,13 +83,13 @@ To inspect the command without launching, call `RelayClient.launch_preview(game_
 - Process identity is always the triple **PID + precise process creation token (`process_create_time_ns`, the high-resolution creation time reported by the process backend) + normalized executable path**. A human-readable second-resolution UTC start timestamp is kept for diagnostics but is never the equality check, so even a PID recycled within the same wall-clock second is detected as a different process. Relay never acts on a PID alone.
 - Relay never attaches to, focuses, or closes a manually launched Civilization process — only the exact process it launched and verified.
 - Before every launch, an OS-backed cross-instance guard defers the launch while any Civilization of the configured executable is still running anywhere on the computer — see [Cross-instance launch guard](#cross-instance-launch-guard-one-civilization-per-computer).
-- A graceful close (a normal Windows close request) is issued only after the turn is authoritatively committed on the server, or a retry is proven to be an idempotent acknowledgement.
-- After requesting a close, Relay waits 15 seconds. If Civilization is still open it shows **"Turn safely sent, but Civilization did not close."** with manual **Focus** and **Close** fallback buttons.
-- Force close is an advanced per-match opt-in (default off), available only in fully managed mode, and fires at most once — only after the graceful deadline elapsed *and* the durable post-commit entitlement *and* the exact process identity are re-verified.
+- A close happens only after the turn is authoritatively committed on the server, or a retry is proven to be an idempotent acknowledgement — verified handoff first, then close.
+- The close is a direct termination of the Relay-owned process, fired at most once per handoff per Relay session and only after the durable post-commit entitlement (same game, operation, outgoing hash, and source sequence) *and* the exact process identity (PID + precise creation token + normalized executable path) are re-verified by a fresh probe immediately beforehand. There is no graceful close attempt and no waiting period: Civilization's own modal PBEM confirmation dialog blocks normal window closes.
+- While the close is in flight the status shows **"Turn safely sent — closing Civilization…"**; Civilization is reported closed only after probing confirms the process is gone. If termination fails while the process is still alive, Relay shows **"Turn safely sent, but Civilization could not be closed."** with manual **Focus** and **Close** fallback buttons.
 - Standard mode never closes Civilization automatically, ever.
-- A process failure (close refused, deadline elapsed, Relay restart) never changes or rolls back an already committed turn.
+- A process failure (termination refused or failed, Relay restart) never changes or rolls back an already committed turn.
 
-Normative closing policy and force-close rules: [`DESIGN_SPEC.md` §8.5](DESIGN_SPEC.md#85-turn-handling-modes).
+Normative closing policy: [`DESIGN_SPEC.md` §8.5](DESIGN_SPEC.md#85-turn-handling-modes).
 
 ## Cross-instance launch guard (one Civilization per computer)
 
@@ -188,9 +188,9 @@ Completing this checklist on a real Windows machine with a real Civilization IV:
 3. **Manually test launch into AdvCiv with a copied test save.** Press the match's primary Start button (or call `request_start`) and confirm Civilization starts, loads the Advanced Civ mod, and opens the save directly without visiting the multiplayer menus. This step is what empirically confirms the `/fxsload` and `mod=<mod folder>` flag behavior.
 4. **Confirm Relay records the exact process identity.** After the launch, `RelayClient.process_status(game_id)` must report `RUNNING` with the identity (PID, precise creation token, executable path, plus the diagnostic UTC start timestamp), and the match's durable state must contain the matching process association — including `process_create_time_ns` — so identity survives a Relay restart.
 5. **Simulate/perform a completed test handoff.** End the turn in Civilization (or place a distinct valid save into the test folder) and confirm Relay detects a stable candidate, uploads it, and commits it against the disposable test server.
-6. **Confirm graceful close.** In a fully managed test match, after the commit the process status must move through `CLOSE_REQUESTED` ("waiting for Civilization to close") to `SAFELY_CLOSED`, with Civilization exiting via a normal window close — no forced termination.
-7. **Confirm no close occurs for a mismatched process.** Start Civilization manually (outside Relay) and verify Relay never focuses or closes it; a probe of a stale recorded identity must report a mismatch and the status must state that the mismatched process will not be touched.
-8. **Confirm force close remains disabled unless explicitly enabled.** With the opt-in checkbox off, let the 15-second graceful deadline elapse and verify the status shows "Turn safely sent, but Civilization did not close." with Focus/Close buttons and no termination; only with the advanced opt-in enabled may the status become force-close eligible.
+6. **Confirm the post-commit close.** In a fully managed test match, after the commit the process status must move through `CLOSING_AFTER_COMMIT` ("Turn safely sent — closing Civilization…") to `SAFELY_CLOSED`, with Civilization terminated while its PBEM confirmation dialog is still showing — no click on that dialog and no graceful close request.
+7. **Confirm no close occurs for a mismatched process.** Start Civilization manually (outside Relay) and verify Relay never focuses, closes, or terminates it; a probe of a stale recorded identity must report a mismatch and the status must state that the mismatched process will not be touched.
+8. **Confirm Standard mode never closes Civilization.** Run the same handoff in a standard-mode match and verify Civilization stays open after the commit with no termination and no close request.
 9. **Run the disposable OpenSSH integration tests on a Docker-capable machine before real-server use.** Run `pytest -m openssh_sftp` and confirm it passes; see [`SFTP_ADAPTER.md`](SFTP_ADAPTER.md) for the harness details.
 
 Record the outcome of each step (with notes for any deviation) when closing P7.

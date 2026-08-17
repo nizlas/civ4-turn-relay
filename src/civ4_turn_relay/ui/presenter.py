@@ -28,12 +28,7 @@ _ATTENTION_PENDING = frozenset(
     }
 )
 
-_CLOSE_NOT_DONE = frozenset(
-    {
-        ProcessStatus.CLOSE_DEADLINE_ELAPSED,
-        ProcessStatus.FORCE_CLOSE_ELIGIBLE,
-    }
-)
+_CLOSE_NOT_DONE = frozenset({ProcessStatus.CLOSE_FAILED})
 
 _DEFERRED_LAUNCH = frozenset(
     {
@@ -149,10 +144,14 @@ def _map_waiting_for_other(
     draft.status_text = f"Waiting for {who}"
     _disabled(draft, "Nothing needs to be done")
     if process is not None:
-        if process.status is ProcessStatus.CLOSE_REQUESTED:
+        if process.status is ProcessStatus.CLOSING_AFTER_COMMIT:
+            draft.detail_text = "Turn safely sent — closing Civilization…"
+        elif process.status is ProcessStatus.CLOSE_REQUESTED:
             draft.detail_text = "Turn safely sent — waiting for Civilization to close"
         elif process.status in _CLOSE_NOT_DONE:
-            draft.detail_text = "Turn safely sent, but Civilization did not close."
+            draft.detail_text = (
+                "Turn safely sent, but Civilization could not be closed."
+            )
             draft.secondary_actions = (
                 SecondaryActionKind.FOCUS_CIV,
                 SecondaryActionKind.CLOSE_CIV,

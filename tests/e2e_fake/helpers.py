@@ -45,7 +45,6 @@ def match_config(
     game_id: str = GAME_ID,
     local_player_id: str = "player_a",
     mode: TurnHandlingMode = TurnHandlingMode.STANDARD,
-    allow_force_close: bool = False,
     pbem_name: str = "pbem",
 ) -> MatchConfig:
     pbem = tmp_path / pbem_name
@@ -60,7 +59,6 @@ def match_config(
         pbem_save_directory=str(pbem.resolve()),
         save_matching=SaveMatchingRules(filename_glob=GLOB),
         turn_handling_mode=mode,
-        allow_force_close_after_commit=allow_force_close,
     )
 
 

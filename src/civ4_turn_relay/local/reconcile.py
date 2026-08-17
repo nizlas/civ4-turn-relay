@@ -373,7 +373,6 @@ def reconcile_match(
         )
         intents = decide_intents(
             config.turn_handling_mode,
-            config.allow_force_close_after_commit,
             state,
             records,
             None,
@@ -628,7 +627,6 @@ def reconcile_match(
 
     intents = decide_intents(
         config.turn_handling_mode,
-        config.allow_force_close_after_commit,
         state,
         records,
         detection,
@@ -639,7 +637,7 @@ def reconcile_match(
 
     # Persist close_requested once a close intent is emitted.
     if any(
-        intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+        intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
         for intent in intents
     ):
         pending = records.pending_post_commit_close

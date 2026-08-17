@@ -79,6 +79,10 @@ _MATCH_CONFIG_REQUIRED_KEYS = (
     "save_matching",
 )
 
+# ``allow_force_close_after_commit`` is a retired field: Fully managed now
+# always terminates the exact Relay-launched process after a verified
+# handoff. Persisted configs written by older versions may still contain the
+# key; it is parsed for type-compatibility and intentionally discarded.
 _MATCH_CONFIG_OPTIONAL_KEYS = (
     "allow_force_close_after_commit",
     "turn_handling_mode",
@@ -443,7 +447,6 @@ class MatchConfig:
     pbem_save_directory: str
     save_matching: SaveMatchingRules
     turn_handling_mode: TurnHandlingMode = TurnHandlingMode.STANDARD
-    allow_force_close_after_commit: bool = False
 
     def __post_init__(self) -> None:
         players = canonicalize_tuple(
@@ -491,19 +494,10 @@ class MatchConfig:
         validate_windows_local_path(
             self.pbem_save_directory, field_path="pbem_save_directory"
         )
-        if not isinstance(self.allow_force_close_after_commit, bool):
-            raise DomainValidationError(
-                "expected a boolean",
-                field_path="allow_force_close_after_commit",
-            )
-        # Meaningful only in Fully managed; STANDARD always stores false.
-        if turn_handling_mode is TurnHandlingMode.STANDARD:
-            object.__setattr__(self, "allow_force_close_after_commit", False)
 
     def to_mapping(self) -> dict[str, object]:
         """Return a primitive mapping of this per-match configuration."""
         return {
-            "allow_force_close_after_commit": self.allow_force_close_after_commit,
             "display_name": self.display_name,
             "game_id": self.game_id,
             "launch_profile": self.launch_profile,
@@ -540,6 +534,11 @@ class MatchConfig:
             )
         else:
             turn_handling_mode = TurnHandlingMode.STANDARD
+        # Backward-compatible migration: older configs persisted the retired
+        # force-close opt-in. Validate its shape, then drop it — the value no
+        # longer gates anything and is not re-serialized.
+        if "allow_force_close_after_commit" in mapping:
+            get_boolean(mapping, "allow_force_close_after_commit", default=False)
         return cls(
             game_id=get_string(mapping, "game_id"),
             display_name=get_string(mapping, "display_name"),
@@ -550,9 +549,6 @@ class MatchConfig:
             pbem_save_directory=get_string(mapping, "pbem_save_directory"),
             save_matching=save_matching,
             turn_handling_mode=turn_handling_mode,
-            allow_force_close_after_commit=get_boolean(
-                mapping, "allow_force_close_after_commit", default=False
-            ),
         )
 
     def to_json_bytes(self) -> bytes:

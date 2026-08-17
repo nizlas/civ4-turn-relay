@@ -45,8 +45,8 @@ _ACTIVE_PROCESS_STATUSES = frozenset(
         ProcessStatus.STARTING,
         ProcessStatus.RUNNING,
         ProcessStatus.CLOSE_REQUESTED,
-        ProcessStatus.CLOSE_DEADLINE_ELAPSED,
-        ProcessStatus.FORCE_CLOSE_ELIGIBLE,
+        ProcessStatus.CLOSING_AFTER_COMMIT,
+        ProcessStatus.CLOSE_FAILED,
     }
 )
 

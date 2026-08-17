@@ -19,7 +19,11 @@ class OrchestrationIntentKind(Enum):
     RESUME_OR_FOCUS_CIV = "resume_or_focus_civ"
     PREPARE_OR_SEND_HANDOFF = "prepare_or_send_handoff"
     REQUIRE_CANDIDATE_SELECTION = "require_candidate_selection"
-    REQUEST_GRACEFUL_CLOSE = "request_graceful_close"
+    # Fully Managed only: the committed (or idempotently acknowledged) turn
+    # entitles Relay to close the exact Civ process it launched. Civ's modal
+    # PBEM confirmation blocks a graceful close, so the app layer terminates
+    # the entitled process directly after re-verifying its identity.
+    CLOSE_CIV_AFTER_COMMIT = "close_civ_after_commit"
     SHOW_POST_COMMIT_CLOSE_WARNING = "show_post_commit_close_warning"
     REQUIRE_USER_ACTION = "require_user_action"
     RETRY = "retry"

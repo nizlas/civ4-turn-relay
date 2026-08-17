@@ -44,6 +44,7 @@ from civ4_turn_relay.local import (
     OrchestrationIntent,
     OrchestrationIntentKind,
     OutgoingCandidateRecord,
+    PostCommitCloseRecord,
     ProcessAssociationRecord,
     ProcessObservation,
     ReconcileResult,
@@ -66,6 +67,7 @@ from civ4_turn_relay.process import (
     ProcessIdentity,
     ProcessSupervisor,
     TerminateOutcome,
+    TerminateResult,
     build_launch_plan,
     observation_from_identity,
 )
@@ -708,13 +710,7 @@ class RelayClient:
                 process_create_time_ns=assoc.process_create_time_ns,
                 executable_path=assoc.executable_path,
             )
-        force_allowed = (
-            session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
-            and session.config.allow_force_close_after_commit
-        )
-        return coordinator.status_snapshot(
-            association=association, force_close_allowed=force_allowed
-        )
+        return coordinator.status_snapshot(association=association)
 
     def launch_preview(self, game_id: str) -> LaunchPlan:
         """Build the launch plan for this match without launching (dry run)."""
@@ -742,12 +738,13 @@ class RelayClient:
         return coordinator.focus(identity)
 
     def request_civ_close(self, game_id: str) -> CloseRequestResult:
-        """Manually request a graceful close backed by the durable entitlement.
+        """Manually close Civ backed by the durable post-commit entitlement.
 
-        This is the UI Close fallback after the graceful deadline. It is
-        allowed only when a durable ``pending_post_commit_close`` record
+        Allowed only when a durable ``pending_post_commit_close`` record
         exists and a fresh probe verifies exactly that identity is running.
-        It never terminates.
+        Fully Managed matches retry the direct entitled termination (Civ's
+        modal PBEM confirmation blocks a graceful close); Standard matches
+        keep the graceful close request and never terminate.
         """
         self._ensure_open()
         session = self._require_session(game_id)
@@ -778,6 +775,11 @@ class RelayClient:
                 outcome=CloseRequestOutcome.ADAPTER_UNAVAILABLE,
                 message=probe.message,
             )
+        if session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED:
+            terminate = self._terminate_pending_close(
+                session, coordinator, pending, None, user_requested=True
+            )
+            return _close_result_from_terminate(terminate)
         result = coordinator.request_close(
             identity, operation_id=pending.operation_id, allow_repeat=True
         )
@@ -1063,7 +1065,7 @@ class RelayClient:
         result: ReconcileResult,
         now_utc: str | None,
     ) -> ReconcileResult:
-        """Act on START_CIV and REQUEST_GRACEFUL_CLOSE reconcile intents."""
+        """Act on START_CIV and CLOSE_CIV_AFTER_COMMIT reconcile intents."""
         game_id = session.config.game_id
         if any(
             intent.kind is OrchestrationIntentKind.START_CIV
@@ -1106,7 +1108,7 @@ class RelayClient:
             (
                 intent
                 for intent in result.intents
-                if intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+                if intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
             ),
             None,
         )
@@ -1114,29 +1116,78 @@ class RelayClient:
             close_intent is not None
             and session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
         ):
-            self._request_entitled_close(session, coordinator, close_intent)
+            self._close_entitled_after_commit(
+                session, coordinator, close_intent, now_utc
+            )
         return result
 
-    def _request_entitled_close(
+    def _close_entitled_after_commit(
         self,
         session: _MatchSession,
         coordinator: ProcessCoordinator,
         intent: OrchestrationIntent,
+        now_utc: str | None,
     ) -> None:
-        """Request a graceful close only for the exact durable entitlement."""
+        """Terminate only the exact durable entitlement named by the intent."""
         game_id = session.config.game_id
         payload = intent.payload or {}
         records = self._store.load_match_state_or_empty(game_id)
         pending = records.pending_post_commit_close
         if pending is None or not close_payload_matches_record(payload, pending):
             return
+        self._terminate_pending_close(session, coordinator, pending, now_utc)
+
+    def _terminate_pending_close(
+        self,
+        session: _MatchSession,
+        coordinator: ProcessCoordinator,
+        pending: PostCommitCloseRecord,
+        now_utc: str | None,
+        *,
+        user_requested: bool = False,
+    ) -> TerminateResult | None:
+        """Run the direct post-commit termination and record typed evidence.
+
+        The handoff this entitlement belongs to is already committed on the
+        server; nothing here can roll it back. A refusal or failure only
+        leaves Civilization open with a truthful status.
+        """
+        game_id = session.config.game_id
         identity = identity_from_close_record(pending)
-        request = coordinator.request_close(identity, operation_id=pending.operation_id)
-        if request is None or request.outcome is not CloseRequestOutcome.REQUESTED:
-            return
+        result = coordinator.terminate_after_commit(
+            identity, pending, user_requested=user_requested
+        )
+        if result is None:
+            return None
         session.last_close_operation_id = pending.operation_id
         if not pending.close_requested:
             self._store.update_match_state(game_id, _mark_close_requested)
+        self._append_session_diagnostic(
+            session,
+            emit_diagnostic(
+                "post_commit_close",
+                fields={
+                    "outcome": result.outcome.value,
+                    "operation_id": pending.operation_id,
+                    "source_protocol_sequence": pending.source_protocol_sequence,
+                    "sha256": pending.sha256,
+                    "pid": pending.pid,
+                    "safely_closed": coordinator.safely_closed,
+                },
+                message=_POST_COMMIT_CLOSE_MESSAGES.get(result.outcome, ""),
+            ),
+        )
+        if coordinator.safely_closed or (
+            result.outcome is TerminateOutcome.IDENTITY_MISMATCH
+        ):
+            # Either probing confirmed the entitled process is gone, or its
+            # pid is reused by a different process — in both cases the exact
+            # entitled process no longer exists and the entitlement is done.
+            self.set_process_observation(
+                game_id, observation_from_identity(identity, running=False)
+            )
+            self.reconcile(game_id, now_utc=now_utc)
+        return result
 
     def _track_close_progress(
         self,
@@ -1144,18 +1195,23 @@ class RelayClient:
         coordinator: ProcessCoordinator,
         now_utc: str | None,
     ) -> None:
-        """Advance a pending post-commit close: exit, deadline, force close.
+        """Advance a pending post-commit close and recover after a restart.
 
-        Force termination happens at most once and only when the match is
-        fully managed with the force-close opt-in, the graceful deadline
-        elapsed, and both a fresh probe and the durable entitlement
-        re-verify the exact identity.
+        Fully Managed restart recovery: a durable entitlement whose close
+        action was already initiated (``close_requested``) gets exactly one
+        fresh termination attempt per Relay session against the re-verified
+        exact identity. Close completion is only ever concluded from
+        probing, never from timers or the termination call alone.
         """
         game_id = session.config.game_id
         records = self._store.load_match_state_or_empty(game_id)
         pending = records.pending_post_commit_close
-        if pending is not None and pending.close_requested:
-            coordinator.rearm_close_after_restart(pending)
+        if (
+            pending is not None
+            and pending.close_requested
+            and session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
+        ):
+            self._terminate_pending_close(session, coordinator, pending, now_utc)
         identity = coordinator.close_identity
         if identity is None or coordinator.safely_closed:
             return
@@ -1171,26 +1227,6 @@ class RelayClient:
             coordinator.drop_close_attempt(
                 probe.message or "identity could not be verified"
             )
-            return
-        if probe.outcome is not ProbeOutcome.RUNNING_MATCH:
-            return
-        if not coordinator.close_deadline_elapsed():
-            return
-        if (
-            session.config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
-            and session.config.allow_force_close_after_commit
-            and pending is not None
-        ):
-            terminate = coordinator.terminate_entitled(identity, pending)
-            if (
-                terminate is not None
-                and terminate.outcome is TerminateOutcome.TERMINATED
-            ):
-                self.set_process_observation(
-                    game_id, observation_from_identity(identity, running=False)
-                )
-                self.reconcile(game_id, now_utc=now_utc)
-                coordinator.note_safely_closed()
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -1262,6 +1298,58 @@ class RelayClient:
             persisted=True,
             retry_required=True,
         )
+
+
+_POST_COMMIT_CLOSE_MESSAGES: dict[TerminateOutcome, str] = {
+    TerminateOutcome.TERMINATED: (
+        "the turn is safely sent; Relay terminated the exact Civilization "
+        "process it launched for this turn"
+    ),
+    TerminateOutcome.NOT_RUNNING: (
+        "the turn is safely sent and the Relay-launched Civilization "
+        "process had already exited; nothing was terminated"
+    ),
+    TerminateOutcome.IDENTITY_MISMATCH: (
+        "the entitled process identity could not be re-verified (the pid "
+        "may be reused); no process was terminated"
+    ),
+    TerminateOutcome.ADAPTER_UNAVAILABLE: (
+        "the process adapter is unavailable; Civilization was not closed"
+    ),
+    TerminateOutcome.TERMINATE_FAILED: (
+        "the turn is safely sent, but terminating Civilization failed; "
+        "close it manually"
+    ),
+}
+
+
+def _close_result_from_terminate(
+    terminate: TerminateResult | None,
+) -> CloseRequestResult:
+    """Map a user-requested entitled termination onto the close-result type."""
+    if terminate is None:
+        return CloseRequestResult(
+            outcome=CloseRequestOutcome.IDENTITY_MISMATCH,
+            message="the entitled process identity could not be verified",
+        )
+    if terminate.outcome is TerminateOutcome.TERMINATED:
+        return CloseRequestResult(outcome=CloseRequestOutcome.REQUESTED)
+    if terminate.outcome is TerminateOutcome.NOT_RUNNING:
+        return CloseRequestResult(outcome=CloseRequestOutcome.NOT_RUNNING)
+    if terminate.outcome is TerminateOutcome.IDENTITY_MISMATCH:
+        return CloseRequestResult(
+            outcome=CloseRequestOutcome.IDENTITY_MISMATCH,
+            message=terminate.message,
+        )
+    if terminate.outcome is TerminateOutcome.ADAPTER_UNAVAILABLE:
+        return CloseRequestResult(
+            outcome=CloseRequestOutcome.ADAPTER_UNAVAILABLE,
+            message=terminate.message,
+        )
+    return CloseRequestResult(
+        outcome=CloseRequestOutcome.REQUEST_FAILED,
+        message=terminate.message or "terminating Civilization failed",
+    )
 
 
 def _mark_close_requested(records: MatchLocalRecords) -> MatchLocalRecords:

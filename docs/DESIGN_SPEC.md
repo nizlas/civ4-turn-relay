@@ -175,7 +175,8 @@ Server and installation settings MUST NOT be duplicated into every match. Secret
 | Mod name or path | — | Yes | Default concept: `AdvCiv`; per-match only |
 | PBEM save location and matching rules | — | Yes | Directory + filename/pattern constraints; per-match only |
 | Turn handling | `turn_handling_mode` | Yes | `standard` \| `fully_managed`; **default `standard`**; per-match only; behavior in [§8.5](#85-turn-handling-modes) |
-| Allow force-close after commit | `allow_force_close_after_commit` | Yes | Boolean; **default `false`**; applicable only when `turn_handling_mode` is `fully_managed`; see [§8.5](#85-turn-handling-modes) |
+
+The former `allow_force_close_after_commit` field is retired: Fully managed always terminates the exact Relay-launched process after a verified handoff ([§8.5](#85-turn-handling-modes)); there is no separate consent setting. Persisted configs written by older versions MAY still contain the key; loading MUST accept and discard it, and it MUST NOT be re-serialized.
 
 User-facing labels for `turn_handling_mode`:
 
@@ -193,7 +194,7 @@ The earlier standalone per-match `auto_launch` concept is replaced by `turn_hand
 
 - User-editable values are those listed above.
 - The UI SHOULD validate formats before save (game ID, paths, port range, player list non-empty and unique IDs).
-- `allow_force_close_after_commit` MUST be ignored unless `turn_handling_mode` is `fully_managed`.
+- Legacy `allow_force_close_after_commit` keys in persisted match configs MUST load safely and be discarded ([§4.2](#42-per-match-configuration)).
 - Local persistence MAY use `.env` for global secrets/settings plus per-match config files under the user data directory.
 - Global SFTP settings apply to all matches under the configured server root.
 
@@ -280,7 +281,7 @@ stateDiagram-v2
 - Last successful event with timestamp
 - One context-sensitive primary button
 - Secondary controls: matches, settings, diagnostics
-- Per-match settings MUST expose `turn_handling_mode` and, when Fully managed is selected, the advanced `allow_force_close_after_commit` consent with warning ([§4.2](#42-per-match-configuration))
+- Per-match settings MUST expose `turn_handling_mode` and state the Fully managed close policy: after a verified handoff, Relay terminates the exact Civilization process it launched ([§4.2](#42-per-match-configuration), [§8.5](#85-turn-handling-modes))
 
 ### 7.2 Examples
 
@@ -417,7 +418,7 @@ Normal successful lifecycle requires no Relay interaction after the app is opene
 6. The player plays and ends the turn inside Civ.
 7. Relay detects a stable outgoing save that passes all baseline/hash rules.
 8. Relay automatically uploads and commits it.
-9. Only after the authoritative manifest proves commit, or sender reconciliation proves an idempotent acknowledgement, Relay requests graceful closure of the exact Civ process it launched.
+9. Only after the authoritative manifest proves commit, or sender reconciliation proves an idempotent acknowledgement, Relay directly terminates the exact Civ process it launched (Civ's modal PBEM confirmation dialog blocks a normal graceful close, and the committed handoff makes that dialog irrelevant).
 10. Relay waits for the next player and repeats when ownership returns.
 
 Sequence 0 follows the same model but launches Civ without an incoming save and waits for the first outgoing save.
@@ -436,22 +437,17 @@ Additional Fully managed constraints:
 
 #### Closing policy after authoritative commit
 
-Applies only in `fully_managed`, and only after commit/idempotent-ack proof:
+Applies only in `fully_managed`, and only after commit/idempotent-ack proof. Verified handoff first, then direct termination of the Relay-owned Civ:
 
-1. Request normal Windows application close for the verified Relay-owned process.
-2. Wait 15 seconds.
-3. If Civ exits, continue normally.
-4. Otherwise show: `Turn safely sent, but Civilization did not close.`
-5. Provide manual Focus/Close fallback.
+1. Re-verify the durable post-commit entitlement: same game, same handoff operation, same outgoing hash, same source sequence, and the exact process identity (PID + precise process creation token + normalized executable path).
+2. Re-probe the process immediately before acting. If it has exited, the PID was reused, the executable differs, or any evidence is missing: do nothing and record a typed diagnostic.
+3. Directly terminate the verified Relay-owned process. No graceful close request is attempted first and no waiting period applies — Civ's modal PBEM confirmation blocks normal window closes, so a graceful close cannot succeed after Next Turn.
+4. Show `Turn safely sent — closing Civilization…` while the close is in flight; report Civ as closed only after a probe confirms the process is gone.
+5. If termination fails while the exact process is still alive, show a truthful actionable status (`Turn safely sent, but Civilization could not be closed.`) with manual Focus/Close fallback. The termination MUST NOT retry indefinitely: at most one automatic attempt per handoff operation per Relay session (a restart permits one fresh attempt against the re-verified identity).
 
-Operational state after commit remains `WAITING_FOR_OTHER_PLAYER` even while Civ is closing. Close progress or failure is secondary local status attached to that waiting state; it is not remote ownership and not a protocol failure. The UI MUST distinguish “turn safely committed” from “Civ still open”.
+Operational state after commit remains `WAITING_FOR_OTHER_PLAYER` even while Civ is closing. Close progress or failure is secondary local status attached to that waiting state; it is not remote ownership and not a protocol failure. The UI MUST distinguish “turn safely committed” from “Civ still open”. A close failure MUST NEVER change or roll back an already committed handoff, and Relay MUST NEVER terminate during save creation, verification, upload, or commit — only after the commit point.
 
-#### Force-close opt-in (`allow_force_close_after_commit`)
-
-- Explicit advanced opt-in with warning; default `false`; only applicable in `fully_managed` ([§4.2](#42-per-match-configuration)).
-- Forced termination is allowed only after authoritative commit proof (or proven idempotent acknowledgement) and exact process verification.
-- Never force-close during save creation, verification, upload, or commit.
-- A close failure MUST NEVER change or roll back an already committed handoff.
+The former `allow_force_close_after_commit` opt-in is retired ([§4.2](#42-per-match-configuration)): post-commit termination of the Relay-owned process is the standard `fully_managed` behavior, not an advanced consent. Standard mode never closes or terminates Civ automatically.
 
 ---
 
@@ -529,7 +525,7 @@ Export MAY attach redacted logs and last manifest metadata (no secrets).
 | FR-012 | Secret redaction | Logs, UI errors, and diagnostics export contain no passwords, keys, or secret env values |
 | FR-013 | Play-session baseline | Pre-launch files are not auto-sent; missing baseline disables auto-send |
 | FR-014 | Foreign locks | Never auto-broken; abandoned removal only via confirmed repair |
-| FR-015 | Fully managed turn lifecycle | Verified incoming save causes one automatic launch; duplicate polling does not launch again; commit (or proven idempotent ack) is proven before close request; only the Relay-owned process is targeted; close failure leaves the committed turn safe and clearly reported; force-close is opt-in and post-commit only; restart neither double-launches nor closes an unverified process; Civ exit without outgoing save causes no remote change or relaunch loop ([§8.5](#85-turn-handling-modes)) |
+| FR-015 | Fully managed turn lifecycle | Verified incoming save causes one automatic launch; duplicate polling does not launch again; commit (or proven idempotent ack) is proven before any close action; only the exactly re-verified Relay-owned process is directly terminated, at most once per handoff operation per session; close failure leaves the committed turn safe and clearly reported; restart neither double-launches nor closes an unverified process; Civ exit without outgoing save causes no remote change or relaunch loop ([§8.5](#85-turn-handling-modes)) |
 
 ---
 
@@ -552,7 +548,7 @@ Product-level principles only. Detailed protocol cases: [`SYNC_PROTOCOL.md`](SYN
 | Exact Civ IV CLI for mod + save | Confirmed 2026-08-14 on Steam BTS/AdvCiv: start the raw BTS executable from its own directory with `SteamAppId=8800` and `SteamGameId=8800`; place `/fxsload=<absolute save>` before final `mod=\\AdvCiv`. Start Steam normally (not `-applaunch`) when required. Keep the launcher behind an adapter interface. |
 | Default auto-send vs manual Send | Auto-send after valid `OUTGOING_SAVE_DETECTED` when a trustworthy baseline exists (required for zero-click `fully_managed`) |
 | Default `turn_handling_mode` | `standard` ([§4.2](#42-per-match-configuration), [§8.5](#85-turn-handling-modes)); replaces standalone `auto_launch` |
-| Default `allow_force_close_after_commit` | `false`; Fully managed advanced opt-in only |
+| Post-commit close mechanism | Fully managed directly terminates the exactly verified Relay-owned Civ after commit/idempotent-ack proof; the former `allow_force_close_after_commit` opt-in is retired (legacy keys load safely and are discarded) |
 | Stable-file sampling interval | 1.0s between size samples, twice; make configurable later if needed |
 | Host-key policy | Verify against pinned host key / known_hosts; refuse on mismatch (no silent insecure accept) |
 

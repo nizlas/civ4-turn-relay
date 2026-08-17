@@ -82,7 +82,6 @@ def _match_config(
     game_id: str = "example-match",
     local_player_id: str = "player_a",
     turn_handling_mode: TurnHandlingMode = TurnHandlingMode.FULLY_MANAGED,
-    allow_force_close: bool = False,
     filename_glob: str = GLOB,
 ) -> MatchConfig:
     return MatchConfig(
@@ -95,7 +94,6 @@ def _match_config(
         pbem_save_directory=str(_pbem_dir(tmp_path)),
         save_matching=SaveMatchingRules(filename_glob=filename_glob),
         turn_handling_mode=turn_handling_mode,
-        allow_force_close_after_commit=allow_force_close,
     )
 
 
@@ -686,7 +684,6 @@ def test_outgoing_activity_emits_typed_wait_not_silence(tmp_path: Path) -> None:
 
     intents = decide_intents(
         TurnHandlingMode.FULLY_MANAGED,
-        False,
         OperationalState.MY_TURN_DOWNLOADED,
         records,
         detection,
@@ -804,7 +801,6 @@ def test_pt23_missing_baseline_disables_auto_send(tmp_path: Path) -> None:
     )
     intents = decide_intents(
         TurnHandlingMode.FULLY_MANAGED,
-        False,
         OperationalState.MY_TURN_DOWNLOADED,
         records,
         detection,
@@ -851,7 +847,6 @@ def test_pt24_multiple_candidates_require_selection(tmp_path: Path) -> None:
     assert observed.outcome is DetectionOutcome.MULTIPLE_CANDIDATES
     intents = decide_intents(
         TurnHandlingMode.FULLY_MANAGED,
-        False,
         OperationalState.OUTGOING_SAVE_DETECTED,
         records,
         observed,
@@ -1148,7 +1143,6 @@ def test_prepare_or_send_on_one_candidate(tmp_path: Path) -> None:
 
     intents = decide_intents(
         TurnHandlingMode.FULLY_MANAGED,
-        False,
         OperationalState.OUTGOING_SAVE_DETECTED,
         _records,
         detection,
@@ -1169,7 +1163,7 @@ def test_no_close_before_commit(tmp_path: Path) -> None:
 
     result = _reconcile(storage, store, config, process_observation=_process_obs())
 
-    assert OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE not in {
+    assert OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT not in {
         i.kind for i in result.intents
     }
 
@@ -1201,7 +1195,6 @@ def test_close_after_committed_or_idempotent(tmp_path: Path) -> None:
         )
         intents = decide_intents(
             TurnHandlingMode.FULLY_MANAGED,
-            False,
             OperationalState.WAITING_FOR_OTHER_PLAYER,
             records,
             None,
@@ -1209,13 +1202,12 @@ def test_close_after_committed_or_idempotent(tmp_path: Path) -> None:
             evidence,
             False,
         )
-        assert OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE in {
+        assert OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT in {
             i.kind for i in intents
         }
 
     mismatched = decide_intents(
         TurnHandlingMode.FULLY_MANAGED,
-        False,
         OperationalState.WAITING_FOR_OTHER_PLAYER,
         records,
         None,
@@ -1234,7 +1226,7 @@ def test_close_after_committed_or_idempotent(tmp_path: Path) -> None:
         ),
         False,
     )
-    assert OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE not in {
+    assert OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT not in {
         i.kind for i in mismatched
     }
 
@@ -1255,7 +1247,13 @@ def test_standard_never_auto_start_civ(tmp_path: Path) -> None:
     assert OrchestrationIntentKind.START_CIV not in {i.kind for i in result.intents}
 
 
-def test_allow_force_close_never_emits_terminate(tmp_path: Path) -> None:
+def test_close_intent_carries_exact_entitlement_payload(tmp_path: Path) -> None:
+    """The close intent names the exact durable entitlement, nothing broader.
+
+    The intent layer stays pure: it identifies which process the committed
+    handoff entitles Relay to close; the app layer performs the direct
+    termination only after re-verifying that exact identity.
+    """
     storage = FakeStorage()
     game_id, digest = _commit_player_a_turn(storage)
     evidence = _handoff_evidence(
@@ -1278,7 +1276,6 @@ def test_allow_force_close_never_emits_terminate(tmp_path: Path) -> None:
     )
     intents = decide_intents(
         TurnHandlingMode.FULLY_MANAGED,
-        True,
         OperationalState.WAITING_FOR_OTHER_PLAYER,
         records,
         None,
@@ -1287,9 +1284,20 @@ def test_allow_force_close_never_emits_terminate(tmp_path: Path) -> None:
         False,
     )
 
-    kinds = {intent.kind for intent in intents}
-    assert OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE in kinds
-    assert not any("terminate" in kind.value for kind in kinds)
+    closes = [
+        intent
+        for intent in intents
+        if intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
+    ]
+    assert len(closes) == 1
+    payload = closes[0].payload
+    assert payload is not None
+    assert payload["pid"] == 4242
+    assert payload["process_create_time_ns"] == CREATE_NS
+    assert payload["executable_path"] == r"C:\Games\Civ4\BeyondSword.exe"
+    assert payload["sha256"] == digest
+    assert payload["source_protocol_sequence"] == 0
+    assert payload["operation_id"] == evidence.operation_id
 
 
 def test_civ_exit_without_save_requires_user_action_no_relaunch(tmp_path: Path) -> None:

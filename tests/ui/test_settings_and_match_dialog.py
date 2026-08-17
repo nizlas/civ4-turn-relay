@@ -117,8 +117,6 @@ def test_match_dialog_valid_input_builds_config(
     qtbot.addWidget(dialog)
     _fill_valid(dialog, tmp_path, "test-match")
     dialog.managed_radio.setChecked(True)
-    assert dialog.force_close_checkbox.isEnabled()
-    dialog.force_close_checkbox.setChecked(True)
 
     dialog.accept()
 
@@ -127,7 +125,6 @@ def test_match_dialog_valid_input_builds_config(
     assert config is not None
     assert config.game_id == "test-match"
     assert config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
-    assert config.allow_force_close_after_commit is True
     assert tuple(player.id for player in config.players) == (
         "player_a",
         "player_b",
@@ -137,19 +134,17 @@ def test_match_dialog_valid_input_builds_config(
     assert config.mod_name == "Mods\\AdvCiv"
 
 
-def test_force_close_checkbox_disabled_under_standard(qtbot: QtBot) -> None:
+def test_match_dialog_states_close_policy_without_consent_choice(
+    qtbot: QtBot,
+) -> None:
+    """No force-close checkbox exists anymore; the dialog states the policy."""
     dialog = MatchEditDialog()
     qtbot.addWidget(dialog)
-    assert dialog.standard_radio.isChecked()
-    assert dialog.force_close_checkbox.isEnabled() is False
-
-    dialog.managed_radio.setChecked(True)
-    assert dialog.force_close_checkbox.isEnabled() is True
-    dialog.force_close_checkbox.setChecked(True)
-
-    dialog.standard_radio.setChecked(True)
-    assert dialog.force_close_checkbox.isEnabled() is False
-    assert dialog.force_close_checkbox.isChecked() is False
+    assert not hasattr(dialog, "force_close_checkbox")
+    text = dialog.close_policy_label.text()
+    assert "closes" in text
+    assert "verified" in text
+    assert "Standard never closes Civilization" in text
 
 
 def test_match_dialog_refuses_duplicate_game_id(

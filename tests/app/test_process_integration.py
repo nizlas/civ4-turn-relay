@@ -10,6 +10,7 @@ from civ4_turn_relay.app.relay_client import LAUNCH_LOG_FILENAME
 from civ4_turn_relay.domain import MatchConfig, OperationalState, TurnHandlingMode
 from civ4_turn_relay.local import FakeClock, LocalStore
 from civ4_turn_relay.process import (
+    CloseRequestOutcome,
     FakeMachine,
     FakeProcessSupervisor,
     FocusOutcome,
@@ -18,8 +19,12 @@ from civ4_turn_relay.process import (
     ProcessIdentity,
     ProcessScanEntry,
 )
-from civ4_turn_relay.protocol import HandoffOutcome, InitializeOutcome
-from civ4_turn_relay.storage import FakeStorage
+from civ4_turn_relay.protocol import (
+    HandoffOutcome,
+    InitializeOutcome,
+    read_authoritative_manifest,
+)
+from civ4_turn_relay.storage import FakeStorage, FaultMoment, StorageOp
 from tests.e2e_fake.helpers import (
     GAME_ID,
     GAME_ID_B,
@@ -99,7 +104,6 @@ def _local_client_after_opponent_commit(
     supervisor: FakeProcessSupervisor,
     *,
     mode: TurnHandlingMode = TurnHandlingMode.FULLY_MANAGED,
-    allow_force_close: bool = False,
 ) -> tuple[RelayClient, MatchConfig, str]:
     _opponent_commits_first_save(tmp_path, storage, clock)
     exe = _exe_path(tmp_path)
@@ -109,7 +113,6 @@ def _local_client_after_opponent_commit(
         root,
         local_player_id="player_b",
         mode=mode,
-        allow_force_close=allow_force_close,
         pbem_name="pbem-local",
     )
     joined = client.initialize_or_join(
@@ -307,7 +310,15 @@ def test_immediate_exit_fails_without_relaunch_loop(tmp_path: Path) -> None:
     client.close()
 
 
-def test_fully_managed_commit_closes_gracefully(tmp_path: Path) -> None:
+def test_fully_managed_commit_terminates_directly_exactly_once(
+    tmp_path: Path,
+) -> None:
+    """A committed handoff directly terminates the Relay-launched process.
+
+    No graceful close request (WM_CLOSE) is ever sent first — Civ's modal
+    PBEM confirmation blocks it — and no termination happens before the
+    commit is authoritatively proven.
+    """
     storage = FakeStorage()
     clock = FakeClock()
     supervisor = FakeProcessSupervisor()
@@ -316,6 +327,10 @@ def test_fully_managed_commit_closes_gracefully(tmp_path: Path) -> None:
     )
     client.tick(GAME_ID)
     identity = _associated_identity(client)
+    # While the turn is still being played, nothing is ever closed.
+    client.tick(GAME_ID)
+    assert supervisor.terminations == []
+    assert supervisor.close_requests == []
 
     write_stable_save(
         Path(config.pbem_save_directory),
@@ -329,61 +344,33 @@ def test_fully_managed_commit_closes_gracefully(tmp_path: Path) -> None:
         GAME_ID, auto_handoff_operation_id="b2b2b2b2-b2b2-4b2b-8b2b-b2b2b2b2b2b2"
     )
     assert snap.protocol_sequence == 2
-    assert supervisor.close_requests == [identity]
-    assert supervisor.terminations == []
-
-    snap_after = client.tick(GAME_ID)
+    # Terminate fired exactly once, only after the manifest commit, and no
+    # graceful close was ever attempted first.
+    assert supervisor.terminations == [identity]
+    assert supervisor.close_requests == []
     assert client.process_status(GAME_ID).status is ProcessStatus.SAFELY_CLOSED
     records = client.store.load_match_state_or_empty(GAME_ID)
     assert records.pending_post_commit_close is None
+
+    snap_after = client.tick(GAME_ID)
     assert snap_after.operational_state is OperationalState.WAITING_FOR_OTHER_PLAYER
-    assert supervisor.close_requests == [identity]
+    clock.advance(20.0)
+    client.tick(GAME_ID)
+    assert supervisor.terminations == [identity]
+    assert supervisor.close_requests == []
     client.close()
 
 
-def test_close_deadline_without_force_close(tmp_path: Path) -> None:
+def test_termination_failure_is_truthful_and_never_rolls_back(
+    tmp_path: Path,
+) -> None:
+    """A failed termination leaves the committed handoff intact and visible."""
     storage = FakeStorage()
     clock = FakeClock()
     supervisor = FakeProcessSupervisor()
-    supervisor.exit_on_close_request = False
+    supervisor.terminate_fails = True
     client, config, _exe = _local_client_after_opponent_commit(
-        tmp_path, storage, clock, supervisor, allow_force_close=False
-    )
-    client.tick(GAME_ID)
-    write_stable_save(
-        Path(config.pbem_save_directory),
-        SAVE_NAME_B,
-        SAVE_B,
-        clock,
-        client,
-        GAME_ID,
-    )
-    client.tick(
-        GAME_ID, auto_handoff_operation_id="b3b3b3b3-b3b3-4b3b-8b3b-b3b3b3b3b3b3"
-    )
-    assert len(supervisor.close_requests) == 1
-    status = client.process_status(GAME_ID)
-    assert status.status is ProcessStatus.CLOSE_REQUESTED
-    assert status.close_deadline_remaining_seconds is not None
-    assert 0.0 < status.close_deadline_remaining_seconds <= 15.0
-
-    clock.advance(16.0)
-    client.tick(GAME_ID)
-    status = client.process_status(GAME_ID)
-    assert status.status is ProcessStatus.CLOSE_DEADLINE_ELAPSED
-    assert status.force_close_allowed is False
-    assert supervisor.terminations == []
-    assert len(supervisor.close_requests) == 1
-    client.close()
-
-
-def test_force_close_after_deadline_exactly_once(tmp_path: Path) -> None:
-    storage = FakeStorage()
-    clock = FakeClock()
-    supervisor = FakeProcessSupervisor()
-    supervisor.exit_on_close_request = False
-    client, config, _exe = _local_client_after_opponent_commit(
-        tmp_path, storage, clock, supervisor, allow_force_close=True
+        tmp_path, storage, clock, supervisor
     )
     client.tick(GAME_ID)
     identity = _associated_identity(client)
@@ -395,27 +382,36 @@ def test_force_close_after_deadline_exactly_once(tmp_path: Path) -> None:
         client,
         GAME_ID,
     )
-    client.tick(
-        GAME_ID, auto_handoff_operation_id="b4b4b4b4-b4b4-4b4b-8b4b-b4b4b4b4b4b4"
+    snap = client.tick(
+        GAME_ID, auto_handoff_operation_id="b3b3b3b3-b3b3-4b3b-8b3b-b3b3b3b3b3b3"
     )
-    assert supervisor.close_requests == [identity]
-    # Never before the deadline elapses.
-    client.tick(GAME_ID)
-    assert supervisor.terminations == []
-
-    clock.advance(16.0)
-    client.tick(GAME_ID)
+    # The commit stands regardless of the failed close.
+    assert snap.protocol_sequence == 2
+    assert snap.operational_state is OperationalState.WAITING_FOR_OTHER_PLAYER
     assert supervisor.terminations == [identity]
-    assert client.process_status(GAME_ID).status is ProcessStatus.SAFELY_CLOSED
-    records = client.store.load_match_state_or_empty(GAME_ID)
-    assert records.pending_post_commit_close is None
+    status = client.process_status(GAME_ID)
+    assert status.status is ProcessStatus.CLOSE_FAILED
+    assert "could not be closed" in status.message
 
-    # Never twice.
+    # Never a retry loop: later ticks do not terminate again this session.
     client.tick(GAME_ID)
     clock.advance(20.0)
     client.tick(GAME_ID)
     assert supervisor.terminations == [identity]
-    assert supervisor.close_requests == [identity]
+    assert supervisor.close_requests == []
+    records = client.store.load_match_state_or_empty(GAME_ID)
+    pending = records.pending_post_commit_close
+    assert pending is not None and pending.close_requested
+
+    # The manual Close fallback retries the entitled termination directly.
+    supervisor.terminate_fails = False
+    result = client.request_civ_close(GAME_ID)
+    assert result.outcome is CloseRequestOutcome.REQUESTED
+    assert supervisor.terminations == [identity, identity]
+    assert supervisor.close_requests == []
+    assert client.process_status(GAME_ID).status is ProcessStatus.SAFELY_CLOSED
+    records = client.store.load_match_state_or_empty(GAME_ID)
+    assert records.pending_post_commit_close is None
     client.close()
 
 
@@ -430,9 +426,9 @@ def test_stale_close_entitlement_never_acts_on_same_second_reused_pid(
     storage = FakeStorage()
     clock = FakeClock()
     supervisor = FakeProcessSupervisor()
-    supervisor.exit_on_close_request = False
-    client, config, _exe = _local_client_after_opponent_commit(
-        tmp_path, storage, clock, supervisor, allow_force_close=True
+    supervisor.terminate_fails = True
+    client, config, exe = _local_client_after_opponent_commit(
+        tmp_path, storage, clock, supervisor
     )
     client.tick(GAME_ID)
     identity = _associated_identity(client)
@@ -447,7 +443,9 @@ def test_stale_close_entitlement_never_acts_on_same_second_reused_pid(
     client.tick(
         GAME_ID, auto_handoff_operation_id="b7b7b7b7-b7b7-4b7b-8b7b-b7b7b7b7b7b7"
     )
-    assert supervisor.close_requests == [identity]
+    # The first termination attempt failed; the entitlement stays pending.
+    assert supervisor.terminations == [identity]
+    client.close()
 
     # The entitled process exits on its own; an unrelated process reuses the
     # pid within the same wall-clock second.
@@ -460,25 +458,37 @@ def test_stale_close_entitlement_never_acts_on_same_second_reused_pid(
     )
     supervisor.spawn_external(reused)
 
-    client.tick(GAME_ID)
-    clock.advance(16.0)
-    client.tick(GAME_ID)
+    supervisor.terminate_fails = False
+    restarted = _make_process_client(
+        tmp_path / "local", storage, clock, supervisor, civ4_executable=exe
+    )
+    restarted.open_match(config)
+    restarted.tick(GAME_ID)
     clock.advance(20.0)
-    client.tick(GAME_ID)
-    # The stale entitlement never escalates to the reused pid.
-    assert supervisor.close_requests == [identity]
-    assert supervisor.terminations == []
+    restarted.tick(GAME_ID)
+    # The stale entitlement never escalates to the reused pid: the fresh
+    # pre-termination probe reports a mismatch and nothing is touched.
+    assert supervisor.terminations == [identity]
+    assert supervisor.close_requests == []
     assert supervisor.probe(reused).outcome is ProbeOutcome.RUNNING_MATCH
-    client.close()
+    restarted.close()
 
 
-def test_restart_rearms_close_deadline_once(tmp_path: Path) -> None:
+def test_restart_after_commit_terminates_entitled_process_once(
+    tmp_path: Path,
+) -> None:
+    """Commit, then crash/restart: the exact old process still gets closed.
+
+    The at-most-once guard is session-local, so the restarted Relay makes
+    exactly one fresh termination attempt against the re-verified identity
+    and never loops.
+    """
     storage = FakeStorage()
     clock = FakeClock()
     supervisor = FakeProcessSupervisor()
-    supervisor.exit_on_close_request = False
+    supervisor.terminate_fails = True
     client, config, exe = _local_client_after_opponent_commit(
-        tmp_path, storage, clock, supervisor, allow_force_close=True
+        tmp_path, storage, clock, supervisor
     )
     client.tick(GAME_ID)
     identity = _associated_identity(client)
@@ -490,10 +500,71 @@ def test_restart_rearms_close_deadline_once(tmp_path: Path) -> None:
         client,
         GAME_ID,
     )
-    client.tick(
+    snap = client.tick(
         GAME_ID, auto_handoff_operation_id="b5b5b5b5-b5b5-4b5b-8b5b-b5b5b5b5b5b5"
     )
-    assert supervisor.close_requests == [identity]
+    assert snap.protocol_sequence == 2
+    assert supervisor.terminations == [identity]
+    client.close()
+
+    supervisor.terminate_fails = False
+    restarted = _make_process_client(
+        tmp_path / "local", storage, clock, supervisor, civ4_executable=exe
+    )
+    restarted.open_match(config)
+    restarted.tick(GAME_ID)
+    # One fresh attempt against the re-verified identity; still no WM_CLOSE.
+    assert supervisor.terminations == [identity, identity]
+    assert supervisor.close_requests == []
+    assert restarted.process_status(GAME_ID).status is ProcessStatus.SAFELY_CLOSED
+    records = restarted.store.load_match_state_or_empty(GAME_ID)
+    assert records.pending_post_commit_close is None
+
+    restarted.tick(GAME_ID)
+    clock.advance(20.0)
+    restarted.tick(GAME_ID)
+    assert supervisor.terminations == [identity, identity]
+    restarted.close()
+
+
+def test_lost_commit_response_terminates_exact_process_after_restart(
+    tmp_path: Path,
+) -> None:
+    """Recovery: the commit landed but the response was lost before the
+    crash. The restarted Relay attributes its journal (idempotent
+    acknowledgement), gains the exact close entitlement, and terminates the
+    still-running old Civ process — never a WM_CLOSE, never twice."""
+    storage = FakeStorage()
+    clock = FakeClock()
+    supervisor = FakeProcessSupervisor()
+    client, config, exe = _local_client_after_opponent_commit(
+        tmp_path, storage, clock, supervisor
+    )
+    client.tick(GAME_ID)
+    identity = _associated_identity(client)
+    write_stable_save(
+        Path(config.pbem_save_directory),
+        SAVE_NAME_B,
+        SAVE_B,
+        clock,
+        client,
+        GAME_ID,
+    )
+    op = "b8b8b8b8-b8b8-4b8b-8b8b-b8b8b8b8b8b8"
+    storage.faults.inject(
+        StorageOp.ATOMIC_REPLACE,
+        moment=FaultMoment.AFTER,
+        occurrence=storage.faults.call_count(StorageOp.ATOMIC_REPLACE) + 1,
+    )
+    ambiguous = client.execute_handoff(GAME_ID, operation_id=op)
+    remote = read_authoritative_manifest(storage, GAME_ID)
+    assert remote.manifest is not None
+    if remote.manifest.protocol_sequence != 2:
+        # If the fake did not commit, this is not the lost-response case.
+        assert ambiguous.outcome is HandoffOutcome.TRANSPORT_FAILURE
+        return
+    # Ambiguous evidence never authorizes a close before attribution.
+    assert supervisor.terminations == []
     client.close()
 
     restarted = _make_process_client(
@@ -501,16 +572,20 @@ def test_restart_rearms_close_deadline_once(tmp_path: Path) -> None:
     )
     restarted.open_match(config)
     restarted.tick(GAME_ID)
-    # No second graceful request; deadline re-armed once from current clock.
-    assert supervisor.close_requests == [identity]
-    assert supervisor.terminations == []
-    status = restarted.process_status(GAME_ID)
-    assert status.status is ProcessStatus.CLOSE_REQUESTED
+    assert supervisor.terminations == [identity]
+    assert supervisor.close_requests == []
+    assert restarted.process_status(GAME_ID).status is ProcessStatus.SAFELY_CLOSED
+    records = restarted.store.load_match_state_or_empty(GAME_ID)
+    assert records.pending_post_commit_close is None
+    # The committed server state is untouched by the recovery close.
+    remote_after = read_authoritative_manifest(storage, GAME_ID)
+    assert remote_after.manifest is not None
+    assert remote_after.manifest.protocol_sequence == 2
 
-    clock.advance(16.0)
+    restarted.tick(GAME_ID)
+    clock.advance(20.0)
     restarted.tick(GAME_ID)
     assert supervisor.terminations == [identity]
-    assert restarted.process_status(GAME_ID).status is ProcessStatus.SAFELY_CLOSED
     restarted.close()
 
 
@@ -744,13 +819,13 @@ def _two_profile_setup(
 ]:
     """Two Relay profiles (A and B) sharing one PC and one Civ install.
 
-    Profile A launches Civ at sequence 0, commits its first turn, and its
-    Civ process is still closing (graceful close requested, not yet exited)
-    while profile B already owns the next turn.
+    Profile A launches Civ at sequence 0 and commits its first turn, but its
+    Civ process survives the post-commit termination attempt (scripted
+    failure) and is still open while profile B already owns the next turn.
     """
     exe = _exe_path(tmp_path)
     supervisor_a = FakeProcessSupervisor(machine=machine)
-    supervisor_a.exit_on_close_request = False
+    supervisor_a.terminate_fails = True
     supervisor_b = FakeProcessSupervisor(machine=machine)
 
     root_a = tmp_path / "profile-a"
@@ -800,7 +875,8 @@ def _two_profile_setup(
     )
     assert commit.protocol_sequence == 1
     identity_a = _associated_identity(client_a)
-    assert supervisor_a.close_requests == [identity_a]
+    assert supervisor_a.terminations == [identity_a]
+    assert supervisor_a.close_requests == []
     assert machine.is_running(identity_a)
     return client_a, client_b, supervisor_a, supervisor_b, identity_a
 

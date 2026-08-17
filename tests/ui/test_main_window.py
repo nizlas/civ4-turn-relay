@@ -106,14 +106,14 @@ def test_secondary_focus_close_only_when_present(qtbot: QtBot) -> None:
 
     stuck = MatchUiSnapshot(
         client=client_snapshot(OperationalState.WAITING_FOR_OTHER_PLAYER),
-        process=process_snapshot(ProcessStatus.CLOSE_DEADLINE_ELAPSED),
+        process=process_snapshot(ProcessStatus.CLOSE_FAILED),
     )
     window.on_snapshot(stuck)
     assert not window.focus_button.isHidden()
     assert not window.close_button.isHidden()
     assert (
         window.detail_label.text()
-        == "Turn safely sent, but Civilization did not close."
+        == "Turn safely sent, but Civilization could not be closed."
     )
 
     window.focus_button.click()

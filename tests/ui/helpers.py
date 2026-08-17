@@ -54,11 +54,9 @@ def process_snapshot(
     *,
     message: str = "",
     launch_blocked_reason: str | None = None,
-    force_close_allowed: bool = False,
 ) -> ProcessStatusSnapshot:
     return ProcessStatusSnapshot(
         status=status,
         message=message,
         launch_blocked_reason=launch_blocked_reason,
-        force_close_allowed=force_close_allowed,
     )

@@ -92,9 +92,7 @@ def test_restart_after_lost_commit_response_attributes_and_closes(
         clock,
         client_uuid=uuid.UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
     )
-    config = match_config(
-        root, mode=TurnHandlingMode.FULLY_MANAGED, allow_force_close=True
-    )
+    config = match_config(root, mode=TurnHandlingMode.FULLY_MANAGED)
     client.initialize_or_join(
         config, operation_id="cccccccc-1111-4111-8111-cccccccccccc"
     )
@@ -135,7 +133,7 @@ def test_restart_after_lost_commit_response_attributes_and_closes(
     assert state.pending_post_commit_close.operation_id == op
     assert (
         any(
-            intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+            intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
             for intent in recovered.intents
         )
         or state.pending_post_commit_close.close_requested
@@ -195,7 +193,7 @@ def test_unattributed_ambiguous_keeps_journal_no_close(tmp_path: Path) -> None:
     assert sha256_hex(SAVE_A) not in state.processed_outgoing_hashes
     assert state.pending_post_commit_close is None
     assert not any(
-        intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+        intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
         for intent in result.intents
     )
     remote = read_authoritative_manifest(storage, GAME_ID)

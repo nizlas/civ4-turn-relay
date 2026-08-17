@@ -85,7 +85,6 @@ def _config(tmp_path: Path, *, local_player_id: str = "player_a") -> MatchConfig
         pbem_save_directory=str(_pbem(tmp_path)),
         save_matching=SaveMatchingRules(filename_glob=GLOB),
         turn_handling_mode=TurnHandlingMode.FULLY_MANAGED,
-        allow_force_close_after_commit=False,
     )
 
 
@@ -526,7 +525,7 @@ def test_foreign_journal_not_applied(tmp_path: Path) -> None:
     )
     assert result.records.in_progress_handoff is not None
     assert digest not in result.records.processed_outgoing_hashes
-    assert OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE not in {
+    assert OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT not in {
         intent.kind for intent in result.intents
     }
     assert any(d.name == "foreign_or_stale_journal" for d in result.diagnostics)
@@ -561,7 +560,6 @@ def test_waiting_still_emits_post_commit_close() -> None:
 
     intents = decide_intents(
         TurnHandlingMode.FULLY_MANAGED,
-        False,
         OperationalState.WAITING_FOR_OTHER_PLAYER,
         records,
         None,
@@ -575,6 +573,6 @@ def test_waiting_still_emits_post_commit_close() -> None:
         evidence,
         False,
     )
-    assert OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE in {
+    assert OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT in {
         intent.kind for intent in intents
     }

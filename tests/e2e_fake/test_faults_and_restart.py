@@ -280,7 +280,6 @@ def test_post_commit_close_once(tmp_path: Path) -> None:
     managed = match_config(
         tmp_path / "managed-close",
         mode=TurnHandlingMode.FULLY_MANAGED,
-        allow_force_close=True,
     )
     # Re-bind managed mode on a fresh match using same storage root semantics.
     client.close()
@@ -315,14 +314,14 @@ def test_post_commit_close_once(tmp_path: Path) -> None:
     assert records.pending_post_commit_close.close_requested is True
     second = client.reconcile(GAME_ID)
     assert not any(
-        intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+        intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
         for intent in second.intents
     )
     client.set_process_observation(GAME_ID, stopped_process(55))
     after_exit = client.reconcile(GAME_ID)
     assert after_exit.records.pending_post_commit_close is None
     assert not any(
-        intent.kind is OrchestrationIntentKind.REQUEST_GRACEFUL_CLOSE
+        intent.kind is OrchestrationIntentKind.CLOSE_CIV_AFTER_COMMIT
         for intent in after_exit.intents
     )
     del config

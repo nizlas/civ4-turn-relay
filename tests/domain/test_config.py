@@ -54,6 +54,9 @@ def env_mapping_with_key() -> dict[str, str]:
 
 
 def match_mapping() -> dict[str, Any]:
+    # ``allow_force_close_after_commit`` is a retired legacy key kept here on
+    # purpose: persisted configs written by older versions still contain it,
+    # and every load path must accept and discard it.
     return {
         "allow_force_close_after_commit": True,
         "display_name": "Example Match",
@@ -274,7 +277,6 @@ class TestMatchConfig:
         assert config.game_id == "example-match"
         assert config.local_player_id == "player_a"
         assert config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
-        assert config.allow_force_close_after_commit is True
         assert config.save_matching.filename_glob == "*.CivBeyondSwordSave"
         assert [player.id for player in config.players] == [
             "player_a",
@@ -287,7 +289,6 @@ class TestMatchConfig:
         del mapping["allow_force_close_after_commit"]
         parsed = MatchConfig.from_mapping(mapping)
         assert parsed.turn_handling_mode is TurnHandlingMode.STANDARD
-        assert parsed.allow_force_close_after_commit is False
         config = MatchConfig(
             game_id="example-match",
             display_name="Example Match",
@@ -299,34 +300,26 @@ class TestMatchConfig:
             save_matching=SaveMatchingRules(filename_glob="*.sav"),
         )
         assert config.turn_handling_mode is TurnHandlingMode.STANDARD
-        assert config.allow_force_close_after_commit is False
 
-    def test_standard_canonicalizes_force_close_to_false(self) -> None:
+    @pytest.mark.parametrize("legacy_value", [True, False])
+    def test_legacy_force_close_key_loads_and_is_discarded(
+        self, legacy_value: bool
+    ) -> None:
+        """Migration: persisted configs with the retired opt-in stay loadable.
+
+        The key is accepted, no field is exposed for it, and it is never
+        written back out.
+        """
         mapping = match_mapping()
-        mapping["turn_handling_mode"] = "standard"
-        mapping["allow_force_close_after_commit"] = True
+        mapping["allow_force_close_after_commit"] = legacy_value
         parsed = MatchConfig.from_mapping(mapping)
-        assert parsed.turn_handling_mode is TurnHandlingMode.STANDARD
-        assert parsed.allow_force_close_after_commit is False
-        assert parsed.to_mapping()["allow_force_close_after_commit"] is False
-        constructed = MatchConfig(
-            game_id="example-match",
-            display_name="Example Match",
-            players=(Player(id="player_a", display_name="Player A"),),
-            local_player_id="player_a",
-            launch_profile=None,
-            mod_name=None,
-            pbem_save_directory="C:\\Placeholder\\Saves\\pbem",
-            save_matching=SaveMatchingRules(filename_glob="*.sav"),
-            turn_handling_mode=TurnHandlingMode.STANDARD,
-            allow_force_close_after_commit=True,
-        )
-        assert constructed.allow_force_close_after_commit is False
-
-    def test_fully_managed_preserves_force_close_true(self) -> None:
-        config = MatchConfig.from_mapping(match_mapping())
-        assert config.turn_handling_mode is TurnHandlingMode.FULLY_MANAGED
-        assert config.allow_force_close_after_commit is True
+        assert not hasattr(parsed, "allow_force_close_after_commit")
+        assert "allow_force_close_after_commit" not in parsed.to_mapping()
+        assert b"allow_force_close_after_commit" not in parsed.to_json_bytes()
+        # The migrated config equals the same config without the legacy key.
+        without = dict(mapping)
+        del without["allow_force_close_after_commit"]
+        assert parsed == MatchConfig.from_mapping(without)
 
     def test_obsolete_auto_launch_rejected(self) -> None:
         mapping = match_mapping() | {"auto_launch": True}
@@ -444,5 +437,4 @@ class TestConfigSeparation:
             "pbem_save_directory",
             "save_matching",
             "turn_handling_mode",
-            "allow_force_close_after_commit",
         }
